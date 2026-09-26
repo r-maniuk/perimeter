@@ -1,0 +1,115 @@
+[project]
+name = "perimeter"
+version = "1.0.0"
+description = "Real-time device tracking and circular geofence alerting on FastAPI, PostGIS and NATS JetStream"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.14"
+dependencies = [
+    "alembic>=1.20.0",
+    "asyncpg>=0.31.0",
+    "fastapi>=0.141.1",
+    "geoalchemy2>=0.20.0",
+    "httptools>=0.8.0",
+    "msgspec>=0.21.1",
+    "nats-py>=2.16.0",
+    "prometheus-client>=0.26.0",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "pyjwt>=2.15.0",
+    "sqlalchemy[asyncio]>=2.1.1",
+    "structlog>=26.1.0",
+    "uvicorn>=0.54.0",
+    "uvloop>=0.22.1; sys_platform != 'win32'",
+    "websockets>=17.1",
+]
+
+[project.optional-dependencies]
+tracing = [
+    "opentelemetry-api>=1.45.0",
+    "opentelemetry-sdk>=1.45.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.0",
+    "opentelemetry-instrumentation-fastapi>=0.66b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.66b0",
+]
+
+[dependency-groups]
+dev = [
+    "asgi-lifespan>=2.1.0",
+    "coverage[toml]>=7.16.1",
+    "geographiclib>=2.1",
+    "httpx>=0.28.1",
+    "hypothesis>=6.168.1",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.9",
+    "testcontainers>=4.15.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = ["web", "perimeter/storage/migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "UP", "SIM", "C4", "RUF", "PERF", "PT", "ASYNC",
+    "S", "DTZ", "PIE", "RET", "TC", "PL", "N", "LOG", "G", "FURB",
+]
+ignore = [
+    "PLR0913",  # explicit keyword-only parameters read better than bags of options here
+    "PLR2004",  # magic values in comparisons are fine in protocol code with named constants nearby
+    "S101",     # assert is used for invariants that tests exercise
+    "TC001", "TC002", "TC003",  # runtime-evaluated annotations (FastAPI, msgspec) need real imports
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "PLR", "ARG", "N802", "DTZ001"]
+"generator.py" = ["S311", "PLR0915", "PLR0912"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+plugins = ["pydantic.mypy"]
+files = ["perimeter", "tests", "generator.py"]
+
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "geographiclib.*", "asyncpg.*", "geoalchemy2.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = [
+    "integration: needs PostGIS and NATS (started with testcontainers or TEST_DATABASE_URL / TEST_NATS_URL)",
+    "e2e: needs the full compose stack",
+]
+filterwarnings = ["error", "ignore::DeprecationWarning:testcontainers.*"]
+
+[tool.coverage.run]
+source = ["perimeter"]
+branch = true
+omit = ["perimeter/storage/migrations/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]

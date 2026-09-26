@@ -1,0 +1,26 @@
+{
+  "kind": 2,
+  "tile": [
+    3,
+    7,
+    0
+  ],
+  "points": [
+    {
+      "device_id": "n",
+      "lat": 89.9999999,
+      "lon": 179.9999999,
+      "recorded_at_ms": 1600000000000,
+      "speed_mps": 655.34,
+      "heading_deg": 359.99
+    },
+    {
+      "device_id": "s",
+      "lat": -89.9999999,
+      "lon": -180.0,
+      "recorded_at_ms": 1602147483648,
+      "speed_mps": 0.0,
+      "heading_deg": null
+    }
+  ]
+}
