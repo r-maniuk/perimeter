@@ -33,6 +33,10 @@ tracing = [
     "opentelemetry-instrumentation-sqlalchemy>=0.66b0",
 ]
 
+load = [
+    "aiohttp>=3.14.3",
+]
+
 [dependency-groups]
 dev = [
     "asgi-lifespan>=2.1.0",

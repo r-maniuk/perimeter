@@ -7,16 +7,29 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import suppress
 from urllib.parse import urlparse
 
+import httpx
 import nats
 import pytest
+from asgi_lifespan import LifespanManager
+from fastapi import FastAPI
 from nats.aio.client import Client as NatsClient
 from nats.js import JetStreamContext
 from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from perimeter.api.app import create_app
 from perimeter.bus import topology
-from perimeter.config import DatabaseSettings, NatsSettings
+from perimeter.config import (
+    DatabaseSettings,
+    EngineSettings,
+    NatsSettings,
+    ObservabilitySettings,
+    SecuritySettings,
+    Settings,
+    TelemetrySettings,
+    load_settings,
+)
 from perimeter.storage.engine import create_engine
 from perimeter.tools.init import migrate
 
@@ -126,3 +139,43 @@ def topo() -> topology.Topology:
 async def provisioned(js: JetStreamContext, topo: topology.Topology) -> topology.Topology:
     await topology.ensure(js, topo)
     return topo
+
+
+TEST_SESSION_SECRET = "test-session-secret-that-is-long-enough-0123456789"
+TEST_INGEST_TOKEN = "test-ingest-token"
+TEST_ORIGIN = "http://testserver"
+
+
+@pytest.fixture
+def settings(
+    database_settings: DatabaseSettings, nats_settings: NatsSettings, topo: topology.Topology
+) -> Settings:
+    return load_settings(
+        database=database_settings,
+        nats=nats_settings,
+        security=SecuritySettings(
+            session_secret=SecretStr(TEST_SESSION_SECRET),
+            ingest_token=SecretStr(TEST_INGEST_TOKEN),
+            allowed_origins=TEST_ORIGIN,
+        ),
+        telemetry=TelemetrySettings(partitions=topo.partitions),
+        engine=EngineSettings(lease_ttl_s=topo.lease_ttl_s),
+        observability=ObservabilitySettings(perimeter_env="test"),
+    )
+
+
+@pytest.fixture
+async def api(
+    settings: Settings, provisioned: topology.Topology, db: AsyncEngine
+) -> AsyncIterator[FastAPI]:
+    """A fully started API replica (lifespan run) against the test services."""
+    app = create_app(settings)
+    async with LifespanManager(app, startup_timeout=30, shutdown_timeout=30):
+        yield app
+
+
+@pytest.fixture
+async def client(api: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=api)
+    async with httpx.AsyncClient(transport=transport, base_url=TEST_ORIGIN) as http:
+        yield http
