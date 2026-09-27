@@ -3,7 +3,7 @@
 # Build context: the repository root (see docker-compose.yml).
 
 # Base images are pinned by digest (Dependabot proposes updates).
-FROM node:24.21.0-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS web
+FROM node:26.9.0-alpine@sha256:dbaa92e5758cbbcf85d65d5403fdb530fe3442cbe8c6dbfb7ef23365450d5070 AS web
 WORKDIR /web
 # Dependencies first: this layer is reused until the lockfile changes.
 COPY web/package.json web/package-lock.json ./
@@ -22,7 +22,7 @@ RUN apk add --no-cache brotli zstd \
 # The API reference page: Swagger UI at a pinned version, checked against the lockfile, and served
 # from this image like the dashboard (no third-party script at runtime). Install scripts stay off:
 # the package's analytics dependency would otherwise report the install.
-FROM node:24.21.0-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS docs
+FROM node:26.9.0-alpine@sha256:dbaa92e5758cbbcf85d65d5403fdb530fe3442cbe8c6dbfb7ef23365450d5070 AS docs
 WORKDIR /docs
 ENV SCARF_ANALYTICS=false
 COPY infra/edge/docs/package.json infra/edge/docs/package-lock.json ./
