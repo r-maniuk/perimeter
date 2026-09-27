@@ -161,7 +161,10 @@ Found in code review:
    (a long backup holding locks) left exactly that. Slots are now built apart, filled with those
    rows and attached; each step gives up after half a second instead of queueing inserts behind it.
 9. **Deactivating a zone could race a batch that had just read it as active**, leaving presence
-   behind: deactivation and deletion now take a lock that waits for such batches.
+   behind: deactivation and deletion now take a lock that waits for such batches. Such a wait
+   could in principle go on while batches keep reading the zone; measured under 10,000 reports/s,
+   deactivating the busiest demo zone takes 6–17 ms, and deactivating or deleting a zone that
+   every report falls in takes 30–135 ms and 550 ms (its 10,000 presence rows go with it).
 10. **A socket closed while its client was still talking** could set up subscriptions again during
     the teardown: messages of a session being torn down are ignored.
 11. **A retried report without a timestamp was stored twice** under two receive times, and could

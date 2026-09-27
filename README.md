@@ -25,8 +25,8 @@ make up                  # = docker compose up -d --build --wait
 open http://localhost:8080
 ```
 
-The first build takes ⟪BUILD⟫ (images and dependencies download once); later starts take about
-20 s. The first start generates every credential into a Docker volume, so there is nothing to
+From an empty Docker the first build takes about a minute and a half (base images and
+dependencies download once: 80 s here); later starts take about 15 s. The first start generates every credential into a Docker volume, so there is nothing to
 configure; `.env.example` documents the optional knobs.
 
 | | |
@@ -108,23 +108,17 @@ flowchart LR
 
 **The life of one location report**
 
-1. A device posts a batch to the **edge** (Caddy), which balances over the API replicas.
-2. An **API replica** checks the device token and admission control *before reading the body*,
-   decodes and validates every report in C (msgspec), and publishes each one to JetStream with a
-   de-duplication id. It answers `202` only after JetStream has stored all of them: an
-   acknowledged report is durable.
-3. The **TELEMETRY** stream partitions reports by device (a `partition(16)` subject mapping in the
-   broker), so one device's reports always land in the same partition, in order.
-4. The **engine** replica that holds the partition's lease fetches a batch and applies it in one
-   transaction: claim the partition with its fencing token, ask PostGIS which active zones contain
-   each report (one indexed statement for the whole batch), run the enter/exit/dwell state machine,
-   write positions, the device tracks, presence, alerts and their outbox events. Commit, then
-   acknowledge.
-5. Positions go out as binary frames on `pos.<quadkey>` subjects, one per map tile. Alert events
-   leave the outbox for the **EVENTS** stream, which republishes each to `live.evt.<user>` with its
-   sequence and the user's previous one.
-6. Every API replica with a viewer on that tile relays the position frame; every replica serving a
-   session of that user relays the event to each of the user's sockets. The browser draws both.
+1. The **edge** (Caddy) balances a device's batch over the API replicas.
+2. An **API replica** checks the device token and admission control before reading the body,
+   validates each report in C (msgspec), publishes each to JetStream with a de-duplication id, and
+   answers `202` only once all of them are stored.
+3. **TELEMETRY** partitions reports by device (a `partition(16)` mapping in the broker), so each
+   device's reports stay in order.
+4. The **engine** that holds the partition's lease applies a batch in one transaction — fencing
+   token, one indexed PostGIS match for the whole batch, the state machine, set-based writes and
+   outbox events — and only then acknowledges it.
+5. Positions leave as binary frames per map tile, alerts through the **EVENTS** stream; each API
+   replica relays them to exactly the sockets that want them.
 
 | Component | Role |
 |---|---|
@@ -210,37 +204,33 @@ reserved for transitions, so a device parked inside a zone does not page its own
 
 ### 5. WebSocket architecture: encode once, filter at the broker, never wait on a socket
 
-- **Positions are binary.** A tile frame holds ids and fixed-point columns: 26 bytes per device,
-  against 100–120 as compact JSON with the same fields. The engine encodes it once; API replicas
-  forward the bytes to every interested socket without decoding them, and browsers read the columns
-  straight into WebGL buffers.
-- **The broker does the filtering.** Frames are published per map tile on `pos.<d1>.<d2>…<d12>`,
-  one quadkey digit per subject token. A replica subscribes to the smallest set of prefixes covering
-  its clients' viewports (`pos.1.2.0.>` for a wide view, twelve digits for a street), so it receives
-  only what someone it serves is looking at.
-- **Producers never await a socket.** Each connection has a reader task, a writer task and two
-  bounded lanes: events (by count) and positions (by bytes). A client that falls behind on
-  positions has them dropped and gets a `resync` (positions are state; the next snapshot is newer);
-  one that falls behind on events is closed with 4008 and resumes by sequence. A stalled client
-  costs its own lanes, nobody else's latency.
+- **Positions are binary:** 26 bytes per device in a tile frame, against 100–120 as compact JSON
+  with the same fields. The engine encodes a frame once; API replicas forward the same bytes to
+  every interested socket, and browsers read the columns straight into WebGL buffers.
+- **The broker does the filtering:** frames go out per map tile on `pos.<d1>.<d2>…<d12>`, one
+  quadkey digit per subject token. A replica subscribes to the smallest set of prefixes covering
+  its clients' viewports (`pos.1.2.0.>` for a wide view, twelve digits for a street), so it
+  receives only what someone it serves is looking at.
+- **Producers never await a socket:** each connection has a reader, a writer and two bounded
+  lanes (events by count, positions by bytes). A client behind on positions has them dropped and
+  gets a `resync`; one behind on events is closed with 4008 and resumes by sequence. A stalled
+  client costs its own lanes, nobody else's latency.
 - **Snapshots** of a newly viewed area come from PostGIS, cached per tile for a second and shared
   by concurrent requests, so a room of reconnecting dashboards runs one query.
 
 ### 6. WebSocket state management: many sessions per user
 
-- **Per replica:** the hub keeps each open socket's session (its viewport's tile prefixes, its lanes,
-  its resume position), one feed per user it serves (a single broker subscription carries that
-  user's events, pulses and session notices), and an interest trie of the tiles its clients view.
-  Nothing else is held in memory: a replica that dies loses only its sockets, and they reconnect
-  to the other.
+- **Per replica:** each open socket's session (its viewport's tile prefixes, its lanes, its resume
+  position), one feed per user served (a single broker subscription carries that user's events,
+  pulses and session notices) and an interest trie of the viewed tiles. Nothing else lives in
+  memory: a replica that dies loses only its sockets, and they reconnect to another.
 - **Cluster-wide:** a KV bucket lists every live session of a user on every replica (the Sessions
-  panel); signing one out revokes its token everywhere and closes its socket with 4001. A socket
-  also closes, with 4002, when its token expires.
-- **Durable events:** alerts and zone changes are written to a transactional outbox with the
-  change, relayed to the `EVENTS` stream (right after the commit, plus a sweeper for crashes in
-  between) and de-duplicated by id. Each user's events form one sequence chain: every event carries
-  the user's previous sequence, so a replica notices a gap and fills it from the stream before
-  delivering anything else.
+  panel). Signing one out revokes its token everywhere and closes its socket with 4001; a socket
+  whose token expires is closed with 4002.
+- **Durable events:** alerts and zone changes go through a transactional outbox to the `EVENTS`
+  stream (right after the commit, plus a sweeper for crashes in between), de-duplicated by id.
+  Every event carries the user's previous sequence, so a replica notices a gap and fills it from
+  the stream before delivering anything else.
 - **Resume:** a browser remembers the last sequence it received; after a reconnect, to any replica,
   it sends `resume_after` and gets exactly the events it missed, then continues live.
 
@@ -259,30 +249,28 @@ API pool.
 Validation and serialisation run in C (msgspec, pydantic-core), distance maths in PostGIS, binary
 frames are packed with `array`/`struct`, and queues, waits and sends are bounded. Each process
 measures its own event-loop lag and exports it (`perimeter_event_loop_lag_seconds`, and the
-dashboard's Pipeline panel), so "nothing blocks the loop" is measured: ⟪LOOPLAG⟫ at the brief's
-load.
+dashboard's Pipeline panel), so "nothing blocks the loop" is measured: p99 about 3 ms at the
+brief's load.
 
 ### 9. Secure by default
 
-- **No secrets in the environment, the compose file or git.** A one-shot job generates every
-  credential into a volume on first start; each service mounts only its own directory of it and
-  reads `*_FILE` settings. PostgreSQL gets SCRAM verifiers, NATS bcrypt hashes.
-- **Least privilege.** Separate database roles (the schema owner for migrations, a row-only role
-  for the services). Per-service broker users with subject allow-lists: no service can delete or
-  purge a stream, and the API cannot touch the engine's consumers (`make audit-broker` checks the
-  broker's log for any refusal).
-- **Containers** run as non-root users with read-only root file systems, no capabilities,
-  `no-new-privileges`, resource limits and `internal` networks for the database and broker; only
-  the edge publishes a port, on 127.0.0.1 by default. Base images are pinned by digest, with
-  Dependabot proposing updates.
-- **HTTP**: a strict Content-Security-Policy (the API reference page is served by the edge itself,
+- **No secrets in the environment, the compose file or git:** a one-shot job generates every
+  credential into a volume, and each service mounts only its own directory of it (`*_FILE`
+  settings). PostgreSQL gets SCRAM verifiers, NATS bcrypt hashes.
+- **Least privilege:** a schema-owner role for migrations, a row-only role for the services;
+  per-service broker users with subject allow-lists — no service can delete or purge a stream, and
+  the API cannot touch the engine's consumers (`make audit-broker` fails on any refusal).
+- **Containers:** non-root users, read-only root file systems, no capabilities,
+  `no-new-privileges`, resource limits, `internal` networks for the database and broker. Only the
+  edge publishes a port, on 127.0.0.1 (the `make observe` UIs as well). Base images are pinned by
+  digest, and Dependabot proposes updates.
+- **HTTP:** a strict Content-Security-Policy (the API reference page is served by the edge, with
   scripts from its own origin only), `nosniff`, `frame-ancestors 'none'`, `Referrer-Policy`,
   `Permissions-Policy`.
-- **Sessions**: a browser's token lives only in an HttpOnly, SameSite cookie and never in a
-  response body; scripts get bearer tokens from `POST /v1/token`. Tokens are never accepted in
-  URLs. A socket authenticated by the cookie must come from an allowed `Origin` (no cross-site
-  WebSocket hijacking). Sign-in and zone changes are rate-limited, and an account keeps at most
-  `ZONE_MAX_PER_USER` zones.
+- **Sessions:** a browser's token lives only in an HttpOnly, SameSite cookie, never in a response
+  body; scripts get bearer tokens from `POST /v1/token`, and no token is accepted in a URL. A
+  cookie-authenticated socket must come from an allowed `Origin`. Sign-in and zone changes are
+  rate-limited, and an account keeps at most `ZONE_MAX_PER_USER` zones.
 
 ### 10. Observable end to end
 
@@ -298,7 +286,17 @@ Measured on a laptop (Apple M5 Pro; Docker in an 8-vCPU VM) with the stack exact
 load going through the edge like real devices. Methods, commands and full tables:
 [docs/benchmarks.md](docs/benchmarks.md).
 
-⟪MEASURED⟫
+| Scenario | Result |
+|---|---|
+| **10,000 devices, a report every 3 s** (the brief), 5 min | 980,063 of 980,063 reports accepted; `202` p99 **16 ms**; position device → socket p50 130 ms, p99 214 ms; alert p50 84 ms, p99 153 ms; event-loop lag p99 3 ms |
+| 10,000 devices, a report every second | 9,400 reports/s, nothing lost; `202` p99 22 ms; position p99 214 ms; alert p99 144 ms |
+| 10,000 devices, one HTTP request per report | 3,165 requests/s, all accepted; `202` p99 150 ms |
+| 10,000 devices over 32 WebSockets (credit) | 380,229 accepted, 0 errors; ack p99 16 ms |
+| 30,000 devices, a report every second | **28,000 reports/s** accepted and applied, none shed or lost |
+| 60,000 devices, a report every second (overload) | 32,000 reports/s applied; ingest sheds with `503` + `Retry-After` above a 150k backlog; 0 accepted reports lost; the rest of the API answers throughout |
+| **200 dashboards** watching the whole fleet | 666,000 positions/s delivered (3,330 per viewer); p50 140 ms, p99 195 ms |
+| **Engine killed** (SIGKILL) under load | 0 reports lost, 0 duplicate or missing alerts (1,290 / 1,290 received live); orphaned partitions owned again after 7 s |
+| **API replica killed** under load | 0 reports lost; sessions on the killed replica reconnect to the other and resume by sequence (1,348 / 1,348 alerts received live) |
 
 ## API
 
@@ -359,20 +357,19 @@ uv run generator.py --token-file .secrets/ingest_token --observe demo --zones 20
 
 Without uv, `pip install aiohttp` and `python3 generator.py …` works the same (Python 3.11+).
 
-- **Realistic movement.** Random-waypoint trips with turn-rate-limited curves and pauses;
-  vehicles, cyclists and pedestrians at their own speeds; 5 % of devices never move; Gaussian GPS
-  noise; longitude steps scaled by latitude. `--seed` replays the same fleet and trips.
-- **Open loop.** Every device reports on its own schedule whatever the server does, so an
-  overloaded server shows up as throttling and dropped reports instead of a politely lowered load.
-  One clock task and a heap schedule the fleet — no task per device.
-- **Batching like a gateway.** Reports of many devices share requests (up to 250 per request over
-  32 connections) or WebSocket frames (`--transport ws`, with credit flow control); `--batch 1`
-  sends one request per report. `503`/`429` `Retry-After` pause only the connection that got them.
-- **Observe mode.** `--observe NAME` signs in, creates demo zones (`--zones`, kept with
-  `--keep-zones`), opens the live channel and measures device-to-browser latency of positions and
-  alerts.
-- **A summary that balances.** Every report ends accepted, rejected (by code) or dropped (by
-  reason), and `--json FILE` (or `-` for standard output) writes the summary for scripts.
+- **Realistic movement:** random-waypoint trips with turn-rate-limited curves and pauses;
+  vehicles, cyclists and pedestrians at their own speeds; 5 % that never move; GPS noise. `--seed`
+  replays the same fleet and trips.
+- **Open loop:** every device reports on its own schedule whatever the server does, so overload
+  shows up as throttling and dropped reports, not as a politely lowered load. One clock task and a
+  heap schedule the fleet — no task per device.
+- **Batching like a gateway:** up to 250 reports per request over 32 connections, or WebSocket
+  frames with credit flow control (`--transport ws`); `--batch 1` sends a request per report.
+  `Retry-After` pauses only the connection that got it.
+- **Observe mode:** `--observe NAME` signs in, creates demo zones (`--zones`, kept with
+  `--keep-zones`), watches the live channel and measures device-to-browser latency.
+- **A summary that balances:** every report ends accepted, rejected (by code) or dropped (by
+  reason); `--json FILE` (`-` for standard output) writes it for scripts.
 
 ## Tests
 
@@ -383,19 +380,20 @@ make lint typecheck
 cd web && npm ci && npm test
 ```
 
-⟪TESTS⟫ `mypy --strict` and Ruff are clean. Integration tests run against real PostgreSQL + PostGIS
-and NATS started by testcontainers (or services named by `TEST_DATABASE_URL` / `TEST_NATS_URL`).
+798 Python tests (494 unit, 304 integration) with 94 % line and branch coverage, and 576 web
+tests; `mypy --strict`, Ruff, TypeScript and Biome are clean. Integration tests run against real
+PostgreSQL + PostGIS and NATS started by testcontainers (or services named by
+`TEST_DATABASE_URL` / `TEST_NATS_URL`).
 Highlights, detailed in [docs/design.md](docs/design.md#6-tests-worth-knowing-about):
 
-- **Spatial correctness**: Hypothesis with GeographicLib as the oracle, up to ±84° and across the
-  antimeridian, and every circle, polar ones included, inside its envelope; indexed matching equal
-  to the naive join; `EXPLAIN` asserts the index plans.
-- **The state machine**: any split of a track into batches gives the same alerts; replays are
+- **Spatial correctness:** GeographicLib as the oracle for Hypothesis (up to ±84° and across the
+  antimeridian; every circle, polar ones included, inside its envelope); indexed matching equal to
+  the naive join; `EXPLAIN` asserts the index plans.
+- **The state machine:** any split of a track into batches gives the same alerts; replays are
   no-ops; enter and exit alternate; dwell fires once per stay.
-- **Failure paths on real infrastructure**: fencing, takeover, a recreated lease bucket, track
-  maintenance under a backup's locks, zones deleted and deactivated mid-batch, pool exhaustion.
-- **The live channel with two real API servers** sharing one broker, and **the broker's permission
-  matrix** on a secured server.
+- **Failure paths on real infrastructure:** fencing, takeover, a recreated lease bucket, track
+  maintenance behind a backup's locks, zones deleted mid-batch; the live channel with two real API
+  servers on one broker; the broker's permission matrix on a secured server.
 
 CI (`.github/workflows/ci.yml`) runs lint, types and the full suite with a coverage floor of 90 %,
 the web gates, and a stack job that builds the images, starts the stack, runs `make smoke`, kills
@@ -404,22 +402,22 @@ for refusals.
 
 ## Limits and next steps
 
-- **One PostgreSQL, one NATS server.** Streams and buckets have one replica, so a crashed broker or
+- **One PostgreSQL, one NATS server:** streams and buckets have one replica, so a crashed broker or
   database stops the pipeline until it restarts (durable state survives). A three-node NATS cluster
-  (R3 streams) and a PostgreSQL replica change configuration, not code.
-- **PostgreSQL bounds throughput here** (⟪CEILING⟫ reports/s on this laptop, tracks included). Next
-  steps would be `COPY` for the track inserts and a separate store for position history
-  (TimescaleDB or a columnar store), keeping the transactional state small.
-- **Positions are fleet-wide**, as in the brief: every user sees every device, while zones and
-  alerts are per user. Tenant-scoped fleets would add a tenant token to the position subjects.
-- **One device token** authenticates every device; per-device credentials (or mTLS at the edge) would
-  let a single device be revoked.
-- **Mocked sign-in** (a username, no password), as the brief allows: anyone can create accounts,
-  so per-account limits bound each one but not their number. The rest of the system only sees the
-  signed token's claims, so an OIDC provider replaces one module.
+  and a PostgreSQL replica change configuration, not code.
+- **Throughput on one host** tops out around 32,000 reports/s applied (tracks included), with
+  PostgreSQL and NATS the busiest components. `COPY` for the track inserts, a separate store for
+  position history (TimescaleDB, or a columnar store) and a NATS cluster would come next.
+- **Positions are fleet-wide**, as in the brief (zones and alerts are per user); tenant-scoped
+  fleets would add a tenant token to the position subjects.
+- **One device token** authenticates every device; per-device credentials (or mTLS at the edge)
+  would let one device be revoked.
+- **Mocked sign-in**, as the brief allows: anyone can create accounts, so per-account limits bound
+  each account but not their number. The rest of the system only sees the signed token's claims,
+  so an OIDC provider replaces one module.
 - **Failover pause:** a crashed engine's partitions wait for its leases to expire (6 s) plus one
   round; a shorter `ENGINE_LEASE_TTL_S` trades broker writes for faster takeover.
-- **Alerts are report-driven:** a device that goes silent inside a zone stays inside it until it
-  reports again; a staleness timeout could close such stays.
-- **Plain HTTP on localhost.** Caddy can terminate TLS by itself for a real hostname; set
+- **Report-driven alerts:** a device that goes silent inside a zone stays inside until it reports
+  again; a staleness timeout could close such stays.
+- **Plain HTTP on localhost:** Caddy terminates TLS by itself for a real hostname; set
   `SECURE_COOKIES=true` behind TLS.
