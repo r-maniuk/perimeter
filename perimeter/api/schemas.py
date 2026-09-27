@@ -26,8 +26,10 @@ from pydantic import (
 from perimeter.domain.presence import TransitionKind
 
 DEFAULT_COLOR = "#6d5dfc"
-USERNAME_PATTERN = r"^[a-z0-9][a-z0-9_.-]{1,31}\z"
-COLOR_PATTERN = r"^#[0-9a-f]{6}\z"
+# Checked by pydantic's Rust regex engine, where ``$`` is the end of the text, as it is for the
+# JavaScript that reads published patterns (``\z`` would be a plain "z" there).
+USERNAME_PATTERN = r"^[a-z0-9][a-z0-9_.-]{1,31}$"
+COLOR_PATTERN = r"^#[0-9a-f]{6}$"
 
 
 def _stripped_lower(value: object) -> object:

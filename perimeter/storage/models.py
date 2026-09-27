@@ -30,7 +30,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import CITEXT
+from sqlalchemy.dialects.postgresql import CITEXT, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 NAMING = {
@@ -143,6 +143,7 @@ class OutboxMessage(Base):
     subject: Mapped[str] = mapped_column(Text)
     msg_id: Mapped[str] = mapped_column(Text)
     payload: Mapped[bytes] = mapped_column(LargeBinary)
+    trace_context: Mapped[dict[str, str] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

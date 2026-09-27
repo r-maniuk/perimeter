@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from collections import defaultdict
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 
 import pytest
 from nats.aio.client import Client as NatsClient
@@ -17,6 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from perimeter.bus import topology
+from perimeter.bus.leases import FencingToken, Lease
 from perimeter.config import (
     EngineSettings,
     LiveSettings,
@@ -26,8 +28,15 @@ from perimeter.config import (
 )
 from perimeter.domain import tiles
 from perimeter.domain.reports import TelemetryRecord
+from perimeter.engine.batch import FencedOut
 from perimeter.engine.service import EngineService, StartupError
-from perimeter.engine.worker import unacknowledged
+from perimeter.engine.worker import (
+    LeaseHandle,
+    PartitionSubscription,
+    PartitionWorker,
+    WorkerExit,
+    unacknowledged,
+)
 from perimeter.wire import subjects, telemetry
 from perimeter.wire.frames import FrameKind, decode_tile
 from tests.support import eventually
@@ -348,6 +357,74 @@ async def test_the_unacknowledged_range_of_a_partition_is_read_back_in_order(
     for m in delivered[2:]:
         await m.ack_sync()
     assert await unacknowledged(js, partition) == []
+
+
+async def test_a_fenced_worker_hands_back_what_it_holds_and_takes_nothing_more(
+    nc: NatsClient, js: JetStreamContext, provisioned: topology.Topology
+) -> None:
+    # A zombie woken after a takeover. While it applied its last batch, a status answer to one of
+    # its pull requests and one more report reached its inbox: it hands that report back, and must
+    # not ask the broker for the reports behind it, which the partition's new owner is to fetch.
+    reports = zigzag(1, range(4))
+    await publish(js, reports[:1])
+    partition = await partition_of(js, "veh-000")
+    consumer = subjects.engine_consumer(partition)
+    zombie = await PartitionSubscription.bind(nc, partition)
+    arrivals = await nc.subscribe(zombie.inbox)  # sees whatever reaches the zombie's inbox
+
+    async def pull() -> None:  # answered after the zombie's fetch stopped waiting for it
+        await nc.publish(
+            f"$JS.API.CONSUMER.MSG.NEXT.{subjects.TELEMETRY_STREAM}.{consumer}",
+            b'{"batch": 1, "no_wait": true}',
+            reply=zombie.inbox,
+        )
+
+    async def arrived(matches: Callable[[Msg], bool]) -> None:
+        while not matches(await arrivals.next_msg(timeout=5)):
+            pass
+
+    class Fenced:
+        async def apply(
+            self,
+            partition: int,
+            token: FencingToken,
+            records: Sequence[TelemetryRecord],
+            *,
+            trace: Mapping[str, str] | None = None,
+        ) -> object:
+            await pull()  # nothing is left to deliver, so the broker answers with a status
+            await arrived(lambda msg: bool(msg.headers and "Status" in msg.headers))
+            await publish(js, reports[1:2])
+            await pull()  # this time a report arrives
+            await arrived(lambda msg: msg.data == telemetry.encode(reports[1]))
+            await publish(js, reports[2:])  # the reports the new owner is about to fetch
+            await nc.flush()  # the zombie's inbox has received all the spy has
+            raise FencedOut("a newer owner has committed")
+
+    async def subscribe() -> PartitionSubscription:
+        return zombie
+
+    async def nothing_left() -> list[tuple[str, bytes]]:
+        return []
+
+    worker = PartitionWorker(
+        partition,
+        subscribe=subscribe,
+        in_flight=nothing_left,
+        processor=Fenced(),
+        lease=LeaseHandle(Lease(f"p.{partition}", "engine-z", 1, 1), valid_until=math.inf),
+        batch_max=1,
+        fetch_wait_s=1.0,
+    )
+    assert await asyncio.wait_for(worker.run(), 15) is WorkerExit.FENCED
+    await arrivals.unsubscribe()
+    info = await js.consumer_info(subjects.TELEMETRY_STREAM, consumer)
+    assert info.num_pending == 2, "the reports behind what the zombie held were never delivered"
+    successor = await js.pull_subscribe_bind(durable=consumer, stream=subjects.TELEMETRY_STREAM)
+    delivered = await successor.fetch(len(reports), timeout=2)  # well within the 3 s ack wait
+    assert {
+        telemetry.decode(m.data).recorded_at_ms - T0: m.metadata.num_delivered for m in delivered
+    } == {0: 2, 1_000: 2, 2_000: 1, 3_000: 1}  # both handed back at once, the rest new
 
 
 async def test_the_heartbeat_describes_the_engine(engines: Start, nc: NatsClient) -> None:

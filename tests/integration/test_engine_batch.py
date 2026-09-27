@@ -24,6 +24,7 @@ from perimeter.domain.reports import TelemetryRecord
 from perimeter.engine import sql
 from perimeter.engine.batch import BatchProcessor, FencedOut
 from perimeter.engine.metrics import EngineStats
+from perimeter.ops import tracing
 from perimeter.storage.outbox import OutboxRow
 from perimeter.wire import subjects
 from tests.support import eventually
@@ -465,6 +466,36 @@ async def test_an_alert_whose_publish_failed_is_swept_to_the_owner_exactly_once(
     await asyncio.sleep(0.05)
     assert len(received) == 1
     assert json.loads(received[0].data)["data"]["kind"] == "enter"
+    assert "traceparent" not in (received[0].headers or {})  # tracing is off: nothing to carry
+
+
+async def test_an_alert_swept_after_its_publish_failed_stays_in_the_trace_of_its_batch(
+    db: AsyncEngine,
+    stream: StreamPublisher,
+    provisioned: topology.Topology,
+    nc: NatsClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tracing, "_enabled", True)  # spans are made, and exported nowhere
+    trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+    owner = await make_user(db)
+    await make_zone(db, owner)
+    unlucky = BatchProcessor(
+        db, UnreachableRelay(db, stream), LiveRecorder(), owner="engine-test", stats=EngineStats()
+    )
+    ingest = {"traceparent": f"00-{trace_id}-00f067aa0ba902b7-01"}  # the report's request
+    await unlucky.apply(PARTITION, TOKEN, [report(T0)], trace=ingest)
+    received: list[Msg] = []
+
+    async def collect(msg: Msg) -> None:
+        received.append(msg)
+
+    await nc.subscribe(subjects.live_events(owner), cb=collect)
+    relay = OutboxRelay(db, stream, sweep_min_age_s=0.0)
+    assert await relay.sweep_once() == 1  # outside any span, as the sweeper always runs
+    await eventually(lambda: received)
+    assert received[0].headers is not None
+    assert received[0].headers["traceparent"].split("-")[1] == trace_id
 
 
 async def test_every_report_is_kept_in_the_track_once_late_ones_included(

@@ -138,6 +138,7 @@ async def test_unknown_or_malformed_device_ids(client: httpx.AsyncClient) -> Non
     assert (await client.get("/v1/devices/nobody/trail", headers=alice)).status_code == 404
     assert (await client.get("/v1/devices/a.b", headers=alice)).status_code == 422
     assert (await client.get("/v1/devices/veh-1%0A", headers=alice)).status_code == 422
+    assert (await client.get("/v1/devices/veh-1%0A/trail", headers=alice)).status_code == 422
     assert (await client.get("/v1/devices", params={"limit": 0}, headers=alice)).status_code == 422
 
 

@@ -37,6 +37,7 @@ from perimeter.domain import tiles
 from perimeter.domain.reports import LocationReport, ms_to_datetime
 from perimeter.wire import frames as reference
 from perimeter.wire.events import EventType, encode_event, live_frame, make_event
+from tests.support import eventually
 
 ROOT = Path(__file__).resolve().parents[2]
 TOKEN = "ingest-secret"
@@ -139,6 +140,12 @@ class FakeApi:
         # observe mode
         self.zones: dict[str, dict[str, Any]] = {}
         self.deleted: list[str] = []
+        self.zone_burst: int | None = None  # zone changes allowed at once, then one per interval
+        self.zone_interval_s = 0.05
+        self.zone_refusal = 429
+        self.zone_refused = 0
+        self._zone_tokens = 0.0
+        self._zone_counted_at: float | None = None
         self.viewports: list[dict[str, Any]] = []
         self.signed_out = False
         self.live_sessions = 0
@@ -347,9 +354,30 @@ class FakeApi:
         self.signed_out = True
         return web.Response(status=204)
 
+    def _zone_change_refused(self) -> web.Response | None:
+        """The API's limit on zone changes: a token bucket per account, answered with a pause."""
+        if self.zone_burst is None:
+            return None
+        now = asyncio.get_running_loop().time()
+        if self._zone_counted_at is None:
+            self._zone_tokens = float(self.zone_burst)
+        else:
+            refill = (now - self._zone_counted_at) / self.zone_interval_s
+            self._zone_tokens = min(float(self.zone_burst), self._zone_tokens + refill)
+        self._zone_counted_at = now
+        if self._zone_tokens >= 1.0:
+            self._zone_tokens -= 1.0
+            return None
+        self.zone_refused += 1
+        wait_s = (1.0 - self._zone_tokens) * self.zone_interval_s
+        return problem(self.zone_refusal, "rate_limited", {"Retry-After": f"{wait_s:.3f}"})
+
     async def create_zone(self, request: web.Request) -> web.Response:
         if not self._signed_in(request):
             return problem(401, "unauthorized")
+        refused = self._zone_change_refused()
+        if refused is not None:
+            return refused
         zone = await request.json()
         if zone_problems(zone):
             return problem(422, "validation_failed")
@@ -359,6 +387,10 @@ class FakeApi:
 
     async def delete_zone(self, request: web.Request) -> web.Response:
         zone_id = request.match_info["zone_id"]
+        if self._signed_in(request):
+            refused = self._zone_change_refused()
+            if refused is not None:
+                return refused
         if not self._signed_in(request) or self.zones.pop(zone_id, None) is None:
             return problem(404, "not_found")
         self.deleted.append(zone_id)
@@ -814,6 +846,57 @@ async def test_observe_mode_measures_latency_and_counts_each_alert_once(api: Fak
         assert south <= lat <= north
     assert len(api.viewports) == 2  # the resync was answered with the viewport again
     assert "e2e p50/p99" in out
+
+
+@pytest.mark.parametrize("refusal", [429, 503])
+async def test_observe_mode_waits_out_the_limit_on_zone_changes(api: FakeApi, refusal: int) -> None:
+    # Past its burst the API refuses zone changes with a pause, both when they are created and
+    # when they are deleted again: every one of them is made all the same.
+    api.zone_burst, api.zone_refusal = 3, refusal
+    result, out, _ = await run_generator(
+        settings(api, observe="load-watcher", zones=12, duration=0.5)
+    )
+    assert result.exit_code == 0
+    observe = result.summary["observe"]
+    assert observe["zones_created"] == observe["zones_deleted"] == 12
+    assert not api.zones
+    assert api.zone_refused >= 2 * 9  # 9 of the 12 waited when created, and when deleted
+    assert "demo zones created; the API limits zone changes, waiting" in out
+    assert "12 of 12 demo zones created in" in out
+    assert "12 of 12 demo zones deleted in" in out
+    assert "zones      12 created, 12 deleted" in out
+
+
+async def test_a_zone_change_the_api_keeps_refusing_is_given_up_after_a_bound(
+    api: FakeApi,
+) -> None:
+    api.zone_burst, api.zone_interval_s = 0, 0.01  # every change is refused, 10 ms at a time
+    result, _, err = await run_generator(settings(api, observe="load-watcher", zones=3))
+    assert result.exit_code == generator.EXIT_UNREACHABLE
+    assert "creating zone 'Load zone 01' failed: HTTP 429" in err
+    assert api.zone_refused == generator.ZONE_ATTEMPTS  # the first zone, then nothing more
+
+
+async def test_an_interrupt_stops_creating_zones_and_the_ones_made_are_deleted(
+    api: FakeApi,
+) -> None:
+    api.zone_burst, api.zone_interval_s = 2, 0.2  # 100 zones would take 20 s
+    stop = asyncio.Event()
+
+    async def interrupt_once_a_few_exist() -> None:
+        await eventually(lambda: len(api.zones) >= 4, interval=0.01)
+        stop.set()
+
+    interrupting = asyncio.create_task(interrupt_once_a_few_exist())
+    result, _, _ = await run_generator(
+        settings(api, observe="load-watcher", zones=100, duration=30), stop=stop
+    )
+    await interrupting
+    observe = result.summary["observe"]
+    assert (result.exit_code, result.summary["stop_reason"]) == (0, "interrupted")
+    assert 4 <= observe["zones_created"] < 10
+    assert observe["zones_deleted"] == observe["zones_created"]
+    assert not api.zones
 
 
 async def test_observe_mode_resumes_events_after_the_live_channel_drops(api: FakeApi) -> None:

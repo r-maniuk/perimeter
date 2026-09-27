@@ -3,7 +3,8 @@
 A worker consumes its partition only under the partition's lease, and acts on that in three
 places: it stops fetching as soon as the lease is no longer known to be valid, every batch it
 applies is fenced with the lease's *current* token (a paused worker that lost the lease cannot
-commit), and when it stops it hands messages it has not applied straight back to the broker.
+commit), and when it stops it hands the messages it holds but has not applied straight back to the
+broker, without asking it for any more.
 
 Taking a partition over starts with recovery. Messages the previous owner was given but never
 acknowledged (it crashed, or froze past its lease) come back from the broker only when their ack
@@ -36,7 +37,9 @@ from enum import Enum, StrEnum
 from typing import Literal, NamedTuple, Protocol
 
 import structlog
+from nats.aio.client import Client as NatsClient
 from nats.aio.msg import Msg
+from nats.aio.subscription import Subscription
 from nats.js import JetStreamContext
 from nats.js.errors import NotFoundError
 
@@ -52,7 +55,7 @@ log = structlog.get_logger(__name__)
 
 LEASE_POLL_S = 0.1
 MIN_FETCH_S = 0.05  # a lease about to lapse fetches nothing rather than a sliver
-DRAIN_FETCH_TIMEOUT_S = 0.1
+ARRIVED_READ_S = 0.1  # reading a message that has already arrived never takes this long
 
 _DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _MAX_TIMESTAMP_MS = 253_402_300_799_999  # 9999-12-31T23:59:59.999Z, the end of timestamptz input
@@ -120,16 +123,70 @@ class Backoff:
 
 
 class PullSubscription(Protocol):
+    async def fetch(
+        self,
+        batch: int,
+        timeout: float,  # noqa: ASYNC109 - nats-py's own signature
+    ) -> list[Msg]: ...
+
+    async def arrived(self) -> list[Msg]: ...
+
+    async def unsubscribe(self) -> None: ...
+
+
+class PartitionSubscription:
+    """The pull subscription of a partition's consumer, bound as nats-py binds one.
+
+    nats-py's ``fetch`` returns the messages that have already arrived first, but it always sends
+    a new pull request as well, and its ``pending_msgs`` also counts the broker's status answers
+    (a ``408`` of a request that expired just after the client gave up on it). Handing messages
+    back must not ask the broker for anything, so :meth:`arrived` reads the inbox subscription
+    underneath, which only takes what its own buffer holds.
+    """
+
+    def __init__(self, inbox: Subscription, pull: JetStreamContext.PullSubscription) -> None:
+        self._inbox = inbox
+        self._pull = pull
+
+    @classmethod
+    async def bind(cls, nc: NatsClient, partition: int) -> PartitionSubscription:
+        """What ``pull_subscribe_bind`` does, keeping hold of the inbox subscription."""
+        inbox = await nc.subscribe(nc.new_inbox())
+        pull = JetStreamContext.PullSubscription(
+            js=nc.jetstream(),
+            sub=inbox,
+            stream=subjects.TELEMETRY_STREAM,
+            consumer=subjects.engine_consumer(partition),
+            deliver=inbox.subject.encode(),
+        )
+        return cls(inbox, pull)
+
     @property
-    def pending_msgs(self) -> int: ...
+    def inbox(self) -> str:
+        """The subject the broker delivers this subscription's messages to."""
+        return self._inbox.subject
 
     async def fetch(
         self,
-        batch: int = ...,
-        timeout: float | None = ...,  # noqa: ASYNC109 - nats-py's own signature
-    ) -> list[Msg]: ...
+        batch: int,
+        timeout: float,  # noqa: ASYNC109 - nats-py's own signature
+    ) -> list[Msg]:
+        return await self._pull.fetch(batch, timeout)
 
-    async def unsubscribe(self) -> None: ...
+    async def arrived(self) -> list[Msg]:
+        """Take the messages that reached this subscription but no fetch returned, oldest first.
+
+        Status answers to pull requests carry no message and are dropped, as a fetch drops them.
+        """
+        taken: list[Msg] = []
+        while self._inbox.pending_msgs:
+            msg = await self._inbox.next_msg(timeout=ARRIVED_READ_S)
+            if not JetStreamContext.is_status_msg(msg):
+                taken.append(msg)
+        return taken
+
+    async def unsubscribe(self) -> None:
+        await self._inbox.unsubscribe()
 
 
 class BatchApplier(Protocol):
@@ -413,15 +470,18 @@ class PartitionWorker:
             self._log.warning("engine.settle_failed", action=action, error=repr(exc))
 
     async def _hand_back(self, sub: PullSubscription) -> None:
-        """Give undelivered-to-the-batch messages back and drop the subscription.
+        """Give back the messages that arrived after the last fetch, and drop the subscription.
 
         A message can land in the subscription's buffer just after a fetch timed out; without this
-        it would sit there until its ack wait expired and then arrive out of order elsewhere.
+        it would sit there until its ack wait expired. Only what has arrived is handed back: a
+        fetch would ask the broker for more, and once the lease is gone that takes messages from
+        the partition's new owner, which would get them back after newer reports of the same
+        devices and discard them as late. What did arrive is covered either way, since a new owner
+        first recovers everything its predecessor was given and never acknowledged.
         """
         with suppress(Exception):
-            if sub.pending_msgs:
-                for msg in await sub.fetch(sub.pending_msgs + 1, timeout=DRAIN_FETCH_TIMEOUT_S):
-                    await msg.nak()
+            for msg in await sub.arrived():
+                await msg.nak()
         with suppress(Exception):
             await sub.unsubscribe()
 

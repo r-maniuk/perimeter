@@ -1,14 +1,22 @@
 """Transactional outbox: user events are written in the same transaction as the change that
-caused them, then relayed to JetStream (see :mod:`perimeter.bus.relay`)."""
+caused them, then relayed to JetStream (see :mod:`perimeter.bus.relay`).
+
+Each row keeps the trace context of the span that wrote it (the request or the engine batch), so
+the event joins that trace whichever path relays it, and however much later. Without tracing the
+column stays empty.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
-from sqlalchemy import bindparam, text
-from sqlalchemy.dialects.postgresql import ARRAY, BIGINT, BYTEA, TEXT
+from sqlalchemy import Row, bindparam, text
+from sqlalchemy.dialects.postgresql import ARRAY, BIGINT, BYTEA, JSONB, TEXT
 from sqlalchemy.ext.asyncio import AsyncConnection
+
+from perimeter.ops import tracing
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,21 +32,23 @@ class OutboxRow:
     subject: str
     msg_id: str
     payload: bytes
+    trace_context: dict[str, str] | None = None  # headers (``traceparent``...) to publish with
 
 
 _INSERT = text(
     """
-    INSERT INTO outbox (subject, msg_id, payload)
-    SELECT subject, msg_id, payload
+    INSERT INTO outbox (subject, msg_id, payload, trace_context)
+    SELECT subject, msg_id, payload, :trace_context
     FROM unnest(CAST(:subjects AS text[]), CAST(:msg_ids AS text[]), CAST(:payloads AS bytea[]))
          WITH ORDINALITY AS e(subject, msg_id, payload, ord)
     ORDER BY ord
-    RETURNING id, subject, msg_id, payload
+    RETURNING id, subject, msg_id, payload, trace_context
     """
 ).bindparams(
     bindparam("subjects", type_=ARRAY(TEXT)),
     bindparam("msg_ids", type_=ARRAY(TEXT)),
     bindparam("payloads", type_=ARRAY(BYTEA)),
+    bindparam("trace_context", type_=JSONB(none_as_null=True)),
 )
 
 _DELETE = text("DELETE FROM outbox WHERE id = ANY(CAST(:ids AS bigint[]))").bindparams(
@@ -57,7 +67,7 @@ _CLAIM = text(
         LIMIT :limit
         FOR UPDATE SKIP LOCKED
     )
-    RETURNING id, subject, msg_id, payload
+    RETURNING id, subject, msg_id, payload, trace_context
     """
 )
 
@@ -67,6 +77,7 @@ _BACKLOG = text(
 
 
 async def insert(conn: AsyncConnection, events: Sequence[PendingEvent]) -> list[OutboxRow]:
+    """Write ``events``, each with the trace context of the span writing them, if any."""
     if not events:
         return []
     result = await conn.execute(
@@ -75,9 +86,10 @@ async def insert(conn: AsyncConnection, events: Sequence[PendingEvent]) -> list[
             "subjects": [e.subject for e in events],
             "msg_ids": [e.msg_id for e in events],
             "payloads": [e.payload for e in events],
+            "trace_context": tracing.context(),
         },
     )
-    rows = [OutboxRow(r.id, r.subject, r.msg_id, bytes(r.payload)) for r in result]
+    rows = [_outbox_row(r) for r in result]
     rows.sort(key=lambda row: row.id)
     return rows
 
@@ -96,9 +108,13 @@ async def claim_stale(
     published; rows of a caller that died before deleting them can be claimed again once it lapses.
     """
     result = await conn.execute(_CLAIM, {"min_age_s": min_age_s, "limit": limit, "hold_s": hold_s})
-    rows = [OutboxRow(r.id, r.subject, r.msg_id, bytes(r.payload)) for r in result]
+    rows = [_outbox_row(r) for r in result]
     rows.sort(key=lambda row: row.id)  # publish in commit order
     return rows
+
+
+def _outbox_row(row: Row[Any]) -> OutboxRow:
+    return OutboxRow(row.id, row.subject, row.msg_id, bytes(row.payload), row.trace_context)
 
 
 async def backlog(conn: AsyncConnection) -> tuple[int, float]:

@@ -109,6 +109,20 @@ async def test_ready_ack_and_credit_round_trip(server: str, js: JetStreamContext
     assert info.state.messages == 6
 
 
+async def test_a_device_id_ending_in_a_newline_is_refused(
+    server: str, js: JetStreamContext
+) -> None:
+    async with connect(server, additional_headers=DEVICE) as socket:
+        assert (await receive(socket))["type"] == "ready"
+        frame = reports_frame(1, 2) | {"reports": [report("veh-1\n"), report("veh-2")]}
+        await socket.send(json.dumps(frame))
+        ack = await receive(socket)
+        assert (ack["type"], ack["accepted"]) == ("ack", 1)
+        assert [(r["index"], r["code"]) for r in ack["rejected"]] == [(0, "invalid_device_id")]
+    info = await js.stream_info(subjects.TELEMETRY_STREAM)
+    assert info.state.messages == 1
+
+
 async def test_pipelined_frames_are_acknowledged_in_order(server: str) -> None:
     async with connect(server, additional_headers=DEVICE) as socket:
         await receive(socket)

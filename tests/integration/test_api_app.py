@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import httpx
@@ -9,6 +11,27 @@ from fastapi import FastAPI
 from perimeter.api.security import RevocationList
 from perimeter.api.state import AppState
 from tests.support import eventually
+
+# Escapes that Python's re reads as anchors, and JavaScript as the letters themselves.
+PYTHON_ONLY_ANCHORS = re.compile(r"\\[AZz]")
+
+
+def patterns(node: object) -> Iterator[str]:
+    """Every ``pattern`` in (a part of) an OpenAPI document."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "pattern" and isinstance(value, str):
+                yield value
+            else:
+                yield from patterns(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from patterns(value)
+
+
+def as_javascript_reads_it(pattern: str) -> str:
+    """``pattern`` the way a JavaScript ``RegExp`` reads it, where the two languages differ here."""
+    return PYTHON_ONLY_ANCHORS.sub(lambda anchor: anchor[0][1], pattern)
 
 
 async def test_liveness_readiness_and_metrics(client: httpx.AsyncClient) -> None:
@@ -61,3 +84,26 @@ async def test_the_reference_declares_both_tokens_and_offers_a_fresh_ingest_exam
     stamp = datetime.fromisoformat(example["timestamp"])
     assert abs((datetime.now(UTC) - stamp).total_seconds()) < 60
     assert (await client.get("/docs")).status_code == 404  # served by the edge, not the api
+
+
+async def test_every_pattern_in_the_reference_means_the_same_in_javascript(
+    client: httpx.AsyncClient,
+) -> None:
+    # The reference's "Try it out" refuses to send a value its pattern rejects, and so does any
+    # generated client: a pattern that only Python reads right locks every such client out.
+    document = (await client.get("/openapi.json")).json()
+    assert [p for p in patterns(document) if PYTHON_ONLY_ANCHORS.search(p)] == []
+    paths = document["paths"]
+    device_ids = {
+        path: list(patterns(paths[path]))
+        for path in (
+            "/v1/devices/{device_id}",
+            "/v1/devices/{device_id}/trail",
+            "/v1/alerts",
+            "/v1/telemetry",
+        )
+    }
+    assert all(device_ids.values())  # every one of them describes the device id with a pattern
+    for published in device_ids.values():
+        for pattern in published:
+            assert re.search(as_javascript_reads_it(pattern), "dev-00001"), pattern

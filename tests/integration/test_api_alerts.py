@@ -176,6 +176,7 @@ async def test_alerts_outlive_their_zone(client: httpx.AsyncClient, world: dict[
     [
         ({"kind": "teleport"}, 422, "validation_failed"),
         ({"device_id": "veh.1"}, 422, "validation_failed"),
+        ({"device_id": "veh-1\n"}, 422, "validation_failed"),
         ({"zone_id": "not-a-uuid"}, 422, "validation_failed"),
         ({"since": "last tuesday"}, 422, "validation_failed"),
         ({"limit": 0}, 422, "validation_failed"),

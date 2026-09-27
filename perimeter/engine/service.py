@@ -25,7 +25,6 @@ from typing import Any
 import sqlalchemy.exc
 import structlog
 from nats.aio.client import Client as NatsClient
-from nats.js import JetStreamContext
 from nats.js.kv import KeyValue
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -47,7 +46,13 @@ from perimeter.engine.metrics import (
     heartbeat_payload,
 )
 from perimeter.engine.tiles import TilePublisher
-from perimeter.engine.worker import Backoff, LeaseHandle, PartitionWorker, unacknowledged
+from perimeter.engine.worker import (
+    Backoff,
+    LeaseHandle,
+    PartitionSubscription,
+    PartitionWorker,
+    unacknowledged,
+)
 from perimeter.ops import tracing
 from perimeter.ops.heartbeat import Heartbeat, instance_id
 from perimeter.ops.looplag import LoopLagMonitor
@@ -130,8 +135,8 @@ class EngineService:
         )
         tracing.instrument_database(self._db)
         try:
-            self._nc = await connect(settings.nats, name=f"perimeter-engine/{self.instance}")
-            js = self._nc.jetstream()
+            self._nc = nc = await connect(settings.nats, name=f"perimeter-engine/{self.instance}")
+            js = nc.jetstream()
             await topology.verify(js, topo)
             await self._wait_for_database(self._db)
             ttl_s, kv, leases = await self._lease_bucket(self._nc)
@@ -146,7 +151,7 @@ class EngineService:
         processor = BatchProcessor(self._db, relay, tiles, owner=self.instance, stats=self._stats)
 
         def worker(partition: int, lease: LeaseHandle) -> PartitionWorker:
-            return self._worker(js, processor, partition, lease)
+            return self._worker(nc, processor, partition, lease)
 
         self._coordinator = Coordinator(
             instance=self.instance,
@@ -216,15 +221,15 @@ class EngineService:
 
     def _worker(
         self,
-        js: JetStreamContext,
+        nc: NatsClient,
         processor: BatchProcessor,
         partition: int,
         lease: LeaseHandle,
     ) -> PartitionWorker:
-        async def subscribe() -> JetStreamContext.PullSubscription:
-            return await js.pull_subscribe_bind(
-                durable=subjects.engine_consumer(partition), stream=subjects.TELEMETRY_STREAM
-            )
+        js = nc.jetstream()
+
+        async def subscribe() -> PartitionSubscription:
+            return await PartitionSubscription.bind(nc, partition)
 
         async def in_flight() -> list[tuple[str, bytes]]:
             return await unacknowledged(js, partition)

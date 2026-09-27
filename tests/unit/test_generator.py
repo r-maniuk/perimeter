@@ -611,6 +611,8 @@ def test_summary_renders_every_section() -> None:
                 "p99": 300.0,
                 "max": 300.0,
             },
+            "zones_created": 300,
+            "zones_deleted": 300,
         },
     }
     text = "\n".join(generator.render_summary(summary))
@@ -621,6 +623,7 @@ def test_summary_renders_every_section() -> None:
         "timeout 1",
         "e2e        p50 120 ms",
         "alerts     2 (enter 2)",
+        "zones      300 created, 300 deleted",
         "cpu 12.5%",
     ):
         assert fragment in text

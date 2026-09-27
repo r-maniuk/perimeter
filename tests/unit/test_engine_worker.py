@@ -90,9 +90,23 @@ class Wire:
             _client=cast("NatsClient", self.transport), subject=subject, reply=reply, data=data
         )
 
+    def status(self) -> Msg:
+        """The broker's answer to a pull request that expired: no report, nothing to settle."""
+        return Msg(
+            _client=cast("NatsClient", self.transport),
+            subject="_INBOX.engine",
+            headers={"Status": "408", "Description": "Request Timeout"},
+        )
+
 
 class Subscription:
-    """Serves prepared fetch results, then reports that nothing is left."""
+    """Serves prepared fetch results, then reports that nothing is left.
+
+    As with nats-py, every fetch is a pull request (``fetches`` records each one), and it returns
+    what has already arrived (``buffered``) first, dropping the broker's status answers; here the
+    broker is asked (the prepared results are served) only when that leaves nothing. ``arrived``
+    takes what has arrived and asks for nothing.
+    """
 
     def __init__(self, *results: Sequence[Msg] | BaseException) -> None:
         self.results: deque[Sequence[Msg] | BaseException] = deque(results)
@@ -102,16 +116,12 @@ class Subscription:
         self.unsubscribed = False
         self.drained = asyncio.Event()
 
-    @property
-    def pending_msgs(self) -> int:
-        return len(self.buffered)
-
     async def fetch(self, batch: int = 1, timeout: float | None = 5) -> list[Msg]:  # noqa: ASYNC109
         self.fetches.append(asyncio.get_running_loop().time())
         self.timeouts.append(timeout)
-        if self.buffered:
-            taken, self.buffered = self.buffered[:batch], self.buffered[batch:]
-            return taken
+        arrived = self._take(batch)
+        if arrived:
+            return arrived
         if not self.results:
             self.drained.set()
             await asyncio.sleep(min(timeout or 0.01, 0.01))
@@ -121,8 +131,15 @@ class Subscription:
             raise result
         return list(result)
 
+    async def arrived(self) -> list[Msg]:
+        return self._take(len(self.buffered))
+
     async def unsubscribe(self) -> None:
         self.unsubscribed = True
+
+    def _take(self, limit: int) -> list[Msg]:
+        taken, self.buffered = self.buffered[:limit], self.buffered[limit:]
+        return [msg for msg in taken if not (msg.headers and "Status" in msg.headers)]
 
 
 class Processor:
@@ -240,6 +257,50 @@ async def test_a_fenced_worker_hands_the_batch_back_at_once_and_stops() -> None:
     assert wire.transport.verdicts(batch) == ["nak", "nak"]  # no delay: the new owner needs them
     assert wire.transport.verdicts(later) == ["unsettled"]  # never fetched
     assert len(processor.calls) == 1
+
+
+async def test_a_fenced_worker_asks_the_broker_for_nothing_more() -> None:
+    # A zombie woken after a takeover: whatever it asked the broker for now would be taken from
+    # the partition's new owner, and reach it (handed back) after newer reports of the same devices.
+    wire = Wire()
+    batch = [wire.message(record("veh-1"))]
+    fresh = [wire.message(record("veh-2"))]
+    subscription = Subscription(batch, fresh)
+    processor = Processor(FencedOut("newer owner"))
+    original_apply = processor.apply
+
+    async def apply_while_a_late_answer_arrives(*args: Any, **kwargs: Any) -> object:
+        subscription.buffered.append(wire.status())  # a pull request expired meanwhile
+        return await original_apply(*args, **kwargs)
+
+    processor.apply = apply_while_a_late_answer_arrives  # type: ignore[method-assign]
+    assert await asyncio.wait_for(worker(subscription, processor).run(), 5) is WorkerExit.FENCED
+    assert wire.transport.verdicts(batch) == ["nak"]
+    assert wire.transport.verdicts(fresh) == ["unsettled"]  # never taken from the new owner
+    assert len(subscription.fetches) == 1
+    assert subscription.unsubscribed
+
+
+async def test_a_worker_that_lost_its_lease_hands_back_only_what_it_holds() -> None:
+    wire = Wire()
+    batch = [wire.message(record("veh-1"))]
+    held = wire.message(record("veh-2"))
+    fresh = [wire.message(record("veh-3"))]
+    handle = lease()
+    subscription, processor = Subscription(batch), Processor()
+    subject = worker(subscription, processor, handle)
+    task = asyncio.create_task(subject.run())
+    await subscription.drained.wait()  # the batch is applied, and the next fetch finds nothing
+    handle.revoke()  # the lease is gone: the coordinator revokes it, then stops the worker
+    asked = len(subscription.fetches)
+    subscription.buffered += [wire.status(), held]  # what reached the worker before it lapsed
+    subscription.results.append(fresh)  # what the partition's new owner is about to fetch
+    subject.stop()
+    assert await asyncio.wait_for(task, 5) is WorkerExit.STOPPED
+    assert wire.transport.verdicts(batch) == ["ack"]
+    assert wire.transport.verdicts([held]) == ["nak"]
+    assert wire.transport.verdicts(fresh) == ["unsettled"]
+    assert len(subscription.fetches) == asked, "no pull request once the lease is gone"
 
 
 def in_flight_of(*items: TelemetryRecord | bytes, fail_first: int = 0) -> InFlight:
@@ -443,11 +504,13 @@ async def test_stopping_hands_messages_that_arrived_too_late_back_to_the_broker(
     subject = worker(subscription, processor)
     task = asyncio.create_task(subject.run())
     await subscription.drained.wait()  # the worker is inside a fetch that will time out...
-    subscription.buffered.append(straggler)  # ...just as a message lands in its buffer
+    subscription.buffered += [straggler, wire.status()]  # ...just as a message lands in its buffer
+    asked = len(subscription.fetches)
     subject.stop()
     assert await asyncio.wait_for(task, 5) is WorkerExit.STOPPED
     assert wire.transport.verdicts(batch) == ["ack"]
     assert wire.transport.verdicts([straggler]) == ["nak"]
+    assert len(subscription.fetches) == asked  # handed back without asking the broker for more
     assert subscription.unsubscribed
 
 

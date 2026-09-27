@@ -47,7 +47,10 @@ Backpressure
 Observe
     ``--observe USER`` signs in, optionally creates demo zones, opens the live channel with a
     viewport over the simulated area, decodes the binary position frames and measures end-to-end
-    latency (device clock to live socket), and counts alert events and their latency.
+    latency (device clock to live socket), and counts alert events and their latency. The API limits
+    how fast an account changes its zones, so creating or deleting many of them waits out every 429
+    as its ``Retry-After`` says, with a status line now and then; an interrupt stops the creating,
+    and whatever was created is deleted at the end all the same.
 
 Reading guide, in the order a report travels
     ``Profile``, ``Device``, ``Mobility``   how a device moves and what it reports
@@ -128,6 +131,8 @@ BACKOFF_CAP_S: Final = 15.0
 RECONNECT_BASE_S: Final = 0.5
 RECONNECT_CAP_S: Final = 30.0
 OBSERVE_TAIL_S: Final = 2.0
+ZONE_ATTEMPTS: Final = 20  # times one zone change is sent at most while the API asks to wait
+ZONE_PROGRESS_EVERY_S: Final = 5.0
 WARN_EVERY_S: Final = 10.0
 MAX_LATITUDE: Final = 85.0
 AUTH_CLOSE_CODES: Final = frozenset({4001, 4003})
@@ -1572,6 +1577,49 @@ def plan_zones(
     return zones
 
 
+class ZoneProgress:
+    """Status lines while demo zones are created or deleted through the API's rate limit."""
+
+    def __init__(self, console: Console, verb: str, total: int, done: Callable[[], int]) -> None:
+        self._console = console
+        self._verb = verb
+        self._total = total
+        self._done = done
+        self._started = time.monotonic()
+        self._shown_at: float | None = None
+        self.waits = 0
+
+    def waiting(self, delay: float) -> None:
+        """Book a wait of ``delay`` seconds, and say so every ``ZONE_PROGRESS_EVERY_S`` at most."""
+        self.waits += 1
+        now = time.monotonic()
+        if self._shown_at is None or now - self._shown_at >= ZONE_PROGRESS_EVERY_S:
+            self._shown_at = now
+            self._say(f"; the API limits zone changes, waiting {delay:g} s")
+
+    def finish(self) -> None:
+        if self.waits:  # a change that never had to wait is not worth a line
+            elapsed = time.monotonic() - self._started
+            self._say(f" in {elapsed:.1f} s, after {self.waits:,} waits for the API's limit")
+
+    def _say(self, rest: str) -> None:
+        self._console.line(
+            f"[{self._console.elapsed():7.1f}s] observe: {self._done():,} of {self._total:,} "
+            f"demo zones {self._verb}{rest}"
+        )
+
+
+async def _pause(seconds: float, interrupt: asyncio.Event | None) -> bool:
+    """Sleep ``seconds``; ``False`` as soon as ``interrupt`` is set, if there is one."""
+    if interrupt is None:
+        await asyncio.sleep(seconds)
+        return True
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(seconds):
+            await interrupt.wait()
+    return not interrupt.is_set()
+
+
 def _iso_to_ms(value: Any) -> int | None:
     if not isinstance(value, str):
         return None
@@ -1588,7 +1636,13 @@ class Observer:
     """A live-map client: signs in, adds demo zones, watches the fleet and measures latency."""
 
     def __init__(
-        self, config: Config, stats: Stats, console: Console, devices: frozenset[str]
+        self,
+        config: Config,
+        stats: Stats,
+        console: Console,
+        devices: frozenset[str],
+        *,
+        interrupt: asyncio.Event,
     ) -> None:
         assert config.observe is not None
         self._config = config
@@ -1596,6 +1650,7 @@ class Observer:
         self._stats = stats
         self._console = console
         self._devices = devices
+        self._interrupt = interrupt  # the run's stop: no zone is created once it is set
         self._session: aiohttp.ClientSession | None = None
         self._token: str | None = None
         self._zones: list[str] = []
@@ -1705,19 +1760,19 @@ class Observer:
     async def _create_zones(self) -> None:
         assert self._session is not None
         radius_m = self._config.radius_km * 1000.0
-        for spec in plan_zones(
-            self._config.zones, self._config.center, radius_m, self._config.seed
-        ):
-            async with (
-                asyncio.timeout(self._config.timeout),
-                self._session.post(
-                    self._url(ZONES_PATH), json=spec, headers=self._auth
-                ) as response,
-            ):
-                payload = await response.read()
-                if response.status != 201:
-                    msg = f"creating zone {spec['name']!r} failed: HTTP {response.status}"
-                    raise ObserveError(msg)
+        planned = plan_zones(self._config.zones, self._config.center, radius_m, self._config.seed)
+        progress = ZoneProgress(self._console, "created", len(planned), lambda: self.zones_created)
+        for spec in planned:
+            if self._interrupt.is_set():  # the run ends before it starts; close() tidies up
+                break
+            status, payload = await self._change_zone(
+                self._session, "POST", ZONES_PATH, progress, spec, interrupt=self._interrupt
+            )
+            if status != 201:
+                if self._interrupt.is_set():  # stopped while the API made it wait
+                    break
+                msg = f"creating zone {spec['name']!r} failed: HTTP {status}"
+                raise ObserveError(msg)
             body = _json_body(payload)
             zone_id = body.get("id") if isinstance(body, dict) else None
             if not isinstance(zone_id, str):
@@ -1725,18 +1780,60 @@ class Observer:
                 raise ObserveError(msg)
             self._zones.append(zone_id)
             self.zones_created += 1
+        progress.finish()
 
     async def _delete_zones(self, session: aiohttp.ClientSession) -> None:
+        progress = ZoneProgress(
+            self._console, "deleted", len(self._zones), lambda: self.zones_deleted
+        )
         for zone_id in self._zones:
             try:
-                async with (
-                    asyncio.timeout(self._config.timeout),
-                    session.delete(self._url(f"{ZONES_PATH}/{zone_id}"), headers=self._auth) as r,
-                ):
-                    if r.status in (204, 404):
-                        self.zones_deleted += 1
+                status, _ = await self._change_zone(
+                    session, "DELETE", f"{ZONES_PATH}/{zone_id}", progress
+                )
             except (aiohttp.ClientError, TimeoutError) as exc:
                 self._console.warn("zones", f"could not delete a demo zone: {describe(exc)}")
+                continue
+            if status in (204, 404):
+                self.zones_deleted += 1
+            else:
+                self._console.warn("zones", f"could not delete a demo zone: HTTP {status}")
+        progress.finish()
+
+    async def _change_zone(
+        self,
+        session: aiohttp.ClientSession,
+        method: str,
+        path: str,
+        progress: ZoneProgress,
+        spec: dict[str, Any] | None = None,
+        *,
+        interrupt: asyncio.Event | None = None,
+    ) -> tuple[int, bytes]:
+        """Status and body of one zone change, sent again while the API says when to retry.
+
+        Zone changes are rate limited per account on every API replica, so creating or deleting
+        many demo zones soon meets a 429 with ``Retry-After`` (or a 503 with one, while the
+        database is busy): that pause is kept, ``ZONE_ATTEMPTS`` times at most. Once ``interrupt``
+        is set nothing waits any more, and the last answer is returned.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            async with (
+                asyncio.timeout(self._config.timeout),
+                session.request(method, self._url(path), json=spec, headers=self._auth) as response,
+            ):
+                payload = await response.read()
+                status = response.status
+                retry_after = parse_retry_after(response.headers.get("Retry-After"))
+            if status not in THROTTLE_HTTP_STATUSES or retry_after is None:
+                return status, payload
+            if attempt == ZONE_ATTEMPTS:
+                return status, payload
+            progress.waiting(retry_after)
+            if not await _pause(retry_after, interrupt):
+                return status, payload
 
     async def _connect(self) -> aiohttp.ClientWebSocketResponse:
         assert self._session is not None
@@ -2370,7 +2467,7 @@ class LoadRun:
             else WsTransport(config, self.queue, self.stats, console)
         )
         self.observer = (
-            Observer(config, self.stats, console, frozenset(self.fleet.ids))
+            Observer(config, self.stats, console, frozenset(self.fleet.ids), interrupt=stop)
             if config.observe
             else None
         )
@@ -2769,6 +2866,11 @@ def render_summary(summary: Mapping[str, Any]) -> list[str]:
             f"  alerts     {sum(alerts.values()):,}{breakdown(alerts)}; "
             f"latency {latency(observe['alert_latency_ms'])}"
         )
+        if observe.get("zones_created"):
+            lines.append(
+                f"  zones      {observe['zones_created']:,} created, "
+                f"{observe['zones_deleted']:,} deleted"
+            )
     cpu = process["cpu_percent"]
     rss = process["max_rss_mb"]
     lines.append(

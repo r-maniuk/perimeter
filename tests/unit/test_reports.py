@@ -1,9 +1,15 @@
 from datetime import UTC, datetime
+from typing import Annotated
 
 import msgspec
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
+from pydantic import StringConstraints, TypeAdapter, ValidationError
 
 from perimeter.domain.reports import (
+    DEVICE_ID_PATTERN,
+    DeviceId,
     LocationReport,
     ReportBatch,
     TelemetryRecord,
@@ -14,6 +20,27 @@ from perimeter.wire import telemetry
 
 RECEIVED = 1_790_000_000_000
 decode = msgspec.json.Decoder(LocationReport).decode
+
+# A device id as a path or query parameter: fastapi hands the constraints to pydantic.
+parameter: TypeAdapter[str] = TypeAdapter(
+    Annotated[str, StringConstraints(max_length=64, pattern=DEVICE_ID_PATTERN)]
+)
+
+
+def accepted_in_a_report(device_id: str) -> bool:
+    try:
+        msgspec.convert(device_id, DeviceId)
+    except msgspec.ValidationError:
+        return False
+    return True
+
+
+def accepted_as_a_parameter(device_id: str) -> bool:
+    try:
+        parameter.validate_python(device_id)
+    except ValidationError:
+        return False
+    return True
 
 
 def test_brief_style_payload_is_accepted() -> None:
@@ -63,6 +90,35 @@ def test_a_report_without_a_timestamp_is_refused() -> None:
 def test_invalid_reports_are_rejected(body: bytes) -> None:
     with pytest.raises(msgspec.ValidationError):
         decode(body)
+
+
+@pytest.mark.parametrize(
+    ("device_id", "accepted"),
+    [
+        ("dev-00001", True),
+        ("A_z-9", True),
+        ("x" * 64, True),
+        ("dev-00001\n", False),  # would become a broker subject with a newline in it
+        ("dev\n00001", False),
+        ("dev-00001\r", False),
+        ("dev-00001z\n", False),
+        ("x" * 65, False),
+        ("", False),
+    ],
+)
+def test_a_device_id_must_be_one_subject_token(device_id: str, accepted: bool) -> None:
+    assert accepted_in_a_report(device_id) is accepted
+    assert accepted_as_a_parameter(device_id) is accepted
+
+
+@given(
+    st.from_regex(r"[A-Za-z0-9_-]{1,65}[\n\r]?", fullmatch=True)
+    | st.text(alphabet="aZ09_-.z \n\r\t\x00", max_size=66)
+)
+def test_reports_and_parameters_accept_the_same_device_ids(device_id: str) -> None:
+    # Two engines read the patterns: Python's re for reports (msgspec) and Rust's regex for
+    # parameters (pydantic); their "$" differs before a final newline.
+    assert accepted_in_a_report(device_id) == accepted_as_a_parameter(device_id)
 
 
 def test_envelope_form_is_supported() -> None:

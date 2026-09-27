@@ -130,6 +130,25 @@ async def test_messagepack_bodies(client: httpx.AsyncClient, js: JetStreamContex
     assert len(await stored(js)) == 2
 
 
+async def test_a_device_id_ending_in_a_newline_is_refused_in_either_encoding(
+    client: httpx.AsyncClient, js: JetStreamContext
+) -> None:
+    # It would become the subject ``tlm.veh-1\n``, which no broker accepts.
+    body = [report("veh-1\n")]
+    for response in (
+        await post(client, body),
+        await client.post(
+            "/v1/telemetry",
+            content=msgspec.msgpack.encode(body),
+            headers=DEVICE | {"Content-Type": "application/msgpack"},
+        ),
+    ):
+        assert response.status_code == 422
+        rejected = response.json()["rejected"]
+        assert [(r["index"], r["code"]) for r in rejected] == [(0, "invalid_device_id")]
+    assert (await js.stream_info(subjects.TELEMETRY_STREAM)).state.messages == 0
+
+
 async def test_a_retried_report_is_stored_once(
     client: httpx.AsyncClient, js: JetStreamContext
 ) -> None:

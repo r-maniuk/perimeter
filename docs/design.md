@@ -79,7 +79,9 @@ consumes each partition at a time.
   grows if the broker lost its store and the bucket was created again (its revisions start from 1
   then). Compared as a row, neither half can overflow.
 - **A fetch never outlives the lease.** Each pull request expires while the lease is still known to
-  be valid, so a stale owner cannot receive messages after a new owner took the partition over.
+  be valid, and a worker that stops hands back only the messages already in its buffer, without a
+  fetch (every nats-py fetch sends a new pull request), so a stale owner cannot receive messages
+  after a new owner took the partition over.
 
 **Takeover recovery.** Messages a dead owner had fetched but not acknowledged come back from the
 broker only after the ack timeout (30 s) — long after the new owner has applied newer reports of
@@ -108,8 +110,9 @@ a test that fails without the fix pins it, and the drill loses nothing.
   reloads its zones and alerts over REST, which is cheaper for everybody.
 - **Tracing.** The trace context travels in the standard `traceparent` header from the ingest
   request into the engine batch that applies the report, from that transaction into the events it
-  writes, and from those to the API replicas that deliver them — one trace per alert, from the
-  device's report to the sockets that show it:
+  writes (each outbox row keeps it, so an event the sweeper relays belongs to the trace as well),
+  and from those to the API replicas that deliver them — one trace per alert, from the device's
+  report to the sockets that show it:
 
   ![One trace: the ingest request, the engine batch with its SQL, and the live delivery](screenshots/trace.png)
 

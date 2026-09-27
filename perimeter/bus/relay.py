@@ -11,8 +11,9 @@ de-duplication window turns that into exactly once for subscribers):
   crashes, broker hiccups and database hiccups between commit and delete.
 
 A crash between publishing and deleting republishes the same ``Nats-Msg-Id``; the stream drops it.
-Events carry the trace context of the transaction that wrote them, so a trace follows an alert from
-the report that caused it to the sockets it is delivered to.
+Each row keeps the trace context of the transaction that wrote it, and both paths publish the event
+with it, so a trace follows an alert from the report that caused it to the sockets it is delivered
+to, whichever path relayed it (the sweeper runs outside any span of its own).
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ from prometheus_client import Counter, Gauge
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from perimeter.bus.publish import Ack, StreamPublisher
-from perimeter.ops import tracing
 from perimeter.storage import outbox
 from perimeter.storage.outbox import OutboxRow
 
@@ -60,7 +60,7 @@ class OutboxRelay:
         futures: list[asyncio.Future[Ack]] = []
         try:
             for row in rows:
-                headers = tracing.inject({"Nats-Msg-Id": row.msg_id})
+                headers = {**(row.trace_context or {}), "Nats-Msg-Id": row.msg_id}
                 futures.append(await self._stream.publish(row.subject, row.payload, headers))
         except BaseException:  # could not even send: nothing may keep waiting for an answer
             for future in futures:

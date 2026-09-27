@@ -3,7 +3,8 @@
 Enabled only when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set (the ``observability`` compose profile
 points it at Jaeger). Trace context crosses NATS in the standard ``traceparent`` header: from the
 ingest request into the engine batch that applies the report, from that batch's transaction into
-the alert events it writes, and from those to the API replicas that deliver them to sockets.
+the alert events it writes (each outbox row keeps it, whoever relays the row), and from those to
+the API replicas that deliver them to sockets.
 """
 
 from __future__ import annotations
@@ -83,6 +84,15 @@ def inject(headers: MutableMapping[str, str]) -> MutableMapping[str, str]:
     if _enabled:
         propagate.inject(headers)
     return headers
+
+
+def context() -> dict[str, str] | None:
+    """The current span's context as message headers, to send later; ``None`` without one."""
+    if not _enabled:
+        return None
+    headers: dict[str, str] = {}
+    propagate.inject(headers)
+    return headers or None
 
 
 @contextmanager

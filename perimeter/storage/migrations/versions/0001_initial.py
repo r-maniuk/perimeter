@@ -325,6 +325,7 @@ CREATE TABLE outbox (
     subject        text NOT NULL,
     msg_id         text NOT NULL,
     payload        bytea NOT NULL,
+    trace_context  jsonb,       -- traceparent (and friends) of the writing span, when tracing
     created_at     timestamptz NOT NULL DEFAULT now(),
     claimed_until  timestamptz  -- the outbox sweeper's reservation while it publishes the row
 );

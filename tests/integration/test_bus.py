@@ -312,6 +312,16 @@ async def test_sweeper_recovers_events_left_behind_and_duplicates_are_dropped(
     assert info.state.messages == 2  # e3 once, e4 once
 
 
+async def test_without_tracing_events_keep_and_carry_no_trace_context(
+    db: AsyncEngine, js: JetStreamContext, stream: StreamPublisher, provisioned: topology.Topology
+) -> None:
+    rows = await _pending(db, PendingEvent(subjects.events("u6"), "e9", b"{}"))
+    assert rows[0].trace_context is None
+    assert await OutboxRelay(db, stream, sweep_min_age_s=0.0).sweep_once() == 1
+    stored = await js.get_last_msg(subjects.EVENTS_STREAM, subjects.events("u6"))
+    assert stored.headers == {"Nats-Msg-Id": "e9"}
+
+
 async def test_sweeper_leaves_young_rows_to_the_fast_path(
     db: AsyncEngine, stream: StreamPublisher, provisioned: topology.Topology
 ) -> None:
