@@ -44,7 +44,7 @@ async def replica(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[Replica]:
     tuned = with_live(settings, position_budget_bytes=BUDGET, event_queue_max=16, send_timeout_s=30)
-    async with replicas(tuned, monkeypatch, "api-a") as [started]:
+    async with replicas(tuned, monkeypatch, "api-a", send_buffer=STUCK_BUFFER) as [started]:
         yield started
 
 
@@ -53,6 +53,10 @@ def area(lon: float, lat: float) -> tuple[float, float, float, float]:
 
 
 EVENTS_LIMIT = 2_000  # far past any lane and buffer, well inside what a resume replays
+# Both ends of a socket keep this little room, so a client that stops reading stops the server's
+# writes at once, on any system: Linux, for one, starts a loopback connection's send buffer at over
+# a megabyte, which would take every frame a test sends to a client that reads nothing.
+STUCK_BUFFER = 4_096
 
 
 def heavy_frame(lon: float, lat: float, points: int = 1_000) -> tuple[str, bytes]:
@@ -103,7 +107,7 @@ async def test_a_client_that_stops_reading_positions_is_resynced_while_others_st
     _, slow_token = await signed_in(db, settings, "slow")
     _, fast_token = await signed_in(db, settings, "fast")
     async with (
-        live_client(replica.ws(slow_token), max_queue=1) as slow,
+        live_client(replica.ws(slow_token), max_queue=1, receive_buffer=STUCK_BUFFER) as slow,
         live_client(replica.ws(fast_token)) as fast,
     ):
         sid = (await slow.expect("hello"))["session_id"]
@@ -160,7 +164,7 @@ async def test_a_client_that_falls_behind_its_events_gets_4008_and_resumes_the_r
     replica: Replica, db: AsyncEngine, nc: NatsClient, js: JetStreamContext, settings: Settings
 ) -> None:
     alice, token = await signed_in(db, settings, "alice")
-    async with live_client(replica.ws(token), max_queue=1) as slow:
+    async with live_client(replica.ws(token), max_queue=1, receive_buffer=STUCK_BUFFER) as slow:
         hello = await slow.expect("hello")
         await slow.viewport(*area(*AMSTERDAM))
         await slow.tiles()
@@ -168,8 +172,8 @@ async def test_a_client_that_falls_behind_its_events_gets_4008_and_resumes_the_r
         conn = connection_of(replica, hello["session_id"])
         subject, frame = heavy_frame(*AMSTERDAM)
         await flood_until(nc, subject, frame, lambda: conn.positions_paused)  # socket stuck
-        # The lane holds 16 events, but how many more the socket's buffers still take depends on
-        # how far the kernel has grown them: events go out until the lane overflows.
+        # The lane holds 16 events and the stuck socket takes none of them; events go out until
+        # the lane overflows rather than a count that assumes when.
         published = []
         for n in range(EVENTS_LIMIT):
             event = make_event(EventType.ALERT, {"n": n})

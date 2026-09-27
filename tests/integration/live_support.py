@@ -15,7 +15,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, NamedTuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import pytest
 import uvicorn
@@ -82,11 +82,23 @@ class Replica:
         await asyncio.wait_for(self.task, 30)
 
 
-async def start_replica(settings: Settings, name: str, monkeypatch: pytest.MonkeyPatch) -> Replica:
+async def start_replica(
+    settings: Settings,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    send_buffer: int | None = None,
+) -> Replica:
+    """Start an API replica in-process. ``send_buffer`` fixes the send buffer of every socket it
+    accepts (they take it from the listening one), so the kernel never grows it: Linux starts a
+    loopback connection's send buffer at over a megabyte, which hides a client that stopped reading.
+    """
     monkeypatch.setenv("HOSTNAME", name)  # the replica's instance id
     app = create_app(settings)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if send_buffer is not None:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, send_buffer)
     listener.bind(("127.0.0.1", 0))
     port = listener.getsockname()[1]
     config = uvicorn.Config(
@@ -111,12 +123,17 @@ async def start_replica(settings: Settings, name: str, monkeypatch: pytest.Monke
 
 @contextlib.asynccontextmanager
 async def replicas(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch, *names: str
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    *names: str,
+    send_buffer: int | None = None,
 ) -> AsyncIterator[list[Replica]]:
     started: list[Replica] = []
     try:
         for name in names:
-            started.append(await start_replica(settings, name, monkeypatch))  # noqa: PERF401
+            started.append(  # noqa: PERF401
+                await start_replica(settings, name, monkeypatch, send_buffer=send_buffer)
+            )
         yield started
     finally:
         for replica in reversed(started):
@@ -169,12 +186,25 @@ class LiveClient:
         origin: str | None = None,
         cookie: str | None = None,
         max_queue: int = 16,
+        receive_buffer: int | None = None,
     ) -> LiveClient:
+        """Open a live socket. ``receive_buffer`` fixes the socket's receive buffer before it
+        connects, so the kernel never grows it: a client that stops reading then really stops the
+        server's writes, however large this system lets socket buffers grow (Linux: megabytes).
+        """
         headers: dict[str, str] = {}
         if target.token:
             headers["Authorization"] = f"Bearer {target.token}"
         if cookie:
             headers["Cookie"] = f"{COOKIE_NAME}={cookie}"
+        options: dict[str, Any] = {}
+        if receive_buffer is not None:
+            address = urlsplit(target.url)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+            sock.setblocking(False)
+            await asyncio.get_running_loop().sock_connect(sock, (address.hostname, address.port))
+            options["sock"] = sock
         ws = await connect(
             target.url,
             origin=origin,  # type: ignore[arg-type]
@@ -184,6 +214,7 @@ class LiveClient:
             max_queue=max_queue,
             open_timeout=10,
             compression=None,
+            **options,
         )
         return cls(ws)
 
