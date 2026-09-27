@@ -33,6 +33,10 @@ export interface DeviceLayerOptions {
   serverNow: () => number;
   selected: () => string | null;
   hovered: () => string | null;
+  /** Where the selected device's trail line ends: drawn on to the moving dot, every frame. */
+  trailEnd?: () => { deviceId: string; lon: number; lat: number } | null;
+  /** Width of that line at a zoom level, in CSS pixels. */
+  trailWidth?: (zoom: number) => number;
   staleAfterS?: number;
 }
 
@@ -64,8 +68,12 @@ uniform int u_hovered;
 uniform int u_pass;
 uniform vec4 u_moving;
 uniform vec4 u_stationary;
+uniform vec2 u_link_from;
+uniform float u_link_width;
 
 out vec2 v_uv;
+flat out float v_link;
+out float v_across;
 out vec2 v_local;
 out vec4 v_fill;
 out float v_alpha;
@@ -81,6 +89,37 @@ void main() {
   bool selected = gl_InstanceID == u_selected;
   bool hovered = gl_InstanceID == u_hovered;
   bool highlighted = selected || hovered;
+  v_link = 0.0;
+  v_across = 0.0;
+
+  // Pass 2 links the end of the selected device's trail line to where its dot is drawn now: the
+  // quad becomes a line segment, a_corner.x running along it and a_corner.y across.
+  if (u_pass == 2) {
+    if (!selected) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
+    float k = a_time.y > 0.0 ? clamp((u_now - a_time.x) / a_time.y, 0.0, 1.0) : 1.0;
+    vec4 p0 = u_matrix * vec4(u_link_from, 0.0, 1.0);
+    vec4 p1 = u_matrix * vec4(mix(a_from, a_to, k), 0.0, 1.0);
+    vec2 half_viewport = 0.5 * u_viewport;
+    vec2 d = (p1.xy / p1.w - p0.xy / p0.w) * half_viewport;
+    float len = length(d);
+    if (len < 0.5) {
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
+    vec2 across = vec2(-d.y, d.x) / len;
+    // One pixel of fringe on each side for antialiasing.
+    float half_width = 0.5 * u_link_width + 1.0;
+    vec4 p = mix(p0, p1, a_corner.x * 0.5 + 0.5);
+    p.xy += across * a_corner.y * half_width / half_viewport * p.w;
+    gl_Position = p;
+    v_link = 1.0;
+    v_across = a_corner.y * half_width / (0.5 * u_link_width);
+    return;
+  }
+
   // Pass 0 draws the fleet, pass 1 redraws highlighted devices on top of it.
   if ((u_pass == 0) == highlighted) {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
@@ -134,11 +173,16 @@ in float v_alpha;
 in float v_chevron;
 in float v_tail;
 in float v_ring;
+flat in float v_link;
+in float v_across;
 
 uniform vec4 u_halo;
 uniform vec4 u_accent;
 
 out vec4 fragColor;
+
+// The trail's colour at its newest end (its gradient ends at this opacity).
+const float LINK_ALPHA = 0.95;
 
 // Signed distance to a triangle (Inigo Quilez).
 float sdTriangle(vec2 p, vec2 p0, vec2 p1, vec2 p2) {
@@ -155,6 +199,15 @@ float sdTriangle(vec2 p, vec2 p0, vec2 p1, vec2 p2) {
 }
 
 void main() {
+  if (v_link > 0.5) {
+    float edge = abs(v_across);
+    float soft = max(fwidth(v_across), 1e-4);
+    float coverage = (1.0 - smoothstep(1.0 - soft, 1.0 + soft, edge)) * LINK_ALPHA;
+    if (coverage < 0.003) discard;
+    fragColor = vec4(u_accent.rgb * coverage, coverage);
+    return;
+  }
+
   float r = length(v_uv);
   float aa = max(fwidth(r), 1e-4);
 
@@ -309,6 +362,8 @@ export class DeviceLayer implements CustomLayerInterface {
       "u_stationary",
       "u_halo",
       "u_accent",
+      "u_link_from",
+      "u_link_width",
     ]) {
       this.#uniforms.set(name, gl.getUniformLocation(program, name));
     }
@@ -416,6 +471,17 @@ export class DeviceLayer implements CustomLayerInterface {
     gl.uniform4fv(u.get("u_halo") ?? null, style.halo);
     gl.uniform4fv(u.get("u_accent") ?? null, style.accent);
 
+    const end = selected >= 0 ? this.#options.trailEnd?.() : null;
+    const link = end && end.deviceId === selectedId ? end : null;
+    if (link) {
+      gl.uniform2f(
+        u.get("u_link_from") ?? null,
+        foldX(mercatorX(link.lon) - fleet.originX),
+        mercatorY(link.lat) - fleet.originY,
+      );
+      gl.uniform1f(u.get("u_link_width") ?? null, this.#options.trailWidth?.(zoom) ?? 3);
+    }
+
     gl.bindVertexArray(this.#vao);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -424,6 +490,11 @@ export class DeviceLayer implements CustomLayerInterface {
       for (const copy of copies) {
         this.#originMatrix(mainMatrix, fleet.originX + copy, fleet.originY);
         gl.uniformMatrix4fv(u.get("u_matrix") ?? null, false, this.#matrix);
+        if (link) {
+          // Under the dots: the line runs into the selected device, not over it.
+          gl.uniform1i(u.get("u_pass") ?? null, 2);
+          gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, fleet.count);
+        }
         gl.uniform1i(u.get("u_pass") ?? null, 0);
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, fleet.count);
         if (selected >= 0 || hovered >= 0) {

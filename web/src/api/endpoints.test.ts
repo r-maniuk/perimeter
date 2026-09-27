@@ -6,6 +6,7 @@ import {
   listSessions,
   listZones,
   revokeSession,
+  TrailUnavailableError,
   updateZone,
   zoneOccupants,
 } from "./endpoints";
@@ -137,6 +138,24 @@ describe("REST contract", () => {
       properties: { device_id: "n", since: "x", timestamps: [], speeds: [], complete: true },
     });
     expect(await deviceTrail("n", 5)).toEqual({ coordinates: [], times: [], complete: true });
+  });
+
+  it("tells a trail the server gave up on from a device that did not move", async () => {
+    respond({
+      type: "Feature",
+      id: "veh-1",
+      geometry: null,
+      properties: { device_id: "veh-1", since: "x", timestamps: [], speeds: [], complete: false },
+    });
+    await expect(deviceTrail("veh-1", 60)).rejects.toBeInstanceOf(TrailUnavailableError);
+
+    respond({
+      type: "Feature",
+      id: "veh-1",
+      geometry: null,
+      properties: { device_id: "veh-1", since: "x", timestamps: [], speeds: [], complete: true },
+    });
+    await expect(deviceTrail("veh-1", 60)).resolves.toMatchObject({ coordinates: [] });
   });
 
   it("refuses a trail whose timestamps do not line up with its coordinates", async () => {

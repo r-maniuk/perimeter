@@ -1,5 +1,6 @@
 import { CircleAlert, CircleCheck, Info, TriangleAlert, X } from "lucide-react";
 import { AnimatePresence, m } from "motion/react";
+import { useEffect, useRef, useState } from "react";
 import type { AlertKind } from "@/api/schemas";
 import { KIND_ICON, KIND_LABEL, KIND_TEXT } from "@/features/alerts/kinds";
 import { headline, type Toast } from "@/features/alerts/toasts";
@@ -8,29 +9,99 @@ import { formatClock } from "@/lib/format";
 import { useAlerts } from "@/state/alerts";
 import { useUi } from "@/state/ui";
 import { cx } from "@/ui/cx";
-import { type Notice, useNotices } from "./notices";
+import { type Notice, stackCards, useNotices } from "./notices";
 
 const RESUME_AFTER_HOVER_MS = 2_500;
 const FAR_FUTURE_MS = 3_600_000;
+/** Crossing the gap between two cards must not unfreeze the stack. */
+const RELEASE_DELAY_MS = 300;
 
-/** Alert toasts and notices, stacked (bottom-centre on desktop, under the status bar on phones). */
+type Card =
+  | { key: string; type: "toast"; toast: Toast }
+  | { key: string; type: "notice"; notice: Notice };
+
+const toastCard = (toast: Toast): Card => ({ key: `t:${toast.id}`, type: "toast", toast });
+const noticeCard = (notice: Notice): Card => ({ key: `n:${notice.id}`, type: "notice", notice });
+
+/** Pause or resume the countdown of the cards with these keys. */
+function setExpiries(keys: readonly string[], at: number): void {
+  for (const key of keys) {
+    const id = key.slice(2);
+    if (key.startsWith("t:")) useAlerts.getState().setToastExpiry(id, at);
+    else useNotices.getState().setExpiry(id, at);
+  }
+}
+
+/**
+ * Alert toasts and notices, stacked (bottom-centre on desktop, under the status bar on phones).
+ *
+ * While the pointer or keyboard focus is on the stack it holds still: every card stops counting
+ * down and new ones wait, so nothing moves or vanishes under a click. Notices sit nearest the
+ * screen edge, where arrivals of alert toasts beyond them do not move them either.
+ */
 export function Toaster({ placement }: { placement: "top" | "bottom" }) {
   const toasts = useAlerts((s) => s.toasts);
   const notices = useNotices((s) => s.notices);
   // On phones a full-height sheet owns the screen; alerts wait in the badge until it closes.
   const covered = useUi((s) => placement === "top" && s.sheet === "full");
-  const items: ({ type: "toast"; toast: Toast } | { type: "notice"; notice: Notice })[] = [
-    ...notices.map((notice) => ({ type: "notice" as const, notice })),
-    ...toasts.map((toast) => ({ type: "toast" as const, toast })),
-  ];
-  // Phones have room for one card above the map; desktops stack up to three.
-  const shown = covered ? [] : items.slice(placement === "top" ? -1 : -3);
+  const [held, setHeld] = useState<readonly string[] | null>(null);
+  const heldRef = useRef<readonly string[] | null>(null);
+  const releaseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(
+    () => () => {
+      if (releaseTimer.current) clearTimeout(releaseTimer.current);
+    },
+    [],
+  );
+
+  let shown: Card[];
+  if (covered) {
+    shown = [];
+  } else if (held) {
+    const byKey = new Map(
+      [...toasts.map(toastCard), ...notices.map(noticeCard)].map((c) => [c.key, c]),
+    );
+    shown = held.flatMap((key) => byKey.get(key) ?? []);
+  } else {
+    // Phones have room for one card above the map; desktops stack up to three.
+    const stack = stackCards(notices, toasts, placement === "top" ? 1 : 3);
+    shown = [...stack.toasts.map(toastCard), ...stack.notices.map(noticeCard)];
+  }
   const ordered = placement === "bottom" ? shown : [...shown].reverse();
+
+  function hold() {
+    if (releaseTimer.current) {
+      clearTimeout(releaseTimer.current);
+      releaseTimer.current = null;
+    }
+    if (heldRef.current) return;
+    const keys = shown.map((card) => card.key);
+    heldRef.current = keys;
+    setHeld(keys);
+    setExpiries(keys, Date.now() + FAR_FUTURE_MS);
+  }
+
+  function release() {
+    if (releaseTimer.current) clearTimeout(releaseTimer.current);
+    releaseTimer.current = setTimeout(() => {
+      releaseTimer.current = null;
+      setExpiries(heldRef.current ?? [], Date.now() + RESUME_AFTER_HOVER_MS);
+      heldRef.current = null;
+      setHeld(null);
+    }, RELEASE_DELAY_MS);
+  }
 
   return (
     <section
       aria-label="Notifications"
       aria-live="polite"
+      onPointerEnter={hold}
+      onPointerLeave={release}
+      onFocus={hold}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) release();
+      }}
       className={cx(
         "pointer-events-none fixed inset-x-0 z-40 flex flex-col items-center gap-2 px-3",
         placement === "bottom"
@@ -39,11 +110,11 @@ export function Toaster({ placement }: { placement: "top" | "bottom" }) {
       )}
     >
       <AnimatePresence initial={false}>
-        {ordered.map((item) =>
-          item.type === "toast" ? (
-            <AlertToast key={item.toast.id} toast={item.toast} placement={placement} />
+        {ordered.map((card) =>
+          card.type === "toast" ? (
+            <AlertToast key={card.key} toast={card.toast} placement={placement} />
           ) : (
-            <NoticeCard key={item.notice.id} notice={item.notice} placement={placement} />
+            <NoticeCard key={card.key} notice={card.notice} placement={placement} />
           ),
         )}
       </AnimatePresence>
@@ -86,12 +157,6 @@ function AlertToast({ toast, placement }: { toast: Toast; placement: "top" | "bo
     <m.div
       {...motionProps(placement)}
       className="glass pointer-events-auto relative w-[min(100%,380px)] overflow-hidden rounded-2xl"
-      onPointerEnter={() =>
-        useAlerts.getState().setToastExpiry(toast.id, Date.now() + FAR_FUTURE_MS)
-      }
-      onPointerLeave={() =>
-        useAlerts.getState().setToastExpiry(toast.id, Date.now() + RESUME_AFTER_HOVER_MS)
-      }
     >
       <span
         className="absolute inset-y-0 left-0 w-1"

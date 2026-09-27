@@ -16,6 +16,8 @@ interface NoticeState {
   notices: Notice[];
   push(notice: Omit<Notice, "id" | "expiresAt"> & { durationMs?: number }): string;
   dismiss(id: string): void;
+  /** Move a notice's expiry: held while the pointer or focus is on it, resumed after. */
+  setExpiry(id: string, expiresAt: number): void;
   expire(now: number): void;
 }
 
@@ -31,6 +33,8 @@ export const useNotices = create<NoticeState>()((set) => ({
     return id;
   },
   dismiss: (id) => set((s) => ({ notices: s.notices.filter((n) => n.id !== id) })),
+  setExpiry: (id, expiresAt) =>
+    set((s) => ({ notices: s.notices.map((n) => (n.id === id ? { ...n, expiresAt } : n)) })),
   expire: (now) =>
     set((s) => {
       const notices = s.notices.filter((n) => n.expiresAt > now);
@@ -40,4 +44,19 @@ export const useNotices = create<NoticeState>()((set) => ({
 
 export function notify(notice: Omit<Notice, "id" | "expiresAt"> & { durationMs?: number }): string {
   return useNotices.getState().push(notice);
+}
+
+/**
+ * Which cards fit in `slots` places: notices first (they are rare, and often carry an action such
+ * as "Apply mine"), then the newest alert toasts in the room that is left. Under a burst of alerts
+ * the toasts would otherwise push a notice out of view while it is still counting down.
+ */
+export function stackCards<N, T>(
+  notices: readonly N[],
+  toasts: readonly T[],
+  slots: number,
+): { notices: N[]; toasts: T[] } {
+  const shownNotices = slots > 0 ? notices.slice(-slots) : [];
+  const room = slots - shownNotices.length;
+  return { notices: shownNotices, toasts: room > 0 ? toasts.slice(-room) : [] };
 }

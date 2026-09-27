@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Check, Copy, Crosshair, LocateFixed, Navigation2, Route } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
-import { deviceTrail, getDevice } from "@/api/endpoints";
+import { deviceTrail, getDevice, TrailUnavailableError } from "@/api/endpoints";
 import { describeError, isApiError } from "@/api/http";
 import { PanelFrame } from "@/features/shell/PanelFrame";
 import { useZones } from "@/features/zones/useZones";
@@ -65,6 +65,12 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
     queryKey: ["trail", id, minutes],
     queryFn: ({ signal }) => deviceTrail(id, minutes, signal),
     staleTime: 15_000,
+    // A trail cut off by the server's read deadline means the broker is busy: asking again right
+    // away only adds to its load, so that one waits for the user's "Try again".
+    retry: (failures, error) =>
+      !(error instanceof TrailUnavailableError) &&
+      failures < 3 &&
+      !(isApiError(error) && error.status < 500),
   });
 
   useEffect(() => {
@@ -224,7 +230,16 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
           {trail.isPending ? (
             <span className="text-muted">Loading the last {minutes} minutes…</span>
           ) : trail.isError ? (
-            <span className="text-critical">{describeError(trail.error)}</span>
+            <span className="flex items-center justify-between gap-3">
+              <span className="text-muted">
+                {trail.error instanceof TrailUnavailableError
+                  ? "The trail couldn't be read in time."
+                  : describeError(trail.error)}
+              </span>
+              <Button size="sm" onClick={() => void trail.refetch()}>
+                Try again
+              </Button>
+            </span>
           ) : trail.data.coordinates.length < 2 ? (
             <span className="text-muted">No movement in the last {minutes} minutes.</span>
           ) : (

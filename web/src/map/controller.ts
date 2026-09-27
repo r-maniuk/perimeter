@@ -31,7 +31,7 @@ import {
 import type { Viewport } from "@/live/client";
 import { BASEMAP_STYLE_URL, offlineStyle, restyle, type Theme, themeChanges } from "./basemap";
 import { DeviceLayer, type DeviceStyle, dotRadius } from "./deviceLayer";
-import { addTrailLayer, setTrailColor, TrailRenderer } from "./trailLayer";
+import { addTrailLayer, setTrailColor, TrailRenderer, trailWidth } from "./trailLayer";
 import {
   addZoneLabelLayer,
   addZoneLayers,
@@ -129,6 +129,12 @@ function prefersReducedMotion(): boolean {
   return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
+/** Room kept around fitted zones, inside the space the chrome leaves. */
+const FIT_MARGIN = 56;
+/** The signed-out backdrop turns this slowly, redrawn at this pace (motion is sub-pixel per step). */
+const DRIFT_DEG_PER_S = 0.375;
+const DRIFT_FRAME_MS = 33;
+
 export class MapController {
   readonly events = new Emitter();
   map: MapLibreMap | null = null;
@@ -150,7 +156,7 @@ export class MapController {
   #lastPointer: { x: number; y: number } | null = null;
   #drawing = false;
   #draft: { lat: number; lon: number; pointerId: number } | null = null;
-  #drawnAt = Number.NEGATIVE_INFINITY;
+  #gestureEndedAt = Number.NEGATIVE_INFINITY;
   #insets: Insets = { top: 0, right: 0, bottom: 0, left: 0 };
   #cameraFrame = 0;
   /** First basemap place-name layer: devices are drawn just beneath it. */
@@ -162,7 +168,8 @@ export class MapController {
   #viewportTimer: ReturnType<typeof setTimeout> | null = null;
   #lastViewportAt = 0;
   #interactive = true;
-  #drift: ReturnType<typeof setInterval> | null = null;
+  /** The signed-out backdrop's slow turn: its frame request, and the bearing it started from. */
+  #drift: { frame: number; from: number } | null = null;
   #cleanup: (() => void)[] = [];
   #mounting: Promise<void> | null = null;
   #epoch = 0;
@@ -240,7 +247,7 @@ export class MapController {
   unmount(): void {
     this.#epoch += 1;
     for (const off of this.#cleanup.splice(0)) off();
-    this.#stopDrift();
+    this.#stopDrift(false);
     this.#clearHandles();
     this.#zones?.destroy();
     this.#zones = null;
@@ -282,6 +289,8 @@ export class MapController {
       serverNow: () => this.#serverNow(),
       selected: () => (this.#selection?.kind === "device" ? this.#selection.id : null),
       hovered: () => this.#hovered,
+      trailEnd: () => this.#trail?.end() ?? null,
+      trailWidth,
     });
     map.addLayer(this.#devices, this.#placeLabels ?? "zones-label");
   }
@@ -376,24 +385,39 @@ export class MapController {
       if (interactive) handler.enable();
       else handler.disable();
     }
-    if (interactive) this.#stopDrift();
+    if (interactive) this.#stopDrift(true);
     else this.#startDrift();
   }
 
+  /**
+   * Turn the backdrop slowly about its centre. Each step rotates about the centre as it is now:
+   * an eased move would keep aiming at the screen point it started from, so a resize meanwhile
+   * (the keyboard opening on a phone, browser bars, a rotated screen) would slide the city away.
+   */
   #startDrift(): void {
     const map = this.map;
     if (!map || this.#drift || prefersReducedMotion()) return;
-    const step = () => {
-      map.easeTo({ bearing: map.getBearing() + 3, duration: 8_000, easing: (t) => t });
+    let last = performance.now();
+    const step = (now: number) => {
+      if (!this.#drift) return;
+      if (now - last >= DRIFT_FRAME_MS) {
+        map.setBearing(map.getBearing() + ((now - last) / 1000) * DRIFT_DEG_PER_S);
+        last = now;
+      }
+      this.#drift.frame = requestAnimationFrame(step);
     };
-    step();
-    this.#drift = setInterval(step, 8_000);
+    this.#drift = { frame: requestAnimationFrame(step), from: map.getBearing() };
   }
 
-  #stopDrift(): void {
-    if (this.#drift) clearInterval(this.#drift);
+  /** Stop turning; `settle` eases back to the bearing the backdrop started from. */
+  #stopDrift(settle: boolean): void {
+    const drift = this.#drift;
+    if (!drift) return;
+    cancelAnimationFrame(drift.frame);
     this.#drift = null;
-    this.map?.stop();
+    if (settle) {
+      this.map?.easeTo({ bearing: drift.from, duration: prefersReducedMotion() ? 0 : 700 });
+    }
   }
 
   select(selection: { kind: "zone" | "device"; id: string } | null): void {
@@ -478,11 +502,35 @@ export class MapController {
         bounds.extend([p.lon, p.lat]);
       }
     }
+    this.#settlePadding(map);
     map.fitBounds(bounds, {
-      padding: this.#padding(56),
+      padding: FIT_MARGIN,
       maxZoom: 16,
       duration: prefersReducedMotion() ? 0 : 900,
     });
+  }
+
+  /**
+   * Make the camera's own padding the current chrome insets, without moving the view. MapLibre
+   * keeps the padding of the last move that set one and `fitBounds` adds its own on top, so a
+   * stale value (an inspector that has closed since, say) would push every fit off-centre.
+   */
+  #settlePadding(map: MapLibreMap): void {
+    const insets = this.#padding(0);
+    const current = map.getPadding();
+    if (
+      current.top === insets.top &&
+      current.right === insets.right &&
+      current.bottom === insets.bottom &&
+      current.left === insets.left
+    ) {
+      return;
+    }
+    // The point the new padding centres the camera on, taken where the map shows it right now.
+    const canvas = map.getCanvas();
+    const x = insets.left + (canvas.clientWidth - insets.left - insets.right) / 2;
+    const y = insets.top + (canvas.clientHeight - insets.top - insets.bottom) / 2;
+    map.jumpTo({ center: map.unproject([x, y]), padding: insets });
   }
 
   zoomBy(delta: number): void {
@@ -555,8 +603,8 @@ export class MapController {
       this.#zones?.hover(null);
     };
     const onClick = (e: MapMouseEvent) => {
-      // The click that ends a drawing gesture belongs to the drawing, not to selection.
-      if (this.#drawing || performance.now() - this.#drawnAt < 500) return;
+      // The click that ends a drawing or handle drag belongs to that gesture, not to selection.
+      if (this.#drawing || performance.now() - this.#gestureEndedAt < 500) return;
       const device = this.#pickDevice(e.point.x, e.point.y);
       if (device) {
         this.events.emit("select", { kind: "device", id: device });
@@ -618,7 +666,7 @@ export class MapController {
       const dragged = Math.hypot(e.clientX - rect.left - start.x, e.clientY - rect.top - start.y);
       // A click without a drag drops a zone of a sensible size for the current zoom.
       const radiusM = dragged < 8 ? this.#defaultRadius() : state.radiusM;
-      this.#drawnAt = performance.now();
+      this.#gestureEndedAt = performance.now();
       this.events.emit("drawn", {
         lat: draft.lat,
         lon: normalizeLon(draft.lon),
@@ -787,6 +835,7 @@ export class MapController {
       if (pointerId === null) return;
       if (element.hasPointerCapture(pointerId)) element.releasePointerCapture(pointerId);
       pointerId = null;
+      this.#gestureEndedAt = performance.now();
       element.classList.remove("zone-handle--dragging");
       if (this.#interactive) this.map?.dragPan.enable();
       const editing = this.#editing;

@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Check, Copy, Crosshair, Trash2, Users } from "lucide-react";
 import { AlertDialog } from "radix-ui";
-import { type ReactNode, useEffect, useId, useState } from "react";
+import { type ReactNode, useId, useState } from "react";
 import { type ZonePatch, zoneOccupants } from "@/api/endpoints";
 import type { Zone } from "@/api/schemas";
 import { getRuntime } from "@/app/runtime";
@@ -12,7 +12,6 @@ import {
   formatCount,
   formatDistance,
   formatDuration,
-  parseDistance,
 } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
 import { mapController } from "@/map/controller";
@@ -27,6 +26,7 @@ import { SectionLabel } from "@/ui/SectionLabel";
 import { Slider } from "@/ui/Slider";
 import { Switch } from "@/ui/Switch";
 import { deleteZone } from "./actions";
+import { RadiusField, ZoneNameField } from "./fields";
 import {
   clampRadius,
   DWELL_PRESETS,
@@ -59,7 +59,13 @@ export function ZoneInspector({ zone, onClose }: { zone: Zone; onClose: () => vo
 
   return (
     <PanelFrame
-      title={<ZoneName zone={zone} />}
+      title={
+        <ZoneNameField
+          name={zone.name}
+          color={zone.color}
+          onCommit={(name) => patch(zone, { name })}
+        />
+      }
       subtitle={
         isDraft(zone.id)
           ? "Creating…"
@@ -85,7 +91,7 @@ export function ZoneInspector({ zone, onClose }: { zone: Zone; onClose: () => vo
       <div className="rounded-2xl bg-surface-2/70 p-3.5 ring-1 ring-line ring-inset">
         <div className="flex items-center justify-between gap-3">
           <span className="font-medium text-[13px] text-ink">Radius</span>
-          <RadiusInput
+          <RadiusField
             radius={liveRadius}
             onCommit={(radius) => patch(zone, { radius_m: radius })}
           />
@@ -161,96 +167,6 @@ export function ZoneInspector({ zone, onClose }: { zone: Zone; onClose: () => vo
         <DeleteZone zone={zone} />
       </div>
     </PanelFrame>
-  );
-}
-
-function ZoneName({ zone }: { zone: Zone }) {
-  const [value, setValue] = useState(zone.name);
-  const [focused, setFocused] = useState(false);
-  useEffect(() => {
-    if (!focused) setValue(zone.name);
-  }, [zone.name, focused]);
-
-  function commit() {
-    const name = value.trim();
-    if (name.length === 0 || name.length > 80) {
-      setValue(zone.name);
-      return;
-    }
-    if (name !== zone.name) patch(zone, { name });
-  }
-
-  return (
-    <span className="flex items-center gap-2">
-      <span className="size-3 shrink-0 rounded-full" style={{ background: zone.color }} />
-      <input
-        aria-label="Zone name"
-        value={value}
-        maxLength={80}
-        onChange={(e) => setValue(e.target.value)}
-        onFocus={() => setFocused(true)}
-        onBlur={() => {
-          setFocused(false);
-          commit();
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") e.currentTarget.blur();
-          if (e.key === "Escape") {
-            setValue(zone.name);
-            e.currentTarget.blur();
-            e.stopPropagation();
-          }
-        }}
-        className="-mx-1.5 w-full min-w-0 rounded-md bg-transparent px-1.5 py-0.5 font-semibold text-[15px] text-ink outline-none transition-shadow hover:ring-1 hover:ring-line-strong focus:ring-2 focus:ring-accent"
-      />
-    </span>
-  );
-}
-
-function RadiusInput({ radius, onCommit }: { radius: number; onCommit: (radius: number) => void }) {
-  const [text, setText] = useState(formatDistance(radius));
-  const [focused, setFocused] = useState(false);
-  const [invalid, setInvalid] = useState(false);
-  useEffect(() => {
-    if (!focused) setText(formatDistance(radius));
-  }, [radius, focused]);
-
-  function commit() {
-    const parsed = parseDistance(text);
-    if (parsed === null) {
-      setInvalid(true);
-      return;
-    }
-    setInvalid(false);
-    const next = clampRadius(Math.round(parsed));
-    setText(formatDistance(next));
-    if (next !== Math.round(radius)) onCommit(next);
-  }
-
-  return (
-    <input
-      aria-label="Radius"
-      aria-invalid={invalid || undefined}
-      inputMode="decimal"
-      value={text}
-      onChange={(e) => {
-        setText(e.target.value);
-        setInvalid(false);
-      }}
-      onFocus={(e) => {
-        setFocused(true);
-        e.currentTarget.select();
-      }}
-      onBlur={() => {
-        setFocused(false);
-        commit();
-      }}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") commit();
-        if (e.key === "Escape") e.currentTarget.blur();
-      }}
-      className="h-8 w-28 rounded-lg bg-surface-solid px-2.5 text-right font-mono text-[13px] text-ink tabular-nums outline-none ring-1 ring-line-strong focus:ring-2 focus:ring-accent aria-[invalid]:ring-critical"
-    />
   );
 }
 

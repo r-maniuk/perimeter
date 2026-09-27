@@ -13,7 +13,7 @@ import { Empty } from "@/ui/Empty";
 import { Hint } from "@/ui/Hint";
 import { SectionLabel } from "@/ui/SectionLabel";
 import { Sparkline } from "@/ui/Sparkline";
-import { admission, instances, ownership } from "./model";
+import { admission, instances, ownership, recentMean } from "./model";
 
 /** Engine owner colours: validated for colour-vision separation and contrast, per theme. */
 const OWNER_COLORS = {
@@ -59,6 +59,7 @@ export function OpsPanel({ onClose, titleId }: PanelProps) {
 function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, number[]> }) {
   const dark = useUi((s) => s.dark);
   const last = (key: string) => history[key]?.at(-1) ?? 0;
+  const rate = (key: string) => formatRate(recentMean(history[key]));
   const state = admission(frame);
   const owners = ownership(frame);
   const palette = OWNER_COLORS[dark ? "dark" : "light"];
@@ -71,12 +72,14 @@ function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, 
 
   return (
     <>
-      <SectionLabel>Throughput</SectionLabel>
+      <SectionLabel aside={<span className="text-[11px] text-muted">5 s average</span>}>
+        Throughput
+      </SectionLabel>
       <div className="grid grid-cols-2 gap-2">
-        <StatTile label="Ingest" value={formatRate(last("ingest"))} series={history.ingest} />
-        <StatTile label="Processed" value={formatRate(last("reports"))} series={history.reports} />
-        <StatTile label="Alerts" value={formatRate(last("alerts"))} series={history.alerts} />
-        <StatTile label="Live out" value={formatRate(last("wsOut"))} series={history.wsOut} />
+        <StatTile label="Ingest" value={rate("ingest")} series={history.ingest} />
+        <StatTile label="Processed" value={rate("reports")} series={history.reports} />
+        <StatTile label="Alerts" value={rate("alerts")} series={history.alerts} />
+        <StatTile label="Live out" value={rate("wsOut")} series={history.wsOut} />
       </div>
 
       <SectionLabel>Backpressure</SectionLabel>
@@ -102,9 +105,10 @@ function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, 
           </span>
         </div>
         <Row label="Stream backlog" value={`${formatCount(Math.round(last("lag")))} msgs`} />
-        <Row label="Rejected reports" value={formatRate(last("rejected"))} />
+        <Row label="Rejected reports" value={rate("rejected")} />
+        <Row label="Late reports" value={rate("late")} />
         <Row label="Outbox backlog" value={`${formatCount(Math.round(last("backlog")))} rows`} />
-        <Row label="Live drops" value={formatRate(last("drops"))} />
+        <Row label="Live drops" value={rate("drops")} />
       </div>
 
       <SectionLabel>Latency · p99 unless noted</SectionLabel>
@@ -189,7 +193,10 @@ function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, 
                 )}
               </span>
               <span className="min-w-0 flex-1">
-                <span className="block truncate font-mono text-[12px] text-ink">{p.instance}</span>
+                <span className="flex items-baseline gap-1.5">
+                  <span className="font-medium text-[12.5px] text-ink">{p.service}</span>
+                  <span className="truncate font-mono text-[11px] text-muted">{p.instance}</span>
+                </span>
                 <span className="block text-[11px] text-muted">
                   {describeProcess(p.service, p.raw)}
                 </span>
@@ -220,7 +227,8 @@ function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, 
 function describeProcess(service: string, raw: Record<string, unknown>): string {
   if (service === "engine") {
     const parts = Array.isArray(raw.partitions) ? raw.partitions.length : 0;
-    return `${parts} partitions · ${formatRate(Number(raw.batches_rate ?? 0))} batches`;
+    const batches = formatRate(Number(raw.batches_rate ?? 0)).replace("/s", "");
+    return `${parts} ${parts === 1 ? "partition" : "partitions"} · ${batches} batches/s`;
   }
   const sessions = Number(raw.sessions ?? 0);
   return `${formatCount(sessions)} ${sessions === 1 ? "session" : "sessions"} · db pool ${formatCount(Number(raw.db_pool_checked_out ?? 0))}`;

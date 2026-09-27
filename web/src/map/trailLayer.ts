@@ -7,6 +7,18 @@ import { setSourceData } from "./sources";
 
 export const TRAIL_SOURCE = "trail";
 const MAX_POINTS = 2_000;
+/** Line width in CSS pixels at two zoom levels, linear in between (and flat outside). */
+const TRAIL_WIDTH: readonly [[number, number], [number, number]] = [
+  [10, 2],
+  [16, 4],
+];
+
+/** The trail's width at `zoom`, for anything drawn to continue the line. */
+export function trailWidth(zoom: number): number {
+  const [[z0, w0], [z1, w1]] = TRAIL_WIDTH;
+  const t = Math.min(1, Math.max(0, (zoom - z0) / (z1 - z0)));
+  return w0 + (w1 - w0) * t;
+}
 
 export function addTrailLayer(map: MapLibreMap, color: string, beforeId?: string): void {
   map.addSource(TRAIL_SOURCE, {
@@ -21,7 +33,15 @@ export function addTrailLayer(map: MapLibreMap, color: string, beforeId?: string
       source: TRAIL_SOURCE,
       layout: { "line-cap": "round", "line-join": "round" },
       paint: {
-        "line-width": ["interpolate", ["linear"], ["zoom"], 10, 2, 16, 4],
+        "line-width": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          TRAIL_WIDTH[0][0],
+          TRAIL_WIDTH[0][1],
+          TRAIL_WIDTH[1][0],
+          TRAIL_WIDTH[1][1],
+        ],
         "line-gradient": trailGradient(color),
       },
     },
@@ -73,6 +93,16 @@ export class TrailRenderer {
 
   get deviceId(): string | null {
     return this.#deviceId;
+  }
+
+  /**
+   * Where the drawn line ends. The device layer links it to the moving dot every frame: the line
+   * itself only grows when a report arrives, so on its own it would trail a report behind.
+   */
+  end(): { deviceId: string; lon: number; lat: number } | null {
+    const last = this.#coordinates.at(-1);
+    if (!this.#deviceId || !last) return null;
+    return { deviceId: this.#deviceId, lon: last[0], lat: last[1] };
   }
 
   show(deviceId: string, coordinates: [number, number][]): void {

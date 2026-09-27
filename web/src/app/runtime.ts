@@ -6,6 +6,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { alertFromRecord, currentUser, getZone, updateZone } from "@/api/endpoints";
 import type { EventEnvelope, HelloFrame, OpsFrame, User, Zone } from "@/api/schemas";
+import { seriesOf } from "@/features/ops/model";
 import { notify } from "@/features/shell/notices";
 import {
   applyZoneEvent,
@@ -246,35 +247,7 @@ export class Runtime {
   }
 
   #onOps(frame: OpsFrame): void {
-    const series: Record<string, number> = {};
-    const sum = (service: string, key: string) =>
-      frame.services
-        .filter((s) => s.service === service)
-        .reduce((total, s) => total + Number((s as Record<string, unknown>)[key] ?? 0), 0);
-    const max = (service: string, key: string) =>
-      Math.max(
-        0,
-        ...frame.services
-          .filter((s) => s.service === service)
-          .map((s) => Number((s as Record<string, unknown>)[key] ?? 0)),
-      );
-    series.ingest = sum("api", "ingest_rate");
-    series.rejected = sum("api", "ingest_rejected_rate");
-    series.lag =
-      sum("api", "lag") / Math.max(1, frame.services.filter((s) => s.service === "api").length);
-    series.reports = sum("engine", "reports_rate");
-    series.alerts = sum("engine", "alerts_rate");
-    series.batchP50 = max("engine", "batch_p50_ms");
-    series.batchP99 = max("engine", "batch_p99_ms");
-    series.commitLag = max("engine", "commit_lag_p99_ms");
-    series.publishP99 = max("api", "publish_p99_ms");
-    series.wsOut = sum("api", "live_out_rate");
-    series.drops = sum("api", "live_drops_rate");
-    series.backlog = sum("engine", "relay_backlog");
-    for (const s of frame.services) {
-      series[`lag:${s.instance}`] = Number(s.loop_lag_p99_ms ?? 0);
-    }
-    useLive.getState().pushOps(frame, series);
+    useLive.getState().pushOps(frame, seriesOf(frame));
   }
 
   async #checkIdentity(): Promise<void> {

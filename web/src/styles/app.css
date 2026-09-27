@@ -320,6 +320,12 @@
   .maplibregl-ctrl-bottom-right {
     bottom: 96px;
   }
+
+  /* A phone is too narrow for the scale and the full attribution on one line: the scale sits
+     just above it. */
+  .maplibregl-ctrl-bottom-left {
+    bottom: 122px;
+  }
 }
 
 .maplibregl-ctrl-scale {

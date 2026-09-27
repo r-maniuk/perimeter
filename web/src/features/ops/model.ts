@@ -75,6 +75,48 @@ export function ownership(frame: OpsFrame, partitions = PARTITIONS): Ownership {
   };
 }
 
+type Snapshot = ServiceSnapshot & Record<string, unknown>;
+
+/**
+ * One number per plotted metric from one `ops` frame, by the heartbeat names of spec §18.2.
+ * Rates add up across processes. Backlogs are global (every replica samples the same stream or
+ * outbox table), so the freshest-looking, largest sample stands for them; latencies take the
+ * slowest process.
+ */
+export function seriesOf(frame: OpsFrame): Record<string, number> {
+  const api = frame.services.filter((s) => s.service === "api") as Snapshot[];
+  const engines = frame.services.filter((s) => s.service === "engine") as Snapshot[];
+  const sum = (list: Snapshot[], key: string) => list.reduce((t, s) => t + num(s[key]), 0);
+  const max = (list: Snapshot[], key: string) => list.reduce((m, s) => Math.max(m, num(s[key])), 0);
+  const series: Record<string, number> = {
+    ingest: sum(api, "ingest_rate"),
+    rejected: sum(api, "ingest_rejected_rate"),
+    lag: max(api, "lag"),
+    publishP99: max(api, "publish_p99_ms"),
+    wsOut: sum(api, "live_out_rate"),
+    drops: sum(api, "live_drops_rate"),
+    reports: sum(engines, "reports_rate"),
+    alerts: sum(engines, "alerts_rate"),
+    late: sum(engines, "late_rate"),
+    batchP50: max(engines, "batch_p50_ms"),
+    batchP99: max(engines, "batch_p99_ms"),
+    commitLag: max(engines, "commit_lag_p99_ms"),
+    backlog: max(engines, "relay_backlog"),
+  };
+  for (const s of frame.services) series[`lag:${s.instance}`] = num(s.loop_lag_p99_ms);
+  return series;
+}
+
+/**
+ * The mean of the last `window` one-second samples. Rates of rare events (a few alerts a second)
+ * swing between 0 and 5 from one second to the next; the headline number should not.
+ */
+export function recentMean(values: readonly number[] | undefined, window = 5): number {
+  if (!values || values.length === 0) return 0;
+  const tail = values.slice(-window);
+  return tail.reduce((total, value) => total + value, 0) / tail.length;
+}
+
 export type AdmissionState = "open" | "shedding" | "unknown";
 
 /** The pipeline sheds load if any api replica does (each decides on its own view of the lag). */
