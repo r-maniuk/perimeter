@@ -1,0 +1,349 @@
+@import "tailwindcss";
+@import "maplibre-gl/dist/maplibre-gl.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Design tokens. Semantic roles live in plain custom properties so the theme switch is a single
+ * class on <html>; Tailwind utilities read them through `@theme inline`.
+ * Colour pairs were validated for contrast and colour-vision separation on both surfaces.
+ */
+:root {
+  color-scheme: light;
+  --bg: #f3f2ee;
+  --surface: rgb(255 255 255 / 0.84);
+  --surface-solid: #ffffff;
+  --surface-2: #f5f4f8;
+  --surface-3: #ecebf2;
+  --ink: #16151d;
+  --ink-2: #4f4d63;
+  --muted: #706e84;
+  --line: rgb(22 21 29 / 0.08);
+  --line-strong: rgb(22 21 29 / 0.14);
+  --accent: #6d5dfc;
+  --accent-strong: #5a49ef;
+  --accent-ink: #ffffff;
+  --accent-soft: rgb(109 93 252 / 0.1);
+  --accent-ring: rgb(109 93 252 / 0.35);
+  --enter: #0c9f7a;
+  --exit: #e8590c;
+  --dwell: #2f74d0;
+  --owner-1: #6d5dfc;
+  --owner-2: #0b91a8;
+  --owner-3: #c77700;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --scrim: rgb(243 242 238 / 0.55);
+  --shadow-float:
+    0 0 0 1px rgb(22 21 29 / 0.06), 0 1px 1px rgb(22 21 29 / 0.04),
+    0 12px 32px -12px rgb(30 24 70 / 0.26), 0 4px 10px -4px rgb(30 24 70 / 0.1);
+  --shadow-pop:
+    0 0 0 1px rgb(22 21 29 / 0.08), 0 24px 60px -18px rgb(30 24 70 / 0.38),
+    0 8px 18px -8px rgb(30 24 70 / 0.16);
+}
+
+.dark {
+  color-scheme: dark;
+  --bg: #121216;
+  --surface: rgb(23 23 29 / 0.84);
+  --surface-solid: #17171d;
+  --surface-2: #1f1f27;
+  --surface-3: #282832;
+  --ink: #f4f3fa;
+  --ink-2: #bdbbcd;
+  --muted: #8f8da3;
+  --line: rgb(255 255 255 / 0.07);
+  --line-strong: rgb(255 255 255 / 0.13);
+  --accent: #8b7fff;
+  --accent-strong: #9d93ff;
+  --accent-ink: #120f2e;
+  --accent-soft: rgb(139 127 255 / 0.16);
+  --accent-ring: rgb(139 127 255 / 0.45);
+  --enter: #1aa885;
+  --exit: #e0662a;
+  --dwell: #4a8ae6;
+  --owner-1: #8b7fff;
+  --owner-2: #1aa3b8;
+  --owner-3: #c98500;
+  --scrim: rgb(18 18 22 / 0.55);
+  --shadow-float:
+    0 0 0 1px rgb(255 255 255 / 0.06), 0 16px 40px -14px rgb(0 0 0 / 0.7),
+    0 4px 12px -4px rgb(0 0 0 / 0.5);
+  --shadow-pop:
+    0 0 0 1px rgb(255 255 255 / 0.08), 0 28px 70px -20px rgb(0 0 0 / 0.8),
+    0 8px 20px -8px rgb(0 0 0 / 0.55);
+}
+
+@theme {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.36, 0.64, 1);
+  --animate-breathe: breathe 2.4s var(--ease-out-quint) infinite;
+  --animate-rise: rise 0.42s var(--ease-out-quint) both;
+  --animate-halo: halo 2.4s var(--ease-out-quint) infinite;
+
+  @keyframes breathe {
+    0%,
+    100% {
+      opacity: 0.55;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1.35);
+    }
+  }
+
+  @keyframes halo {
+    0%,
+    100% {
+      opacity: 0.14;
+      transform: scale(0.92);
+    }
+    50% {
+      opacity: 0.32;
+      transform: scale(1.08);
+    }
+  }
+
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-solid: var(--surface-solid);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-enter: var(--enter);
+  --color-exit: var(--exit);
+  --color-dwell: var(--dwell);
+  --color-good: var(--good);
+  --color-warning: var(--warning);
+  --color-serious: var(--serious);
+  --color-critical: var(--critical);
+  --shadow-float: var(--shadow-float);
+  --shadow-pop: var(--shadow-pop);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  html {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: "ss01", "cv11";
+  }
+
+  body {
+    margin: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  ::selection {
+    background: var(--accent-soft);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  /* Mobile browsers zoom into any focused field set below 16px; keep phones at 16px. */
+  @media (pointer: coarse) {
+    input,
+    select,
+    textarea {
+      font-size: max(16px, 1em);
+    }
+  }
+
+  button:disabled {
+    cursor: default;
+  }
+}
+
+@layer components {
+  /* Frosted floating surface used by every panel, card and popover. */
+  .glass {
+    background: var(--surface);
+    box-shadow: var(--shadow-float);
+    -webkit-backdrop-filter: blur(22px) saturate(1.5);
+    backdrop-filter: blur(22px) saturate(1.5);
+  }
+
+  .scroll-quiet {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* ---- Zone edit handles (MapLibre markers: the element is positioned with a transform, so the
+   visible dot is drawn by a pseudo-element that can scale freely) ------------------------------ */
+
+.zone-handle {
+  width: 32px;
+  height: 32px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.zone-handle::after {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border-radius: 999px;
+  background: var(--surface-solid);
+  box-shadow:
+    0 0 0 2.5px var(--handle-color),
+    0 2px 10px rgb(0 0 0 / 0.28);
+  transition: transform 0.15s var(--ease-out-quint);
+}
+
+.zone-handle--center {
+  cursor: move;
+}
+
+.zone-handle--center::after {
+  inset: 9px;
+  background: var(--handle-color);
+  box-shadow:
+    0 0 0 3px var(--surface-solid),
+    0 2px 10px rgb(0 0 0 / 0.3);
+}
+
+.zone-handle:hover::after,
+.zone-handle--dragging::after {
+  transform: scale(1.25);
+}
+
+.zone-handle--dragging {
+  cursor: grabbing;
+}
+
+/* ---- MapLibre chrome, restyled to match -------------------------------------------------- */
+
+.maplibregl-map {
+  font-family: var(--font-sans);
+}
+
+.maplibregl-ctrl-attrib.maplibregl-compact {
+  background: var(--surface);
+  color: var(--muted);
+  box-shadow: var(--shadow-float);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  border-radius: 999px;
+  margin: 0 12px 12px 0;
+  font-size: 11px;
+}
+
+.maplibregl-ctrl-attrib.maplibregl-compact.maplibregl-compact-show {
+  border-radius: 12px;
+}
+
+.maplibregl-ctrl-attrib a {
+  color: var(--ink-2);
+}
+
+.dark .maplibregl-ctrl-attrib-button {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+/* The rail floats over the left edge on desktop: keep the scale bar clear of it, and keep the
+   attribution visible beside the inspector while one is open. */
+@media (min-width: 768px) {
+  .maplibregl-ctrl-bottom-left {
+    left: 84px;
+  }
+
+  .maplibregl-ctrl-bottom-left {
+    transition: left 0.3s var(--ease-out-quint);
+  }
+
+  [data-panel] .maplibregl-ctrl-bottom-left {
+    left: 472px;
+  }
+
+  .maplibregl-ctrl-bottom-right {
+    transition: right 0.3s var(--ease-out-quint);
+  }
+
+  [data-inspecting] .maplibregl-ctrl-bottom-right {
+    right: 372px;
+  }
+}
+
+@media (max-width: 767px) {
+  .maplibregl-ctrl-bottom-left,
+  .maplibregl-ctrl-bottom-right {
+    bottom: 96px;
+  }
+}
+
+.maplibregl-ctrl-scale {
+  background: transparent;
+  border-color: var(--ink-2);
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.maplibregl-canvas:focus-visible {
+  outline: none;
+}
+
+/* biome-ignore-start lint/complexity/noImportantStyles: a global reduced-motion override must win over every component's own timing. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+/* biome-ignore-end lint/complexity/noImportantStyles: end of the reduced-motion override. */
