@@ -18,6 +18,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from perimeter.api.state import AppState
 from perimeter.config import IngestSettings, Settings, load_settings
+from perimeter.domain.clock import SYSTEM_CLOCK
 from perimeter.domain.reports import TelemetryRecord
 from perimeter.wire import subjects, telemetry
 from tests.integration.conftest import TEST_INGEST_TOKEN
@@ -70,7 +71,13 @@ async def server(api: FastAPI) -> AsyncIterator[str]:
 
 
 def report(device: str = "veh-1", **fields: Any) -> dict[str, Any]:
-    return {"device_id": device, "latitude": 52.3731, "longitude": 4.8926, **fields}
+    return {
+        "device_id": device,
+        "latitude": 52.3731,
+        "longitude": 4.8926,
+        "timestamp": SYSTEM_CLOCK.now_ms(),
+        **fields,
+    }
 
 
 def reports_frame(seq: int, count: int, *, prefix: str = "veh") -> dict[str, Any]:

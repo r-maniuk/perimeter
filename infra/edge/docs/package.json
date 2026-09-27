@@ -1,0 +1,8 @@
+{
+  "name": "perimeter-api-reference",
+  "private": true,
+  "description": "Swagger UI for the API reference at /docs, served by the edge image itself",
+  "dependencies": {
+    "swagger-ui-dist": "5.33.0"
+  }
+}

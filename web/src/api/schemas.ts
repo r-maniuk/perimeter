@@ -14,9 +14,8 @@ const LatLon = v.looseObject({ lat: v.number(), lon: v.number() });
 export const UserSchema = v.looseObject({ id: Id, username: v.string() });
 export type User = v.InferOutput<typeof UserSchema>;
 
+/** The browser's session: its token lives in the HttpOnly cookie and never in a response body. */
 export const SessionSchema = v.looseObject({
-  token: v.string(),
-  token_type: v.optional(v.string()),
   expires_at: v.union([v.string(), v.number()]),
   user: UserSchema,
 });

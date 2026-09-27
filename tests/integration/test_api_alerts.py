@@ -15,8 +15,7 @@ T0 = datetime(2026, 9, 26, 19, 0, tzinfo=UTC)
 
 
 async def auth(client: httpx.AsyncClient, username: str) -> tuple[dict[str, str], uuid.UUID]:
-    response = await client.post("/v1/session", json={"username": username})
-    client.cookies.clear()
+    response = await client.post("/v1/token", json={"username": username})
     session = response.json()
     return {"Authorization": f"Bearer {session['token']}"}, uuid.UUID(session["user"]["id"])
 

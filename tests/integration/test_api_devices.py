@@ -13,8 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 
 async def auth(client: httpx.AsyncClient, username: str) -> dict[str, str]:
-    response = await client.post("/v1/session", json={"username": username})
-    client.cookies.clear()
+    response = await client.post("/v1/token", json={"username": username})
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 

@@ -18,7 +18,16 @@ from tests.support import eventually
 
 
 async def sign_in(client: httpx.AsyncClient, username: str = "alice") -> dict[str, Any]:
+    """A browser sign-in: the session cookie, and a body with the user only."""
     response = await client.post("/v1/session", json={"username": username})
+    assert response.status_code == 201, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+async def get_token(client: httpx.AsyncClient, username: str = "alice") -> dict[str, Any]:
+    """A command-line sign-in: a bearer token, and no cookie."""
+    response = await client.post("/v1/token", json={"username": username})
     assert response.status_code == 201, response.text
     body: dict[str, Any] = response.json()
     return body
@@ -34,7 +43,7 @@ async def test_sign_in_creates_the_user_once_and_sets_a_hardened_cookie(
     response = await client.post("/v1/session", json={"username": "  Alice.Smith "})
     assert response.status_code == 201
     session = response.json()
-    assert session["token_type"] == "bearer"
+    assert set(session) == {"expires_at", "user"}  # the token is in the cookie only
     assert session["user"]["username"] == "alice.smith"
     cookie = response.headers["set-cookie"]
     ttl = api.state.perimeter.tokens.ttl_s
@@ -42,9 +51,19 @@ async def test_sign_in_creates_the_user_once_and_sets_a_hardened_cookie(
         assert attribute in cookie
     assert "samesite=lax" in cookie.lower()
     assert "secure" not in cookie.lower()  # SECURE_COOKIES is off in tests
+    first_cookie = client.cookies["perimeter_session"]
     again = await sign_in(client, "ALICE.SMITH")
     assert again["user"] == session["user"]
-    assert again["token"] != session["token"]
+    assert client.cookies["perimeter_session"] != first_cookie
+
+
+async def test_a_token_for_a_client_without_cookies_sets_none(client: httpx.AsyncClient) -> None:
+    grant = await get_token(client, "Alice")
+    assert grant["token_type"] == "bearer"
+    assert grant["user"]["username"] == "alice"
+    assert not client.cookies
+    assert (await client.get("/v1/me", headers=bearer(grant))).json()["username"] == "alice"
+    assert (await get_token(client))["token"] != grant["token"]
 
 
 async def test_cookie_and_bearer_both_identify_the_user(client: httpx.AsyncClient) -> None:
@@ -57,9 +76,10 @@ async def test_cookie_and_bearer_both_identify_the_user(client: httpx.AsyncClien
     assert anonymous.status_code == 401
     assert anonymous.headers["www-authenticate"] == "Bearer"
     assert anonymous.headers["content-type"] == "application/problem+json"
-    by_bearer = (await client.get("/v1/me", headers=bearer(session))).json()
+    grant = await get_token(client)
+    by_bearer = (await client.get("/v1/me", headers=bearer(grant))).json()
     assert by_bearer["username"] == "alice"
-    assert by_bearer["session_expires_at"] == session["expires_at"]
+    assert by_bearer["session_expires_at"] == grant["expires_at"]
     garbage = await client.get("/v1/me", headers={"Authorization": "Bearer not-a-token"})
     assert garbage.status_code == 401
 
@@ -67,14 +87,14 @@ async def test_cookie_and_bearer_both_identify_the_user(client: httpx.AsyncClien
 async def test_sign_out_revokes_the_token_on_every_replica(
     client: httpx.AsyncClient, api: FastAPI
 ) -> None:
-    session = await sign_in(client)
+    session = await get_token(client)
     state: AppState = api.state.perimeter
     token_id = state.tokens.verify(session["token"]).token_id
-    other_replica = await RevocationList.open(state.js)
+    other_replica = await RevocationList.open(state.js, keep_s=60)
     try:
         response = await client.delete("/v1/session", headers=bearer(session))
         assert response.status_code == 204
-        assert "Max-Age=0" in response.headers["set-cookie"]
+        assert "Max-Age=0" in response.headers["set-cookie"]  # a browser's cookie goes too
         assert (await client.get("/v1/me", headers=bearer(session))).status_code == 401
         await eventually(lambda: other_replica.is_revoked(token_id))
     finally:
@@ -141,7 +161,7 @@ async def test_sign_in_is_rate_limited_per_address(client: httpx.AsyncClient, ap
 async def test_a_token_that_outlived_its_account_is_refused(
     client: httpx.AsyncClient, db: AsyncEngine
 ) -> None:
-    session = await sign_in(client, "ghost")
+    session = await get_token(client, "ghost")
     async with db.begin() as conn:
         await conn.execute(text("DELETE FROM users WHERE username = 'ghost'"))
     me = await client.get("/v1/me", headers=bearer(session))

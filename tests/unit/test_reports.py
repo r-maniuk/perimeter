@@ -21,7 +21,7 @@ def test_brief_style_payload_is_accepted() -> None:
         b'{"device_id":"truck-17","latitude":52.37,"longitude":4.89,'
         b'"timestamp":"2026-09-26T19:00:00Z"}'
     )
-    assert report.recorded_at_ms(RECEIVED) == datetime_to_ms(datetime(2026, 9, 26, 19, tzinfo=UTC))
+    assert report.recorded_at_ms() == datetime_to_ms(datetime(2026, 9, 26, 19, tzinfo=UTC))
 
 
 @pytest.mark.parametrize(
@@ -36,12 +36,13 @@ def test_brief_style_payload_is_accepted() -> None:
 )
 def test_timestamp_formats(stamp: bytes, expected: int) -> None:
     report = decode(b'{"device_id":"d","latitude":0,"longitude":0,"timestamp":%s}' % stamp)
-    assert report.recorded_at_ms(RECEIVED) == expected
+    assert report.recorded_at_ms() == expected
 
 
-def test_missing_timestamp_uses_the_receive_time() -> None:
-    report = decode(b'{"device_id":"d","latitude":0,"longitude":0}')
-    assert report.recorded_at_ms(RECEIVED) == RECEIVED
+def test_a_report_without_a_timestamp_is_refused() -> None:
+    # Without it a retried report could not be recognised, nor placed in the device's history.
+    with pytest.raises(msgspec.ValidationError, match="missing required field `timestamp`"):
+        decode(b'{"device_id":"d","latitude":0,"longitude":0}')
 
 
 @pytest.mark.parametrize(
@@ -66,7 +67,8 @@ def test_invalid_reports_are_rejected(body: bytes) -> None:
 
 def test_envelope_form_is_supported() -> None:
     batch = msgspec.json.decode(
-        b'{"reports":[{"device_id":"a","latitude":1,"longitude":2}]}', type=ReportBatch
+        b'{"reports":[{"device_id":"a","latitude":1,"longitude":2,"timestamp":1790000000}]}',
+        type=ReportBatch,
     )
     assert batch.reports[0].device_id == "a"
 

@@ -16,6 +16,7 @@ build/
 
 # Web
 web/node_modules/
+infra/edge/docs/node_modules/
 web/dist/
 web/coverage/
 web/*.tsbuildinfo

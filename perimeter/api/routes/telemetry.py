@@ -11,7 +11,8 @@ from __future__ import annotations
 from typing import Any
 
 import msgspec
-from fastapi import APIRouter, Request, Response, WebSocket, status
+from fastapi import APIRouter, Request, Response, Security, WebSocket, status
+from fastapi.security import HTTPBearer
 
 from perimeter.api.deps import State
 from perimeter.api.errors import ProblemError, unauthorized
@@ -78,6 +79,14 @@ _REQUEST_BODY = {
 }
 
 
+# Declared for the OpenAPI document (the reference's "Authorize"); checked by _authenticate_device.
+DEVICE_TOKEN = HTTPBearer(
+    auto_error=False,
+    scheme_name="DeviceToken",
+    description="The device ingest token (`make ingest-token`); `X-Ingest-Token` works as well.",
+)
+
+
 def report_decoder(settings: Settings) -> ReportDecoder:
     return ReportDecoder(
         max_batch=settings.ingest.max_batch,
@@ -100,6 +109,7 @@ def _rejections(rejected: list[Rejection]) -> list[dict[str, Any]]:
     "/telemetry",
     status_code=status.HTTP_202_ACCEPTED,
     response_model=IngestResult,
+    dependencies=[Security(DEVICE_TOKEN)],
     openapi_extra={"requestBody": _REQUEST_BODY},
     responses={
         401: {"description": "Missing or wrong device ingest token"},
@@ -163,7 +173,11 @@ async def ingest(request: Request, state: State) -> Response:
             headers={"Retry-After": str(retry_after)},
             extra={"retry_after": retry_after},
         ) from exc
-    body = {"accepted": outcome.accepted, "rejected": _rejections(batch.rejected)}
+    body = {
+        "accepted": outcome.accepted,
+        "duplicates": outcome.duplicates,
+        "rejected": _rejections(batch.rejected),
+    }
     return Response(
         _encoder.encode(body), status_code=status.HTTP_202_ACCEPTED, media_type="application/json"
     )

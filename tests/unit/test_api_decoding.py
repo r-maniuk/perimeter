@@ -21,7 +21,7 @@ decoder = ReportDecoder(max_batch=5, max_skew_s=30, max_age_s=7_200)
 
 
 def report(device: str = "veh-1", **fields: Any) -> dict[str, Any]:
-    return {"device_id": device, "latitude": 52.37, "longitude": 4.89, **fields}
+    return {"device_id": device, "latitude": 52.37, "longitude": 4.89, "timestamp": NOW_MS} | fields
 
 
 def as_json(value: object) -> bytes:
@@ -38,7 +38,7 @@ def body(payload: bytes, encoding: Encoding = Encoding.JSON) -> Any:
         as_json(report()),
         as_json([report()]),
         as_json({"reports": [report()]}),
-        b'  \n {"device_id":"veh-1","latitude":52.37,"longitude":4.89}',
+        b'  \n {"device_id":"veh-1","latitude":52.37,"longitude":4.89,"timestamp":1790000000}',
     ],
 )
 def test_every_body_shape_is_accepted(payload: bytes) -> None:

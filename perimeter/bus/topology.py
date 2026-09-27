@@ -64,7 +64,7 @@ class Topology:
 def telemetry_stream(topo: Topology) -> StreamConfig:
     return StreamConfig(
         name=subjects.TELEMETRY_STREAM,
-        description="Device location reports, partitioned by device; doubles as the trail log.",
+        description="Device location reports, partitioned by device.",
         subjects=[subjects.TELEMETRY_INPUT],
         subject_transform=SubjectTransform(
             src=subjects.TELEMETRY_INPUT,
@@ -211,3 +211,14 @@ async def _ensure_bucket(js: JetStreamContext, config: KeyValueConfig) -> None:
     except BucketNotFoundError:
         await js.create_key_value(config)
         log.info("topology.bucket_created", bucket=config.bucket)
+        return
+    # A bucket's TTL is its stream's age limit, fixed at creation unless updated here: follow the
+    # configuration, or a changed SESSION_TTL_S would let revocations lapse before their tokens.
+    info = await js.stream_info(f"KV_{config.bucket}")
+    if config.ttl and abs((info.config.max_age or 0) - config.ttl) > 1e-3:
+        before = info.config.max_age
+        info.config.max_age = config.ttl
+        await js.update_stream(info.config)
+        log.info(
+            "topology.bucket_ttl_changed", bucket=config.bucket, before_s=before, now_s=config.ttl
+        )

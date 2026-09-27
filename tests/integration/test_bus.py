@@ -40,6 +40,21 @@ async def test_ensure_is_idempotent_and_verify_accepts_it(
     assert sorted(c.name for c in consumers) == [f"engine-p{p}" for p in range(topo.partitions)]
 
 
+async def test_bucket_lifetimes_follow_the_configuration(
+    js: JetStreamContext, topo: topology.Topology
+) -> None:
+    # A revocation must outlive the tokens it revokes, whatever SESSION_TTL_S says today.
+    await topology.ensure(js, topo)
+    longer = topology.Topology(
+        partitions=topo.partitions, lease_ttl_s=3, sessions_ttl_s=5, revoked_ttl_s=90
+    )
+    await topology.ensure(js, longer)
+    revoked = await js.stream_info(f"KV_{subjects.KV_REVOKED}")
+    engine = await js.stream_info(f"KV_{subjects.KV_ENGINE}")
+    assert revoked.config.max_age == 90
+    assert engine.config.max_age == 3
+
+
 async def test_repartitioning_is_refused(js: JetStreamContext, topo: topology.Topology) -> None:
     await topology.ensure(js, topo)
     other = topology.Topology(partitions=topo.partitions * 2)

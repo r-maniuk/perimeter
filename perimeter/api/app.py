@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+import copy
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -126,7 +128,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             js=js,
             relay=OutboxRelay(db, stream),
             tokens=TokenService(settings.security),
-            revoked=await RevocationList.open(js),
+            revoked=await RevocationList.open(js, keep_s=settings.security.session_ttl_s),
             looplag=LoopLagMonitor(),
             admission=admission,
             publisher=publisher,
@@ -170,7 +172,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=__version__,
         summary="Live device tracking and circular geofence alerts.",
         lifespan=lifespan,
-        docs_url="/docs",
+        docs_url=None,  # the edge serves the reference page itself (infra/edge/docs)
         redoc_url=None,
         openapi_url="/openapi.json",
     )
@@ -196,4 +198,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         v1.include_router(router)
     app.include_router(v1)  # after every router is on v1: inclusion copies the routes
     app.mount("/metrics", make_asgi_app())
+    app.openapi = _with_a_recent_ingest_example(app.openapi)  # type: ignore[method-assign]
     return app
+
+
+def _with_a_recent_ingest_example(
+    generate: Callable[[], dict[str, Any]],
+) -> Callable[[], dict[str, Any]]:
+    """The OpenAPI document, its ingest example stamped with the current time.
+
+    The reference's "Try it out" sends the example as it is, and reports older than the telemetry
+    retention are refused: a fixed timestamp would make its first attempt a 422.
+    """
+
+    def openapi() -> dict[str, Any]:
+        document = copy.deepcopy(generate())
+        body = document["paths"].get("/v1/telemetry", {}).get("post", {}).get("requestBody", {})
+        example = body.get("content", {}).get("application/json", {}).get("example", {})
+        now = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        for report in example.get("reports", []):
+            report["timestamp"] = now
+        return document
+
+    return openapi

@@ -1,8 +1,9 @@
 """Failure drill: kill a replica under load, then prove nothing was lost, duplicated or missed.
 
-The drill drives the running stack with ``generator.py`` through the edge (with an observer that
-creates demo zones and watches the live channel), kills one replica of ``--kill`` mid-run with
-SIGKILL, starts it again after ``--down`` seconds, lets the pipeline drain, and then checks:
+The drill drives the running stack with the load generator, inside the stack's network and through
+the edge (with an observer that creates demo zones and watches the live channel), kills one
+replica of ``--kill`` mid-run with SIGKILL, starts it again after ``--down`` seconds, lets the
+pipeline drain, and then checks:
 
 1. **no accepted report is lost**: the TELEMETRY stream grew by exactly the number of reports the
    API acknowledged, and every engine consumer drained (nothing pending, nothing unacknowledged:
@@ -12,26 +13,26 @@ SIGKILL, starts it again after ``--down`` seconds, lets the pipeline drain, and 
 3. **no alert is missed live**: the observer received exactly the alerts stored for its user, even
    if the replica holding its socket died (it resumes by sequence).
 
-Run against a stack started with ``make up``::
+Run against a stack started with ``make up`` (standard library only, Python 3.9 or newer)::
 
-    uv run python scripts/drill.py --kill engine
-    uv run python scripts/drill.py --kill api --devices 10000 --duration 120
+    python3 scripts/drill.py --kill engine
+    python3 scripts/drill.py --kill api --devices 10000 --duration 120
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+UTC = timezone.utc  # datetime.UTC needs Python 3.11; this script runs on any python3 from 3.9
 
 ROOT = Path(__file__).resolve().parent.parent
 DRAIN_TIMEOUT_S = 120.0
@@ -84,7 +85,7 @@ def jetstream() -> dict[str, Any]:
     return report
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Telemetry:
     last_seq: int
     pending: int
@@ -155,7 +156,7 @@ def takeover_seconds(service: str, killed_at: datetime, restarted_at: datetime) 
         "logs", "--no-color", "--no-log-prefix", "--since", killed_at.isoformat(), "engine"
     )
     stamps = [
-        datetime.fromisoformat(match.group(1))
+        datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))  # "Z" parses from 3.11 only
         for line in logs.splitlines()
         if '"engine.partition_acquired"' in line
         and (match := re.search(r'"timestamp":"([^"]+)"', line))
@@ -173,32 +174,28 @@ def main() -> int:
     parser.add_argument("--at", type=float, default=35.0, help="seconds into the run to kill")
     parser.add_argument("--down", type=float, default=15.0, help="seconds before restarting")
     parser.add_argument("--zones", type=int, default=20)
-    parser.add_argument("--url", default=f"http://127.0.0.1:{os.environ.get('HTTP_PORT', '8080')}")
     args = parser.parse_args()
 
     username = f"drill-{int(time.time())}"
-    workdir = Path(tempfile.mkdtemp(prefix="perimeter-drill-"))
-    token_file = workdir / "ingest_token"
-    token_file.write_text(compose("exec", "-T", "api", "cat", "/run/secrets/ingest_token"))
-    token_file.chmod(0o600)
-    summary_file = workdir / "summary.json"
     before = telemetry_state()
 
+    # The generator runs as the compose `load` service (it reaches the edge on the stack's own
+    # network and reads the device token from its secret); its summary comes back as JSON on
+    # standard output, its running report on standard error.
     options = {
-        "--url": args.url,
-        "--token-file": str(token_file),
         "--devices": str(args.devices),
         "--interval": str(args.interval),
         "--duration": str(args.duration),
         "--observe": username,
         "--zones": str(args.zones),
         "--report-every": "15",
-        "--json": str(summary_file),
+        "--json": "-",
     }
-    command = [sys.executable, str(ROOT / "generator.py")]
+    command = ["docker", "compose", "--profile", "load", "run", "--rm", "--no-deps", "-T"]
+    command.append("generator")
     for flag, value in options.items():
         command += [flag, value]
-    generator = subprocess.Popen(command, cwd=ROOT)  # noqa: S603
+    generator = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, text=True)  # noqa: S603
     killed_at: datetime | None = None
     restarted_at: datetime | None = None
     victim = ""
@@ -212,9 +209,11 @@ def main() -> int:
         restarted_at = datetime.now(UTC)
         docker("start", victim)
         print(f"drill: started it again after {args.down:g} s")
-    generator.wait()
+    output, _ = generator.communicate()
+    if generator.returncode not in (0, None):
+        print(f"drill: the generator exited with {generator.returncode}", file=sys.stderr)
     after = wait_drained(DRAIN_TIMEOUT_S)
-    summary = json.loads(summary_file.read_text())
+    summary = json.loads(output)
     accepted = int(summary["reports"]["accepted"])
     observed = sum(summary.get("observe", {}).get("alerts", {}).values())
     checks = alert_checks(username)
@@ -241,7 +240,6 @@ def main() -> int:
         print(f"  {'PASS' if ok else 'FAIL'}  {name:<34} {detail}")
     if takeover is not None:
         print(f"        takeover: orphaned partitions owned again {takeover:.1f} s after the kill")
-    print(f"        summary: {summary_file}")
     return 0 if all(ok for _, ok, _ in results) else 1
 
 

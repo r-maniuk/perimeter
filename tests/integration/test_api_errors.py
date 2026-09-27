@@ -28,7 +28,7 @@ def settings(settings: Settings) -> Settings:
 
 @pytest.fixture
 async def token(client: httpx.AsyncClient) -> str:
-    response = await client.post("/v1/session", json={"username": "alice"})
+    response = await client.post("/v1/token", json={"username": "alice"})
     client.cookies.clear()
     token: str = response.json()["token"]
     return token

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """End-to-end smoke test of a running stack, through the edge only.
 
-    docker compose exec -T api cat /run/secrets/ingest_token \\
-        | uv run python scripts/smoke.py --ingest-token-file -        # what `make smoke` runs
+``make smoke`` runs it inside the stack's network, from the application image (nothing to install
+on the host)::
 
-In order: the edge serves the dashboard with its security headers and hides /metrics; the API is
-live and ready behind it; a user signs in and draws a zone; a live session opens on the zone's
-area; one device report from inside the zone is ingested; the session then receives the ``enter``
-alert and the device's position as a binary frame, each within the deadline; finally the zone is
-deleted and the user signs out. Exit status 0 means every step passed.
+    docker compose --profile load run --rm --no-deps --entrypoint python generator \\
+        /app/scripts/smoke.py --base-url http://edge:8080 \\
+        --ingest-token-file /run/secrets/ingest_token
+
+In order: the edge serves the dashboard and the API reference with their security headers and
+hides /metrics; the API is live and ready behind it; a user signs in and draws a zone; a live
+session opens on the zone's area; one device report from inside the zone is ingested; the session
+then receives the ``enter`` alert and the device's position as a binary frame, each within the
+deadline; finally the zone is deleted and the user signs out. Exit status 0 means every step
+passed.
 """
 
 from __future__ import annotations
@@ -19,14 +24,14 @@ import json
 import secrets
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
+import aiohttp
 from websockets.asyncio.client import ClientConnection, connect
 
 from perimeter.wire.frames import FrameError, decode_bundle, decode_tile
@@ -59,11 +64,43 @@ def _expect(condition: object, message: str) -> None:
         raise SmokeTestError(message)
 
 
-def _expect_status(response: httpx.Response, status: int) -> None:
-    if response.status_code != status:
-        body = response.text[:300]
-        msg = f"{response.request.method} {response.request.url.path} -> {response.status_code}"
-        raise SmokeTestError(f"{msg} (expected {status}): {body}")
+@dataclass(frozen=True, slots=True)
+class Reply:
+    method: str
+    path: str
+    status: int
+    headers: Mapping[str, str]  # case-insensitive
+    text: str
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+class Http:
+    """The few calls the smoke test makes, against the edge."""
+
+    def __init__(self, session: aiohttp.ClientSession, base_url: str) -> None:
+        self._session = session
+        self._base = base_url
+
+    async def request(self, method: str, path: str, **options: Any) -> Reply:
+        async with self._session.request(method, self._base + path, **options) as response:
+            return Reply(method, path, response.status, response.headers, await response.text())
+
+    async def get(self, path: str, **options: Any) -> Reply:
+        return await self.request("GET", path, **options)
+
+    async def post(self, path: str, **options: Any) -> Reply:
+        return await self.request("POST", path, **options)
+
+    async def delete(self, path: str, **options: Any) -> Reply:
+        return await self.request("DELETE", path, **options)
+
+
+def _expect_status(reply: Reply, status: int) -> None:
+    if reply.status != status:
+        msg = f"{reply.method} {reply.path} -> {reply.status}"
+        raise SmokeTestError(f"{msg} (expected {status}): {reply.text[:300]}")
 
 
 async def _step[T](name: str, action: Callable[[], Awaitable[T]]) -> T:
@@ -73,14 +110,14 @@ async def _step[T](name: str, action: Callable[[], Awaitable[T]]) -> T:
     except SmokeTestError as exc:
         print(f"FAIL  {name}: {exc}", flush=True)
         raise
-    except (httpx.HTTPError, OSError, TimeoutError) as exc:
+    except (aiohttp.ClientError, OSError, TimeoutError) as exc:
         print(f"FAIL  {name}: {type(exc).__name__}: {exc}", flush=True)
         raise SmokeTestError(name) from exc
     print(f"  ok  {name} ({(time.perf_counter() - started) * 1000:.0f} ms)", flush=True)
     return result
 
 
-async def check_edge(http: httpx.AsyncClient) -> None:
+async def check_edge(http: Http) -> None:
     page = await http.get("/")
     _expect_status(page, 200)
     _expect(page.headers.get("content-type", "").startswith("text/html"), "/ is not HTML")
@@ -88,9 +125,17 @@ async def check_edge(http: httpx.AsyncClient) -> None:
         _expect(fragment in page.headers.get(header, ""), f"{header} missing or weak on /")
     _expect("server" not in page.headers, "the edge discloses a Server header")
     _expect_status(await http.get("/metrics"), 404)
+    reference = await http.get("/docs")
+    _expect_status(reference, 200)
+    _expect("swagger-ui" in reference.text, "/docs is not the API reference")
+    policy = reference.headers.get("content-security-policy", "")
+    _expect(
+        "script-src 'self';" in policy and "http" not in policy,
+        f"/docs may run scripts from elsewhere: {policy}",
+    )
 
 
-async def check_api(http: httpx.AsyncClient) -> None:
+async def check_api(http: Http) -> None:
     _expect_status(await http.get("/healthz"), 200)
     ready = await http.get("/readyz")
     _expect_status(ready, 200)
@@ -100,15 +145,15 @@ async def check_api(http: httpx.AsyncClient) -> None:
     _expect(schema.json().get("info", {}).get("title") == "Perimeter", "unexpected OpenAPI title")
 
 
-async def sign_in(http: httpx.AsyncClient, username: str) -> str:
-    response = await http.post("/v1/session", json={"username": username})
-    _expect(response.status_code in {200, 201}, f"sign-in answered {response.status_code}")
+async def sign_in(http: Http, username: str) -> str:
+    response = await http.post("/v1/token", json={"username": username})
+    _expect(response.status in {200, 201}, f"sign-in answered {response.status}")
     token = response.json().get("token")
     _expect(isinstance(token, str) and token, "sign-in returned no token")
     return str(token)
 
 
-async def create_zone(http: httpx.AsyncClient, token: str) -> str:
+async def create_zone(http: Http, token: str) -> str:
     response = await http.post(
         "/v1/geozones",
         headers={"Authorization": f"Bearer {token}"},
@@ -141,7 +186,7 @@ async def open_live(live: ClientConnection) -> None:
     )
 
 
-async def ingest(http: httpx.AsyncClient, ingest_token: str, device_id: str) -> None:
+async def ingest(http: Http, ingest_token: str, device_id: str) -> None:
     now = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     report = {
         "device_id": device_id,
@@ -213,7 +258,8 @@ async def live_session(base_url: str, token: str) -> AsyncIterator[ClientConnect
 async def run(options: Options) -> None:
     run_id = secrets.token_hex(4)
     username, device_id = f"smoke-{run_id}", f"smoke-{run_id}"
-    async with httpx.AsyncClient(base_url=options.base_url, timeout=10) as http:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        http = Http(session, options.base_url)
         await _step("edge serves the dashboard with security headers", lambda: check_edge(http))
         await _step("api is live and ready behind the edge", lambda: check_api(http))
         token = await _step(f"sign in as {username}", lambda: sign_in(http, username))
@@ -238,9 +284,9 @@ async def run(options: Options) -> None:
             await _step("sign out", lambda: _delete(http, "/v1/session", auth))
 
 
-async def _delete(http: httpx.AsyncClient, path: str, headers: dict[str, str]) -> None:
+async def _delete(http: Http, path: str, headers: dict[str, str]) -> None:
     response = await http.delete(path, headers=headers)
-    _expect(response.status_code in {200, 204}, f"DELETE {path} -> {response.status_code}")
+    _expect(response.status in {200, 204}, f"DELETE {path} -> {response.status}")
 
 
 def _read_token(source: str) -> str:

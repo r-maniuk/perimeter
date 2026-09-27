@@ -202,7 +202,7 @@ def test_reports_validate_against_the_ingest_schema() -> None:
         assert TIMESTAMP.fullmatch(raw["timestamp"])
         single = msgspec.json.decode(text.encode(), type=LocationReport)
         assert single == report
-        assert WALL0_MS <= report.recorded_at_ms(0) <= WALL0_MS + 10_000
+        assert WALL0_MS <= report.recorded_at_ms() <= WALL0_MS + 10_000
         assert report.speed is not None
         if report.speed > 0:
             assert report.heading is not None

@@ -151,7 +151,7 @@ class FakeApi:
             [
                 web.post("/v1/telemetry", self.telemetry),
                 web.get("/v1/telemetry/stream", self.stream),
-                web.post("/v1/session", self.sign_in),
+                web.post("/v1/token", self.sign_in),
                 web.delete("/v1/session", self.sign_out),
                 web.post("/v1/geozones", self.create_zone),
                 web.delete("/v1/geozones/{zone_id}", self.delete_zone),
@@ -176,7 +176,7 @@ class FakeApi:
                 self.invalid += 1
                 rejected.append({"index": index, "code": "invalid", "detail": str(exc)})
                 continue
-            key = (report.device_id, report.recorded_at_ms(0))
+            key = (report.device_id, report.recorded_at_ms())
             keys.append(key)
             if self.reject_prefix and report.device_id.startswith(self.reject_prefix):
                 self.rejected += 1
@@ -215,12 +215,12 @@ class FakeApi:
         if retry_after is not None:
             # The real API answers before reading the body; reading it here names the batch, so
             # the test can recognise its retry.
-            keys = tuple((r.device_id, r.recorded_at_ms(0)) for r in map(decode_report, raws))
+            keys = tuple((r.device_id, r.recorded_at_ms()) for r in map(decode_report, raws))
             self.hits.append(Hit(now, port, 503, keys))
             return problem(503, "overloaded", {"Retry-After": f"{retry_after:g}"})
         failure = self.failures.pop(number, None)
         if failure is not None:
-            keys = tuple((r.device_id, r.recorded_at_ms(0)) for r in map(decode_report, raws))
+            keys = tuple((r.device_id, r.recorded_at_ms()) for r in map(decode_report, raws))
             self.hits.append(Hit(now, port, int(failure) if failure.isdigit() else 0, keys))
             return self.fail(request, failure, len(raws))
         if self.delay_s and raws:
@@ -365,7 +365,7 @@ class FakeApi:
         return web.Response(status=204)
 
     async def live(self, request: web.Request) -> web.StreamResponse:
-        if request.query.get("token") != SESSION_TOKEN or self.refuse_live:
+        if not self._signed_in(request) or self.refuse_live:
             return problem(403, "forbidden")
         self.resume_requests.append(request.query.get("resume_after"))
         ws = web.WebSocketResponse()
@@ -907,3 +907,23 @@ async def test_the_script_exits_with_3_when_the_target_is_down(tmp_path: Path) -
     assert process.returncode == generator.EXIT_UNREACHABLE
     assert b"cannot reach" in errors
     assert json.loads((tmp_path / "summary.json").read_text())["exit_code"] == 3
+
+
+async def test_the_summary_can_go_to_standard_output_as_json_alone(api: FakeApi) -> None:
+    # How a caller in another container (the failure drill) reads the result: no shared files.
+    env = generator_env(
+        api, devices="50", interval="0.2", ramp="0", duration="1", connections="1", json="-"
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(ROOT / "generator.py"),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    async with asyncio.timeout(30):
+        out, report = await process.communicate()
+    assert process.returncode == 0, report.decode()
+    summary = json.loads(out)
+    assert summary["reports"]["accepted"] == len(api.received) > 0
+    assert "(balanced)" in report.decode()  # the human report went to standard error

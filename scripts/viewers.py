@@ -48,9 +48,7 @@ class Tally:
 async def sign_in(base: str) -> str:
     async with (
         aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http,
-        http.post(
-            f"{base}/v1/session", json={"username": f"viewer-{secrets.token_hex(4)}"}
-        ) as reply,
+        http.post(f"{base}/v1/token", json={"username": f"viewer-{secrets.token_hex(4)}"}) as reply,
     ):
         reply.raise_for_status()
         token: str = (await reply.json())["token"]

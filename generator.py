@@ -95,8 +95,10 @@ EXIT_FORCED: Final = 130
 INGEST_PATH: Final = "/v1/telemetry"
 STREAM_PATH: Final = "/v1/telemetry/stream"
 SESSION_PATH: Final = "/v1/session"
+TOKEN_PATH: Final = "/v1/token"  # noqa: S105 - a path, not a secret
 ZONES_PATH: Final = "/v1/geozones"
 LIVE_PATH: Final = "/v1/live"
+JSON_TO_STDOUT: Final = Path("-")
 
 TICK_S: Final = 0.01  # fleet clock resolution
 STEP_S: Final = 1.0  # longest motion integration step
@@ -1676,7 +1678,7 @@ class Observer:
     async def _sign_in(self) -> None:
         assert self._session is not None
         async with self._session.post(
-            self._url(SESSION_PATH), json={"username": self._username}
+            self._url(TOKEN_PATH), json={"username": self._username}
         ) as response:
             payload = await response.read()
             if response.status not in (200, 201):
@@ -1728,13 +1730,12 @@ class Observer:
     async def _connect(self) -> aiohttp.ClientWebSocketResponse:
         assert self._session is not None
         assert self._token is not None
-        params = {"token": self._token}
-        if self._last_seq:
-            params["resume_after"] = str(self._last_seq)
+        params = {"resume_after": str(self._last_seq)} if self._last_seq else {}
         async with asyncio.timeout(self._config.timeout):
             ws = await self._session.ws_connect(
                 _websocket_url(self._config.url, LIVE_PATH),
                 params=params,
+                headers=self._auth,
                 heartbeat=WS_HEARTBEAT_S,
                 max_msg_size=LIVE_MAX_MESSAGE,
                 timeout=aiohttp.ClientWSTimeout(ws_close=WS_CLOSE_TIMEOUT_S),
@@ -2170,7 +2171,14 @@ OPTIONS: Final = (
         "seconds between status lines; 0 prints only the summary",
         "S",
     ),
-    Option("--json", "json_path", _path, "also write the summary as JSON to this file", "PATH"),
+    Option(
+        "--json",
+        "json_path",
+        _path,
+        "also write the summary as JSON to this file ('-': standard output; the report then goes "
+        "to standard error)",
+        "PATH",
+    ),
 )
 
 _EPILOG: Final = f"""\
@@ -2761,7 +2769,11 @@ def render_summary(summary: Mapping[str, Any]) -> list[str]:
 
 
 def write_json(path: Path, summary: Mapping[str, Any]) -> None:
-    """Write atomically, so a reader never sees half a summary."""
+    """Write atomically, so a reader never sees half a summary (``-``: standard output)."""
+    if path == JSON_TO_STDOUT:
+        sys.stdout.write(json.dumps(summary, indent=2) + "\n")
+        sys.stdout.flush()
+        return
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
@@ -2798,8 +2810,10 @@ async def _main(config: Config) -> int:
             installed.append(signum)
         except (NotImplementedError, RuntimeError):  # pragma: no cover - Windows
             signal.signal(signum, lambda *_: loop.call_soon_threadsafe(interrupted))
+    # With the summary on standard output, the running report moves to standard error.
+    out = sys.stderr if config.json_path == JSON_TO_STDOUT else None
     try:
-        result = await run(config, stop=stop, force=force)
+        result = await run(config, stop=stop, force=force, out=out)
     finally:
         for signum in installed:
             loop.remove_signal_handler(signum)

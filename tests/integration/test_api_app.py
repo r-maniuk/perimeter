@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import httpx
 from fastapi import FastAPI
@@ -36,7 +37,7 @@ async def test_openapi_document_is_served(client: httpx.AsyncClient) -> None:
 
 async def test_revocations_propagate_between_replicas(api: FastAPI) -> None:
     state: AppState = api.state.perimeter
-    other = await RevocationList.open(state.js)
+    other = await RevocationList.open(state.js, keep_s=60)
     try:
         listener = other.subscribe()
         await state.revoked.revoke("token-123")
@@ -44,3 +45,19 @@ async def test_revocations_propagate_between_replicas(api: FastAPI) -> None:
         assert await asyncio.wait_for(listener.get(), 2) == "token-123"
     finally:
         await other.close()
+
+
+async def test_the_reference_declares_both_tokens_and_offers_a_fresh_ingest_example(
+    client: httpx.AsyncClient,
+) -> None:
+    document = (await client.get("/openapi.json")).json()
+    schemes = document["components"]["securitySchemes"]
+    assert schemes["SessionToken"]["scheme"] == "bearer"
+    assert schemes["DeviceToken"]["scheme"] == "bearer"
+    ingest = document["paths"]["/v1/telemetry"]["post"]
+    assert {"DeviceToken": []} in ingest["security"]
+    assert {"SessionToken": []} in document["paths"]["/v1/geozones"]["get"]["security"]
+    example = ingest["requestBody"]["content"]["application/json"]["example"]["reports"][0]
+    stamp = datetime.fromisoformat(example["timestamp"])
+    assert abs((datetime.now(UTC) - stamp).total_seconds()) < 60
+    assert (await client.get("/docs")).status_code == 404  # served by the edge, not the api

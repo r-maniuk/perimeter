@@ -1,0 +1,23 @@
+# Weekly update proposals for everything pinned in this repository: base images (by digest),
+# compose images, GitHub Actions (by commit), Python and web dependencies (lockfiles).
+version: 2
+updates:
+  - package-ecosystem: docker
+    directories: ["/", "/infra/db", "/infra/nats", "/infra/edge"]
+    schedule: {interval: weekly}
+  - package-ecosystem: docker-compose
+    directory: "/"
+    schedule: {interval: weekly}
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: {interval: weekly}
+  - package-ecosystem: uv
+    directory: "/"
+    schedule: {interval: weekly}
+    groups:
+      python: {patterns: ["*"]}
+  - package-ecosystem: npm
+    directories: ["/web", "/infra/edge/docs"]
+    schedule: {interval: weekly}
+    groups:
+      web: {patterns: ["*"]}

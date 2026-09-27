@@ -96,6 +96,26 @@ class User(BaseModel):
 
 
 class Session(BaseModel):
+    """A browser session: its token is in the ``HttpOnly`` cookie, never in a body."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "expires_at": "2026-09-27T07:07:06Z",
+                    "user": {"id": "01925f7e-8a1c-7c3e-9d2a-3b4c5d6e7f80", "username": "alice"},
+                }
+            ]
+        }
+    )
+
+    expires_at: datetime
+    user: User
+
+
+class TokenGrant(BaseModel):
+    """A bearer token for a client without cookies (command line, scripts, the load generator)."""
+
     model_config = ConfigDict(
         json_schema_extra={
             "examples": [
@@ -109,7 +129,7 @@ class Session(BaseModel):
         }
     )
 
-    token: str = Field(description="Bearer token for non-browser clients (also set as a cookie)")
+    token: str = Field(description="Send as `Authorization: Bearer <token>`")
     token_type: Literal["bearer"] = "bearer"  # noqa: S105 - the token scheme, not a secret
     expires_at: datetime
     user: User
@@ -371,6 +391,7 @@ class IngestResult(BaseModel):
             "examples": [
                 {
                     "accepted": 249,
+                    "duplicates": 0,
                     "rejected": [
                         {
                             "index": 17,
@@ -384,4 +405,10 @@ class IngestResult(BaseModel):
     )
 
     accepted: int = Field(description="Reports durably stored (acknowledged by JetStream)")
+    duplicates: int = Field(
+        description=(
+            "How many of the accepted reports were already stored: a retry of a report whose "
+            "answer was lost (same device and timestamp). Stored once all the same."
+        )
+    )
     rejected: list[IngestRejection]

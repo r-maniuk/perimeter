@@ -26,9 +26,9 @@ x-logging: &logging
 # Every container: read-only root file system, no Linux capabilities, no privilege escalation,
 # an init process that forwards signals and reaps children, rotated logs; and per service below,
 # limits on CPU, memory and number of processes. The limits leave several times the headroom of
-# what was measured with 10,000 devices reporting every 3 s (3,300 reports/s) through two engines:
-# engine 75 MiB and 0.9 core each, db 220 MiB and 1.4 cores, nats 95 MiB, edge 12 MiB,
-# api 85 MiB idle.
+# what was measured with 10,000 devices reporting every 3 s (3,300 reports/s, docs/benchmarks.md):
+# engine 97 MiB and a quarter of a core each, db 409 MiB and half a core, nats 148 MiB, api about
+# 100 MiB, edge 18 MiB. No service may use more than 2 CPUs, so the stack starts on a 2-vCPU VM.
 x-hardened: &hardened
   read_only: true
   cap_drop: [ALL]
@@ -150,7 +150,7 @@ services:
     restart: unless-stopped
     deploy:
       resources:
-        limits: {cpus: "3", memory: 2G, pids: 256}
+        limits: {cpus: "2", memory: 2G, pids: 256}
 
   nats:
     <<: *hardened
@@ -339,7 +339,7 @@ services:
   # --- profile `observability`: metrics and traces (make observe) ------------------------------
   prometheus:
     <<: *hardened
-    image: prom/prometheus:v3.15.0
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
     profiles: [observability]
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -367,7 +367,7 @@ services:
 
   jaeger:
     <<: *hardened
-    image: jaegertracing/jaeger:2.21.0
+    image: jaegertracing/jaeger:2.21.0@sha256:3d0ac795ff98aa04d1be04311d2dac6c25b4bfc8322dc02e53bc5b170c5018c3
     profiles: [observability]
     tmpfs:
       - /tmp:size=64m,mode=1777

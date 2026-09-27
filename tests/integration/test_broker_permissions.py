@@ -187,7 +187,7 @@ async def test_the_api_can_do_everything_it_needs(
     await eventually(lambda: any(m.subject == "live.evt.u1" for m in received))
     info = await js.stream_info(subjects.EVENTS_STREAM, subjects_filter=subjects.events("u1"))
     assert info.state.messages >= 1
-    stored = await js.get_msg(subjects.EVENTS_STREAM, seq=info.state.first_seq)
+    stored = await js.get_msg(subjects.EVENTS_STREAM, seq=info.state.first_seq, direct=True)
     assert stored.subject == subjects.events("u1")
 
     # resume replay and gap healing: batched direct gets
@@ -200,24 +200,13 @@ async def test_the_api_can_do_everything_it_needs(
     last = await js.get_last_msg(subjects.EVENTS_STREAM, subjects.events("u1"), direct=True)
     assert last.subject == subjects.events("u1")
 
-    # ... or ephemeral ordered consumers
-    replay = await js.subscribe(
-        subjects.events("u1"),
-        stream=subjects.EVENTS_STREAM,
-        ordered_consumer=True,
-        deliver_policy=DeliverPolicy.BY_START_SEQUENCE,
-        config=ConsumerConfig(opt_start_seq=info.state.first_seq),
-    )
-    assert (await replay.next_msg(timeout=2)).subject == subjects.events("u1")
-    await replay.unsubscribe()
-
     # sessions registry and remote sign-out
     sessions = await js.key_value(subjects.KV_SESSIONS)
     await sessions.put("u1.s1", b"{}")
     assert (await sessions.get("u1.s1")).value == b"{}"
     assert await sessions.keys() == ["u1.s1"]
     await sessions.delete("u1.s1")
-    revocations = await RevocationList.open(js)
+    revocations = await RevocationList.open(js, keep_s=60)
     await revocations.revoke("jti-1")
     await revocations.close()
 
@@ -304,6 +293,11 @@ def _rogue_stream(nc: NatsClient, js: JetStreamContext) -> Awaitable[object]:
     return js.add_stream(StreamConfig(name="ROGUE", subjects=["rogue.>"]))
 
 
+def _events_consumer(nc: NatsClient, js: JetStreamContext) -> Awaitable[object]:
+    # History is read with direct gets: a consumer per reconnecting client is not needed.
+    return js.add_consumer(subjects.EVENTS_STREAM, ConsumerConfig(deliver_policy=DeliverPolicy.ALL))
+
+
 FORBIDDEN: list[tuple[str, str, Attempt]] = [
     ("api", "$JS.API.STREAM.DELETE.TELEMETRY", lambda nc, js: js.delete_stream("TELEMETRY")),
     ("api", "$JS.API.STREAM.PURGE.EVENTS", lambda nc, js: js.purge_stream("EVENTS")),
@@ -314,6 +308,7 @@ FORBIDDEN: list[tuple[str, str, Attempt]] = [
         "$JS.API.CONSUMER.DELETE.TELEMETRY.engine-p0",
         lambda nc, js: js.delete_consumer("TELEMETRY", "engine-p0"),
     ),
+    ("api", "$JS.API.CONSUMER.CREATE.EVENTS", _events_consumer),
     ("api", "$KV.engine.p.0", lambda nc, js: js.publish("$KV.engine.p.0", b"api")),
     ("api", "_INBOX.engine.>", lambda nc, js: nc.subscribe("_INBOX.engine.>")),
     ("engine", "tlm.dev-9", lambda nc, js: js.publish("tlm.dev-9", b"r")),

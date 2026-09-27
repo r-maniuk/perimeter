@@ -98,6 +98,8 @@ docstring-code-format = true
 [tool.ruff.per-file-target-version]
 # The generator also runs standalone (`uv run generator.py`, PEP 723 metadata), on Python >= 3.11.
 "generator.py" = "py311"
+# The failure drill runs on the host's own python3 (standard library only), 3.9 and newer.
+"scripts/drill.py" = "py39"
 
 [tool.mypy]
 python_version = "3.14"

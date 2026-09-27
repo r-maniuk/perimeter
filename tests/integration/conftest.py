@@ -34,8 +34,14 @@ from perimeter.config import (
 from perimeter.storage.engine import create_engine
 from perimeter.tools.init import migrate
 
-POSTGIS_IMAGE = "imresamu/postgis:18-3.6.1-alpine3.23"
-NATS_IMAGE = "nats:2.15.0-alpine"
+# The same pinned images as the stack (infra/db, infra/nats).
+POSTGIS_IMAGE = (
+    "imresamu/postgis:18-3.6.1-alpine3.23"
+    "@sha256:3c51493252f45d654ef07bf68ae22c9cec52a196edd0eaaa67ba06b654e56a01"
+)
+NATS_IMAGE = (
+    "nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4"
+)
 
 TABLES = "users, geozones, devices, device_tracks, zone_presence, alerts, outbox, partition_epochs"
 

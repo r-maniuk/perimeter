@@ -90,12 +90,15 @@
 		respond 404
 	}
 
-	# FastAPI's interactive API docs load Swagger UI from its CDN and bootstrap it with one inline
-	# script. This relaxed policy applies to these two pages only.
+	# The interactive API reference: Swagger UI shipped in this image, reading /openapi.json from
+	# the API. Scripts come from this origin only; its components set inline styles.
 	@docs path /docs /docs/*
 	handle @docs {
-		header Content-Security-Policy "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; style-src 'self' https://cdn.jsdelivr.net; img-src 'self' data: https://fastapi.tiangolo.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
-		import api_upstreams
+		header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+		header Cache-Control "no-cache"
+		root * /srv
+		rewrite /docs /docs/index.html
+		file_server
 	}
 
 	@api path /v1/* /openapi.json /healthz /readyz

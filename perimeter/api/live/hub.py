@@ -507,6 +507,12 @@ class LiveHub:
                 if session.principal.token_id == token_id:
                     session.close(CloseCode.SIGNED_OUT, "signed out")
 
+    def _close_revoked(self) -> None:
+        """The sweep behind the revocation queue: no signed-out socket stays open for long."""
+        for session in list(self._sessions.values()):
+            if not session.conn.closing and self._revoked.is_revoked(session.principal.token_id):
+                session.close(CloseCode.SIGNED_OUT, "signed out")
+
     async def _maintain(self, stop: asyncio.Event) -> None:
         loop = asyncio.get_running_loop()
         reconnects = self._nc.stats["reconnects"]
@@ -515,6 +521,7 @@ class LiveHub:
             with suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), MAINTENANCE_INTERVAL_S)
             self._snapshots.prune()
+            self._close_revoked()
             current = self._nc.stats["reconnects"]
             if current == reconnects and loop.time() < next_audit:
                 continue

@@ -23,8 +23,7 @@ DAM = {"lat": 52.3731, "lon": 4.8926}
 
 
 async def auth(client: httpx.AsyncClient, username: str) -> tuple[dict[str, str], str]:
-    response = await client.post("/v1/session", json={"username": username})
-    client.cookies.clear()
+    response = await client.post("/v1/token", json={"username": username})
     session = response.json()
     return {"Authorization": f"Bearer {session['token']}"}, session["user"]["id"]
 

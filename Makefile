@@ -1,5 +1,7 @@
-# Developer workflow. Every target is a thin wrapper around docker compose or uv, so the stack works
+# Developer workflow. Every target is a short docker compose, uv or npm command, so the stack works
 # just as well without make: `make help` lists the targets, `make -n <target>` prints the command.
+# Running the stack, the load, the smoke test and the drill needs Docker only (and python3 for the
+# drill); the Python tests and linters need uv, the web ones npm.
 
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -40,11 +42,11 @@ load: ## Drive 10,000 simulated devices through the edge (ARGS="--devices 20000 
 	$(COMPOSE) --profile load run --rm generator $(ARGS)
 
 smoke: ## End-to-end check through the edge: sign-in, zone, ingest, live alert and position
-	$(COMPOSE) exec -T api cat /run/secrets/ingest_token \
-		| $(UV) run python scripts/smoke.py --base-url http://127.0.0.1:$(HTTP_PORT) --ingest-token-file -
+	$(COMPOSE) --profile load run --rm --no-deps --entrypoint python generator \
+		/app/scripts/smoke.py --base-url http://edge:8080 --ingest-token-file /run/secrets/ingest_token
 
 drill: ## Kill a replica under load, then prove no loss or duplicates (KILL=engine|api|none)
-	$(UV) run python scripts/drill.py --kill $(or $(KILL),engine) $(ARGS)
+	python3 scripts/drill.py --kill $(or $(KILL),engine) $(ARGS)
 
 audit-broker: ## Fail if the broker refused anything: any "Violation" in its log
 	@log="$$($(COMPOSE) logs --no-color nats)"; \

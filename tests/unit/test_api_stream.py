@@ -91,7 +91,7 @@ class FakeAdmission:
 
 
 def report(device: str = "veh-1") -> dict[str, Any]:
-    return {"device_id": device, "latitude": 52.37, "longitude": 4.89}
+    return {"device_id": device, "latitude": 52.37, "longitude": 4.89, "timestamp": NOW_MS}
 
 
 def frame(seq: int, count: int, *, invalid: int = 0) -> dict[str, Any]:

@@ -27,6 +27,11 @@ from perimeter.wire import subjects
 
 log = structlog.get_logger(__name__)
 
+REVOCATIONS_SYNC_S = 10.0
+REWATCH_EVERY_S = 60.0
+REWATCH_DELAY_S = 0.5
+LISTENER_QUEUE_MAX = 1_024
+
 COOKIE_NAME = "perimeter_session"
 ALGORITHM = "HS256"
 MIN_SECRET_BYTES = 32
@@ -98,55 +103,99 @@ class TokenService:
             raise AuthError("invalid or expired session token") from exc
 
 
+class RevocationsUnavailable(Exception):  # noqa: N818 - a condition the caller reports
+    """The revoked tokens could not be read: a replica must not serve without them."""
+
+
 class RevocationList:
     """Token ids revoked by remote sign-out, mirrored from the ``revoked`` bucket into memory.
 
     Every replica watches the bucket, so a sign-out on one replica is enforced by all of them
-    within milliseconds, without a round trip per request.
+    within milliseconds, without a round trip per request. The mirror fails closed: a replica does
+    not start before it has read every revocation, and a watch that ends is started again. Every
+    minute the whole bucket is read anew, because a watch can also stall without a word (a broker
+    whose store was lost resumes it at a sequence that no longer exists). A revocation is forgotten
+    ``keep_s`` after it was seen, when every token it can concern has expired (the bucket keeps
+    entries for the same time).
     """
 
-    def __init__(self, kv: KeyValue) -> None:
+    def __init__(self, kv: KeyValue, *, keep_s: float) -> None:
         self._kv = kv
-        self._revoked: set[str] = set()
+        self._keep_s = keep_s
+        self._revoked: dict[str, float] = {}  # token id -> when this replica learnt of it
         self._task: asyncio.Task[None] | None = None
         self._listeners: list[asyncio.Queue[str]] = []
 
     @classmethod
-    async def open(cls, js: JetStreamContext) -> RevocationList:
-        revocations = cls(await js.key_value(subjects.KV_REVOKED))
+    async def open(cls, js: JetStreamContext, *, keep_s: float) -> RevocationList:
+        revocations = cls(await js.key_value(subjects.KV_REVOKED), keep_s=keep_s)
         await revocations.start()
         return revocations
 
-    async def start(self) -> None:
-        watcher = await self._kv.watchall()
-        ready = asyncio.Event()
-
-        async def follow() -> None:
-            async for entry in watcher:
-                if entry is None:  # initial values delivered
-                    ready.set()
-                    continue
-                if entry.operation is None and entry.key:
-                    self._revoked.add(entry.key)
-                    for queue in self._listeners:
-                        queue.put_nowait(entry.key)
-
-        self._task = asyncio.create_task(follow(), name="revocations")
+    async def start(self, *, sync_timeout_s: float = REVOCATIONS_SYNC_S) -> None:
+        synced = asyncio.Event()
+        self._task = asyncio.create_task(self._follow(synced), name="revocations")
         try:
-            await asyncio.wait_for(ready.wait(), 10)
-        except TimeoutError:
-            log.warning("revocations.initial_sync_slow")
+            await asyncio.wait_for(synced.wait(), sync_timeout_s)
+        except TimeoutError as exc:
+            await self.close()
+            msg = f"the revoked tokens could not be read within {sync_timeout_s:g} s"
+            raise RevocationsUnavailable(msg) from exc
+
+    async def _follow(self, synced: asyncio.Event) -> None:
+        delay = REWATCH_DELAY_S
+        while True:
+            try:
+                watcher = await self._kv.watchall()
+                try:
+                    async with asyncio.timeout(REWATCH_EVERY_S):
+                        async for entry in watcher:
+                            if entry is None:  # every current value delivered
+                                synced.set()
+                                delay = REWATCH_DELAY_S
+                            elif entry.operation is None and entry.key:
+                                self._add(entry.key)
+                except TimeoutError:
+                    pass  # read everything anew, in case the watch stalled unnoticed
+                finally:
+                    with suppress(Exception):
+                        await watcher.stop()  # type: ignore[no-untyped-call]
+                self._prune()
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("revocations.watch_lost", error=repr(exc), retry_in_s=delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, REWATCH_EVERY_S)
+
+    def _add(self, token_id: str) -> None:
+        if token_id in self._revoked:
+            return
+        self._revoked[token_id] = time.time()
+        for queue in self._listeners:
+            if queue.full():  # nobody is draining it: its reader sweeps sessions anyway
+                queue.get_nowait()
+            queue.put_nowait(token_id)
+
+    def _prune(self) -> None:
+        horizon = time.time() - self._keep_s
+        for token_id in [t for t, seen in self._revoked.items() if seen < horizon]:
+            del self._revoked[token_id]
 
     async def revoke(self, token_id: str) -> None:
-        self._revoked.add(token_id)
+        self._add(token_id)
         await self._kv.put(token_id, b"1")
 
     def is_revoked(self, token_id: str) -> bool:
         return token_id in self._revoked
 
+    def __len__(self) -> int:
+        return len(self._revoked)
+
     def subscribe(self) -> asyncio.Queue[str]:
-        """Queue of token ids revoked from now on (used to close live sessions)."""
-        queue: asyncio.Queue[str] = asyncio.Queue()
+        """Bounded queue of token ids revoked from now on (used to close live sessions)."""
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=LISTENER_QUEUE_MAX)
         self._listeners.append(queue)
         return queue
 

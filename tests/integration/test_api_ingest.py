@@ -52,7 +52,13 @@ def now_ms() -> int:
 
 
 def report(device: str = "veh-1", **fields: Any) -> dict[str, Any]:
-    return {"device_id": device, "latitude": 52.3731, "longitude": 4.8926, **fields}
+    return {
+        "device_id": device,
+        "latitude": 52.3731,
+        "longitude": 4.8926,
+        "timestamp": now_ms(),
+        **fields,
+    }
 
 
 async def post(client: httpx.AsyncClient, body: object, **headers: str) -> httpx.Response:
@@ -81,7 +87,7 @@ async def test_accepted_reports_are_stored_with_their_dedup_id(
         {"reports": [report(timestamp=stamp, speed=12.5, heading=90), report("veh-2")]},
     )
     assert response.status_code == 202, response.text
-    assert response.json() == {"accepted": 2, "rejected": []}
+    assert response.json() == {"accepted": 2, "duplicates": 0, "rejected": []}
     messages = await stored(js)
     assert len(messages) == 2
     subject, record, headers = messages[0]
@@ -90,6 +96,18 @@ async def test_accepted_reports_are_stored_with_their_dedup_id(
     assert (record.recorded_at_ms, record.speed, record.heading) == (stamp, 12.5, 90.0)
     assert record.received_at_ms >= stamp
     assert headers["Nats-Msg-Id"] == f"veh-1:{stamp}"
+
+
+async def test_a_retried_report_is_stored_once_and_counted_as_a_duplicate(
+    client: httpx.AsyncClient, js: JetStreamContext
+) -> None:
+    # A device whose answer was lost sends the same report again: same device, same timestamp.
+    again = report(timestamp=now_ms() - 1_000)
+    first = await post(client, [again])
+    retry = await post(client, [again, report("veh-2")])
+    assert first.json() == {"accepted": 1, "duplicates": 0, "rejected": []}
+    assert retry.json() == {"accepted": 2, "duplicates": 1, "rejected": []}
+    assert len(await stored(js)) == 2
 
 
 @pytest.mark.parametrize("shape", ["object", "array", "envelope"])
@@ -141,7 +159,7 @@ async def test_device_credentials_are_required(
 
 
 async def test_a_user_session_is_not_a_device_credential(client: httpx.AsyncClient) -> None:
-    session = (await client.post("/v1/session", json={"username": "alice"})).json()
+    session = (await client.post("/v1/token", json={"username": "alice"})).json()
     response = await client.post(
         "/v1/telemetry", json=report(), headers={"Authorization": f"Bearer {session['token']}"}
     )

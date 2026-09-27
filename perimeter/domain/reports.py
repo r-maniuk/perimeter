@@ -28,21 +28,21 @@ class LocationReport(msgspec.Struct, frozen=True, kw_only=True):
     """One position as a device sends it.
 
     ``timestamp`` is the device clock: an RFC 3339 string (naive values are taken as UTC) or a
-    Unix epoch number in seconds or milliseconds. When absent, the server receive time is used.
+    Unix epoch number in seconds or milliseconds. It is required: with the device id it identifies
+    the report (a retried report is stored once) and places it in the device's history, which a
+    receive time could do for neither.
     """
 
     device_id: DeviceId
     latitude: Latitude
     longitude: Longitude
-    timestamp: datetime | float | None = None
+    timestamp: datetime | float
     speed: Speed | None = None
     heading: Heading | None = None
     accuracy: Accuracy | None = None
 
-    def recorded_at_ms(self, received_at_ms: int) -> int:
+    def recorded_at_ms(self) -> int:
         stamp = self.timestamp
-        if stamp is None:
-            return received_at_ms
         if isinstance(stamp, datetime):
             aware = stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)
             return int(aware.timestamp() * 1000)
@@ -76,7 +76,7 @@ class TelemetryRecord(msgspec.Struct, array_like=True, frozen=True, gc=False):
             heading = 0.0
         return cls(
             device_id=report.device_id,
-            recorded_at_ms=report.recorded_at_ms(received_at_ms),
+            recorded_at_ms=report.recorded_at_ms(),
             received_at_ms=received_at_ms,
             lat=report.latitude,
             lon=report.longitude,

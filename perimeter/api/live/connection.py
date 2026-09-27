@@ -25,8 +25,8 @@ import asyncio
 import itertools
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Coroutine
-from typing import Any
+from collections.abc import Awaitable, Callable
+from functools import partial
 
 import structlog
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
@@ -224,9 +224,9 @@ class LiveConnection:
         self._texts.appendleft(first_frame)
         self._wake.set()
         self._tasks = [
-            asyncio.create_task(self._guard(self._write(), "writer"), name="live-writer"),
+            asyncio.create_task(self._guard(self._write, "writer"), name="live-writer"),
             asyncio.create_task(
-                self._guard(self._read(handler, pending), "reader"), name="live-reader"
+                self._guard(partial(self._read, handler, pending), "reader"), name="live-reader"
             ),
         ]
 
@@ -263,9 +263,11 @@ class LiveConnection:
         except TimeoutError, OSError, RuntimeError, WebSocketDisconnect:
             log.debug("live.close_frame_not_sent", code=self._close_code)
 
-    async def _guard(self, work: Coroutine[Any, Any, None], role: str) -> None:
+    async def _guard(self, work: Callable[[], Awaitable[None]], role: str) -> None:
+        # The coroutine is made here, not by the caller: a connection closed before its tasks
+        # first ran cancels them before they start, and must not leave a coroutine never awaited.
         try:
-            await work
+            await work()
         except asyncio.CancelledError:
             raise
         except Exception:

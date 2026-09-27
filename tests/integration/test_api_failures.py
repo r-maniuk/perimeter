@@ -21,8 +21,7 @@ class _DriverError(Exception):
 
 
 async def auth(client: httpx.AsyncClient, username: str = "alice") -> dict[str, str]:
-    response = await client.post("/v1/session", json={"username": username})
-    client.cookies.clear()
+    response = await client.post("/v1/token", json={"username": username})
     return {"Authorization": f"Bearer {response.json()['token']}"}
 
 
@@ -121,6 +120,7 @@ async def test_the_openapi_document_describes_every_endpoint(client: httpx.Async
     paths = schema["paths"]
     expected = {
         "/v1/session": {"post", "delete"},
+        "/v1/token": {"post"},
         "/v1/me": {"get"},
         "/v1/geozones": {"get", "post"},
         "/v1/geozones/{zone_id}": {"get", "patch", "delete"},

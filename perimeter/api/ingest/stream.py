@@ -6,7 +6,7 @@ are JSON text; clients send JSON text or MessagePack binary frames of the same s
 
     server  {"type":"ready","credit":N}
     client  {"type":"reports","seq":k,"reports":[...]}             costs len(reports) credit
-    server  {"type":"ack","seq":k,"accepted":a,"rejected":[...],"credit":c}
+    server  {"type":"ack","seq":k,"accepted":a,"duplicates":d,"rejected":[...],"credit":c}
     server  {"type":"hold","retry_after":s}
     server  {"type":"credit","credit":c}
     server  {"type":"error","seq":k,"code":"...","detail":"...","credit":c}
@@ -207,11 +207,12 @@ class IngestStream:
 
     async def _answer(self, reply: _Reply) -> None:
         error = reply.error
-        accepted = 0
+        accepted = duplicates = 0
         retry_after: int | None = None
         if reply.publish is not None:
             try:
-                accepted = (await asyncio.shield(reply.publish)).accepted
+                outcome = await asyncio.shield(reply.publish)
+                accepted, duplicates = outcome.accepted, outcome.duplicates
             except IngestOverloaded:
                 error = ("ingest_overloaded", "the ingest pipeline is saturated; resend the frame")
                 retry_after = OVERLOADED_RETRY_S
@@ -236,6 +237,7 @@ class IngestStream:
                 "type": "ack",
                 "seq": reply.seq,
                 "accepted": accepted,
+                "duplicates": duplicates,
                 "rejected": [
                     {"index": r.index, "code": r.code, "detail": r.detail} for r in reply.rejected
                 ],

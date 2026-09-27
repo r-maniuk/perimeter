@@ -208,7 +208,7 @@ class ReportDecoder:
                 rejected.append(_schema_rejection(index, exc))
                 continue
             try:
-                recorded_at_ms = report.recorded_at_ms(received_at_ms)
+                recorded_at_ms = report.recorded_at_ms()
             except ValueError, OverflowError:  # NaN or infinite epoch (possible in MessagePack)
                 detail = "timestamp must be a finite epoch number or an RFC 3339 string"
                 rejected.append(Rejection(index, "invalid_timestamp", detail))

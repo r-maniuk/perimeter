@@ -41,8 +41,14 @@ class FakeRegistry:
 
 
 class FakeRevoked:
+    def __init__(self) -> None:
+        self.revoked: set[str] = set()
+
     def subscribe(self) -> asyncio.Queue[str]:
         return asyncio.Queue()
+
+    def is_revoked(self, token_id: str) -> bool:
+        return token_id in self.revoked
 
 
 class FakeWebSocket:
@@ -76,7 +82,7 @@ def viewport(west: float) -> dict[str, Any]:
     return received({"type": "viewport", "bbox": [west, 52.30, west + 0.2, 52.45]})
 
 
-def hub_with(ops: OpsBoard) -> LiveHub:
+def hub_with(ops: OpsBoard, revoked: FakeRevoked | None = None) -> LiveHub:
     return LiveHub(
         load_settings(),
         nc=FakeNats(),  # type: ignore[arg-type]
@@ -84,7 +90,7 @@ def hub_with(ops: OpsBoard) -> LiveHub:
         db=None,  # type: ignore[arg-type]
         registry=FakeRegistry(),  # type: ignore[arg-type]
         ops=ops,
-        revoked=FakeRevoked(),  # type: ignore[arg-type]
+        revoked=revoked or FakeRevoked(),  # type: ignore[arg-type]
         instance="r1",
     )
 
@@ -133,3 +139,15 @@ async def test_a_socket_is_closed_when_its_token_expires() -> None:
     assert session.conn.close_code == CloseCode.SIGNED_OUT
     await hub._finish(session)
     assert websocket.closed_with == CloseCode.SIGNED_OUT
+
+
+async def test_the_sweep_closes_a_socket_whose_revocation_notice_was_lost() -> None:
+    revoked = FakeRevoked()
+    hub = hub_with(OpsBoard(FakeNats()), revoked)  # type: ignore[arg-type]
+    session, _ = open_session(hub, expires_at=2_000_000_000)
+    hub._close_revoked()
+    assert not session.conn.closing
+    revoked.revoked.add(session.principal.token_id)  # signed out elsewhere, notice dropped
+    hub._close_revoked()
+    assert session.conn.close_code == CloseCode.SIGNED_OUT
+    await hub._finish(session)
