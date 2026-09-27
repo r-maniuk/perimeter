@@ -8,6 +8,11 @@ updates:
     directories: ["/", "/infra/db", "/infra/nats", "/infra/edge"]
     schedule: {interval: weekly}
     cooldown: {default-days: 7}
+    ignore:
+      # The dashboard builds on Node's LTS line, as its CI job does: moving to a new major is a
+      # decision, not a routine update.
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: docker-compose
     directory: "/"
     schedule: {interval: weekly}
@@ -26,5 +31,9 @@ updates:
     directories: ["/web", "/infra/edge/docs"]
     schedule: {interval: weekly}
     cooldown: {default-days: 7}
+    ignore:
+      # The types of the Node release the dashboard builds on (see the docker entry).
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       web: {patterns: ["*"]}
