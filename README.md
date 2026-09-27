@@ -93,18 +93,18 @@ and subject-based fan-out of positions to exactly the replicas whose clients loo
 ## How it works
 
 ```mermaid
-flowchart LR
-    devices([devices]) -- "HTTP batch / WS + credit" --> edge
-    browsers([browsers]) -- "dashboard, REST, /v1/live" --> edge
-    edge[edge · Caddy] --> api1[api] & api2[api]
-    api1 & api2 -- "publish, acked" --> tlm[("TELEMETRY<br/>16 partitions by device")]
-    tlm -- "one leased owner per partition" --> eng1[engine] & eng2[engine]
-    eng1 & eng2 -- "1 fenced transaction per batch" --> pg[("PostgreSQL 18<br/>PostGIS 3.6")]
-    eng1 & eng2 -- "alerts: outbox → EVENTS" --> evt[("EVENTS<br/>a sequence chain per user")]
-    api1 & api2 -. "zone changes: outbox → EVENTS" .-> evt
-    eng1 & eng2 -- "binary tile frames" --> pos{{"pos.‹quadkey›"}}
-    evt -- "live.evt.‹user›" --> api1 & api2
-    pos -- "only viewed tiles" --> api1 & api2
+flowchart TB
+    devices(["devices"]) -- "HTTP batches · WebSocket with credit" --> edge
+    browsers(["dashboards"]) -- "SPA · REST · /v1/live" --> edge
+    edge["edge · Caddy"] --> api["api × 2 · FastAPI"]
+    api -- "publish, acked when stored" --> tlm[("TELEMETRY<br/>16 partitions by device")]
+    tlm -- "one leased owner per partition" --> engine["engine × 2"]
+    engine -- "one fenced transaction per batch" --> pg[("PostgreSQL 18 + PostGIS 3.6")]
+    engine -- "alerts: outbox" --> evt[("EVENTS<br/>a sequence chain per user")]
+    engine -- "binary tile frames" --> pos{{"pos.‹quadkey›"}}
+    evt -- "live.evt.‹user›" --> api
+    pos -- "only the viewed tiles" --> api
+    api -. "zone changes: outbox" .-> evt
 ```
 
 **The life of one location report**
