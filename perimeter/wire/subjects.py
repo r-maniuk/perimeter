@@ -10,6 +10,7 @@ Subject map::
     pos.<d1>.<d2>...<dZ>         binary position frames of the leaf tile with quadkey d1..dZ
     ctl.ses.<session>            control messages for one live session (remote sign-out)
     sys.metrics.<service>.<id>   one-second metric heartbeats for the ops view
+    _INBOX.<user>.>              replies to one authenticated service (per-user inbox prefix)
 """
 
 from __future__ import annotations
@@ -80,6 +81,11 @@ def session_control(session_id: str) -> str:
 
 def metrics_heartbeat(service: str, instance: str) -> str:
     return f"sys.metrics.{service}.{instance}"
+
+
+def inbox_prefix(user: str) -> str:
+    """Inbox root of an authenticated service; the broker lets each user read only its own."""
+    return f"_INBOX.{user}"
 
 
 def partitions_from_transform(destination: str) -> int | None:

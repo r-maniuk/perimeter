@@ -28,8 +28,11 @@ LABEL org.opencontainers.image.title="perimeter" \
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
+# /secrets is where the one-shot secrets job mounts its volume: a fresh volume inherits this owner
+# and mode, so the job can populate it without root or any capability.
 RUN groupadd --system --gid 10001 perimeter \
- && useradd --system --uid 10001 --gid perimeter --no-create-home --shell /usr/sbin/nologin perimeter
+ && useradd --system --uid 10001 --gid perimeter --no-create-home --shell /usr/sbin/nologin perimeter \
+ && install -d -o perimeter -g perimeter -m 0700 /secrets
 COPY --from=build /opt/venv /opt/venv
 COPY generator.py /app/generator.py
 WORKDIR /app

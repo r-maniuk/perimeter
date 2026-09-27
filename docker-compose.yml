@@ -1,0 +1,400 @@
+# Perimeter: the whole stack on one machine.
+#
+#   docker compose up -d --build --wait        (or: make up)
+#   open http://localhost:8080
+#
+# Order of start-up: secrets (one-shot) -> db, nats -> init (one-shot: migrations, broker topology)
+# -> api x2, engine x2 -> edge. Only the edge publishes a port. Secrets never appear in this file
+# or in any environment: the secrets job writes them to a volume, and each service mounts only its
+# own directory of it at /run/secrets. Tuning knobs go in an optional .env file (see .env.example).
+#
+# Networks
+#   public  the edge's published port (and, in the observability profile, the loopback-only UIs)
+#   edge    internal: edge -> api replicas; the load generator -> edge
+#   core    internal: api, engine, init -> db, nats; metrics and traces
+# The application containers sit on internal networks only: they cannot reach the outside world,
+# and nothing outside can reach them except through the edge.
+
+name: perimeter
+
+x-logging: &logging
+  driver: local
+  options:
+    max-size: 10m
+    max-file: "3"
+
+# Every container: read-only root file system, no Linux capabilities, no privilege escalation,
+# an init process that forwards signals and reaps children, rotated logs; and per service below,
+# limits on CPU, memory and number of processes. The limits leave several times the headroom of
+# what was measured with 10,000 devices reporting every 3 s (3,300 reports/s) through two engines:
+# engine 75 MiB and 0.9 core each, db 220 MiB and 1.4 cores, nats 95 MiB, edge 12 MiB,
+# api 85 MiB idle.
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  init: true
+  logging: *logging
+
+x-app: &app
+  <<: *hardened
+  image: perimeter-app:${PERIMETER_TAG:-local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  user: "10001:10001"
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  # Tuning knobs (DATABASE_POOL_TIMEOUT_S, INGEST_*, LIVE_*, ENGINE_BATCH_MAX, ...); the wiring
+  # below always wins over them.
+  env_file:
+    - path: .env
+      required: false
+
+# Wiring shared by every Python process.
+x-app-environment: &app-environment
+  PERIMETER_ENV: ${PERIMETER_ENV:-production}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  DATABASE_HOST: db
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: perimeter
+  DATABASE_PASSWORD_FILE: /run/secrets/database_password
+  NATS_URL: nats://nats:4222
+  NATS_PASSWORD_FILE: /run/secrets/nats_password
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+
+services:
+  secrets:
+    <<: *app
+    command:
+      ["python", "-m", "perimeter.tools.secrets", "/secrets", "--postgres-gid", "70", "--nats-gid", "10002"]
+    # Group membership lets the job hand files to the database (70) and broker (10002) users
+    # without root: an owner may give a file to any group it belongs to.
+    group_add: ["70", "10002"]
+    network_mode: none
+    volumes:
+      - secrets:/secrets
+    restart: "no"
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 128M, pids: 32}
+
+  db:
+    <<: *hardened
+    image: perimeter-db:${PERIMETER_TAG:-local}
+    build: infra/db
+    depends_on:
+      secrets: {condition: service_completed_successfully}
+    environment:
+      POSTGRES_DB: perimeter
+      POSTGRES_PASSWORD_FILE: /run/secrets/superuser_password
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8 --locale-provider=builtin --builtin-locale=C.UTF-8
+    # Sized for this workload inside a 2 GB container.
+    # - Connections: api 2 x 10 + engine 2 x 18 (every partition + 2) + init 2 = 58, plus headroom
+    #   for maintenance and a replica starting while its predecessor drains: 80 (+3 superuser).
+    # - Memory: shared_buffers a quarter of the limit, the rest left to the page cache.
+    # - Small, hot tables rewritten constantly (latest positions, presence): vacuum early, often.
+    # - Steady writes: fewer, smoother checkpoints; zstd-compressed full-page images in the WAL.
+    # - SSD storage; short OLTP statements gain nothing from JIT compilation.
+    # - Statement statistics and slow-statement / lock-wait logging for diagnosis under load.
+    command: >-
+      postgres
+      -c hba_file=/etc/postgresql/pg_hba.conf
+      -c max_connections=80
+      -c shared_buffers=512MB
+      -c effective_cache_size=1536MB
+      -c work_mem=8MB
+      -c maintenance_work_mem=128MB
+      -c autovacuum_naptime=10s
+      -c autovacuum_vacuum_scale_factor=0.05
+      -c autovacuum_analyze_scale_factor=0.05
+      -c autovacuum_vacuum_cost_limit=2000
+      -c max_wal_size=2GB
+      -c min_wal_size=256MB
+      -c checkpoint_timeout=10min
+      -c checkpoint_completion_target=0.9
+      -c wal_compression=zstd
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c jit=off
+      -c shared_preload_libraries=pg_stat_statements
+      -c track_io_timing=on
+      -c log_min_duration_statement=500ms
+      -c log_lock_waits=on
+      -c idle_in_transaction_session_timeout=60s
+      -c timezone=UTC
+      -c log_timezone=UTC
+    user: "70:70"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: db}
+    tmpfs:
+      - /var/run/postgresql:size=1m,uid=70,gid=70,mode=0775
+      - /tmp:size=64m,mode=1777
+    shm_size: 256m
+    networks: [core]
+    healthcheck:
+      # Over TCP on purpose: while the first start runs its init scripts the server listens on the
+      # Unix socket only, and must not count as ready yet.
+      test: ["CMD", "pg_isready", "--quiet", "--host=127.0.0.1", "--dbname=perimeter", "--username=perimeter_app"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+      start_interval: 1s
+    stop_grace_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: {cpus: "3", memory: 2G, pids: 256}
+
+  nats:
+    <<: *hardened
+    image: perimeter-nats:${PERIMETER_TAG:-local}
+    build: infra/nats
+    user: "10002:10002"
+    depends_on:
+      secrets: {condition: service_completed_successfully}
+    volumes:
+      - natsdata:/data
+      - type: volume
+        source: secrets
+        target: /etc/nats/auth
+        read_only: true
+        volume: {subpath: nats}
+    networks: [core]
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+      start_interval: 1s
+    stop_grace_period: 20s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: {cpus: "1", memory: 1G, pids: 128}
+
+  init:
+    <<: *app
+    command: ["python", "-m", "perimeter.tools.init"]
+    depends_on:
+      db: {condition: service_healthy}
+      nats: {condition: service_healthy}
+    environment:
+      <<: *app-environment
+      DATABASE_USER: perimeter
+      DATABASE_POOL_SIZE: "2"
+      NATS_USER: init
+    volumes:
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: init}
+    networks: [core]
+    restart: "no"
+    deploy:
+      resources:
+        limits: {cpus: "1", memory: 384M, pids: 64}
+
+  api:
+    <<: *app
+    command: ["python", "-m", "perimeter.api"]
+    depends_on:
+      init: {condition: service_completed_successfully}
+    environment:
+      <<: *app-environment
+      DATABASE_USER: perimeter_app
+      DATABASE_POOL_SIZE: "10"
+      NATS_USER: api
+      SESSION_SECRET_FILE: /run/secrets/session_secret
+      INGEST_TOKEN_FILE: /run/secrets/ingest_token
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:${HTTP_PORT:-8080},http://127.0.0.1:${HTTP_PORT:-8080}}
+    volumes:
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: api}
+    networks: [edge, core]
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    healthcheck:
+      test: ["CMD", "python", "-m", "perimeter.tools.probe"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 1s
+    stop_grace_period: 20s
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+      resources:
+        limits: {cpus: "1.5", memory: 768M, pids: 128}
+
+  engine:
+    <<: *app
+    command: ["python", "-m", "perimeter.engine"]
+    depends_on:
+      init: {condition: service_completed_successfully}
+    environment:
+      <<: *app-environment
+      DATABASE_USER: perimeter_app
+      NATS_USER: engine
+      ENGINE_METRICS_PORT: "9102"
+    volumes:
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: engine}
+    networks: [core]
+    healthcheck:
+      test: ["CMD", "python", "-m", "perimeter.tools.probe", "http://127.0.0.1:9102/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 1s
+    # Finishing in-flight batches and releasing partition leases lets a peer take over at once.
+    stop_grace_period: 30s
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+      resources:
+        limits: {cpus: "1.5", memory: 512M, pids: 128}
+
+  edge:
+    <<: *hardened
+    image: perimeter-edge:${PERIMETER_TAG:-local}
+    build:
+      context: .
+      dockerfile: infra/edge/Dockerfile
+    user: "10003:10003"
+    depends_on:
+      api: {condition: service_healthy}
+    ports:
+      - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
+    tmpfs:
+      - /data:size=16m,uid=10003,gid=10003,mode=0700
+      - /config:size=1m,uid=10003,gid=10003,mode=0700
+      - /tmp:size=16m,mode=1777
+    networks: [public, edge]
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+      start_interval: 1s
+    stop_grace_period: 15s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: {cpus: "1", memory: 256M, pids: 128}
+
+  # --- profile `load`: the device simulator, targeting the edge like real devices would --------
+  generator:
+    <<: *app
+    profiles: [load]
+    # An entrypoint, so `docker compose run --rm generator --devices 20000` passes flags through.
+    entrypoint: ["python", "/app/generator.py"]
+    depends_on:
+      edge: {condition: service_healthy}
+    environment:
+      GENERATOR_URL: http://edge:8080
+      GENERATOR_TOKEN_FILE: /run/secrets/ingest_token
+      GENERATOR_DEVICES: ${GENERATOR_DEVICES:-10000}
+      GENERATOR_INTERVAL: ${GENERATOR_INTERVAL:-3}
+      GENERATOR_DURATION: ${GENERATOR_DURATION:-300}
+      GENERATOR_TRANSPORT: ${GENERATOR_TRANSPORT:-http}
+    volumes:
+      - type: volume
+        source: secrets
+        target: /run/secrets
+        read_only: true
+        volume: {subpath: generator}
+    networks: [edge]
+    stop_grace_period: 30s
+    restart: "no"
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 1G, pids: 128}
+
+  # --- profile `observability`: metrics and traces (make observe) ------------------------------
+  prometheus:
+    <<: *hardened
+    image: prom/prometheus:v3.15.0
+    profiles: [observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+    configs:
+      - source: prometheus
+        target: /etc/prometheus/prometheus.yml
+    volumes:
+      - promdata:/prometheus
+    networks: [core, public]
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: {cpus: "1", memory: 512M, pids: 128}
+
+  jaeger:
+    <<: *hardened
+    image: jaegertracing/jaeger:2.21.0
+    profiles: [observability]
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks: [core, public]
+    ports:
+      - "127.0.0.1:${JAEGER_PORT:-16686}:16686"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:13133/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: {cpus: "1", memory: 512M, pids: 128}
+
+configs:
+  prometheus:
+    file: ./infra/prometheus/prometheus.yml
+
+networks:
+  public: {}
+  edge:
+    internal: true
+  core:
+    internal: true
+
+volumes:
+  secrets: {}
+  pgdata: {}
+  natsdata: {}
+  promdata: {}

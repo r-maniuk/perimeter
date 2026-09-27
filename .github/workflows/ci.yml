@@ -1,0 +1,158 @@
+# Every push to main and every pull request: the Python gates with the full test suite, the
+# dashboard's gates, and the complete stack built from scratch and exercised end to end through
+# the edge. Third-party actions are pinned to full commit SHAs (the release is noted beside each).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_COLOR: "1"
+  UV_VERSION: "0.12.19"
+
+jobs:
+  python:
+    name: python (lint, types, tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install
+        run: uv sync --all-extras --frozen
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Types
+        run: uv run mypy
+
+      # Integration tests start PostGIS and NATS with testcontainers on the runner's Docker.
+      - name: Tests with coverage
+        run: >-
+          uv run pytest
+          --hypothesis-profile=ci
+          --cov=perimeter --cov-report=term --cov-report=xml --cov-fail-under=85
+
+      - name: Keep the coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  web:
+    name: web (lint, types, tests, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same major version the edge image builds with.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  stack:
+    name: stack (build, start, smoke through the edge)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PERIMETER_TAG: ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # One build per image, straight from docker-compose.yml, with layers cached between runs.
+      # The api, engine, init and generator services share the image the secrets job builds.
+      - name: Build images
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        with:
+          files: docker-compose.yml
+          targets: secrets,db,nats,edge
+          load: true
+          set: |
+            secrets.cache-from=type=gha,scope=app
+            secrets.cache-to=type=gha,scope=app,mode=max
+            db.cache-from=type=gha,scope=db
+            db.cache-to=type=gha,scope=db,mode=max
+            nats.cache-from=type=gha,scope=nats
+            nats.cache-to=type=gha,scope=nats,mode=max
+            edge.cache-from=type=gha,scope=edge
+            edge.cache-to=type=gha,scope=edge,mode=max
+
+      - name: Start the stack
+        run: docker compose up --detach --no-build --wait --wait-timeout 180
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install the smoke test's dependencies
+        run: uv sync --frozen
+
+      - name: Smoke test through the edge
+        run: make smoke
+
+      - name: No permission violations on the broker
+        run: make audit-broker
+
+      - name: Show the stack
+        if: failure()
+        run: |
+          docker compose ps --all
+          docker compose logs --no-color --timestamps > compose.log
+
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compose-logs
+          path: compose.log
+          retention-days: 14
+
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes --remove-orphans

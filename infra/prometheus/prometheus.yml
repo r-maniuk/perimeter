@@ -1,0 +1,27 @@
+# Scrapes every api and engine replica directly on the internal network (compose profile
+# `observability`). Replicas are discovered through Docker's DNS, so scaling needs no edits here.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: api
+    # The api mounts its exposition under /metrics/.
+    metrics_path: /metrics/
+    dns_sd_configs:
+      - names: [api]
+        type: A
+        port: 8000
+        refresh_interval: 5s
+
+  - job_name: engine
+    dns_sd_configs:
+      - names: [engine]
+        type: A
+        port: 9102
+        refresh_interval: 5s
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]

@@ -11,6 +11,7 @@ from nats.aio.client import Client as NatsClient
 from nats.errors import NoServersError
 
 from perimeter.config import NatsSettings
+from perimeter.wire import subjects
 
 log = structlog.get_logger(__name__)
 
@@ -50,6 +51,9 @@ async def connect(settings: NatsSettings, *, name: str, attempts: int = 30) -> N
     if settings.user:
         options["user"] = settings.user
         options["password"] = settings.password.get_secret_value() if settings.password else ""
+        # Request replies, JetStream acks and consumer deliveries arrive under this prefix, which
+        # is what lets the broker confine every service's subscriptions to its own replies.
+        options["inbox_prefix"] = subjects.inbox_prefix(settings.user)
 
     delay = 0.25
     for attempt in range(1, attempts + 1):

@@ -8,6 +8,7 @@ requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.20.0",
     "asyncpg>=0.31.0",
+    "bcrypt>=5.0.0",
     "fastapi>=0.141.1",
     "geoalchemy2>=0.20.0",
     "httptools>=0.8.0",
@@ -104,7 +105,7 @@ strict = true
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 plugins = ["pydantic.mypy"]
-files = ["perimeter", "tests", "generator.py"]
+files = ["perimeter", "tests", "scripts", "generator.py"]
 
 [[tool.mypy.overrides]]
 module = ["testcontainers.*", "geographiclib.*", "asyncpg.*", "geoalchemy2.*"]
