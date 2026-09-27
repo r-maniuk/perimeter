@@ -138,6 +138,7 @@ class PartitionEpoch(Base):
     __tablename__ = "partition_epochs"
 
     partition: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
-    epoch: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+    generation: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+    revision: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     owner: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -14,7 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from perimeter.bus import topology
-from perimeter.bus.leases import LeaseBucket, LeaseLost, generation_of
+from perimeter.bus.leases import FencingToken, LeaseBucket, LeaseLost, generation_of
 from perimeter.bus.relay import OutboxRelay
 from perimeter.storage import outbox
 from perimeter.storage.outbox import PendingEvent
@@ -109,7 +109,7 @@ async def test_an_abandoned_lease_expires_and_the_token_keeps_growing(js: JetStr
     bucket = await _bucket(js, ttl=1.0)
     first = await bucket.acquire("p.2", "engine-a")
     assert first is not None
-    taken: list[int] = []
+    taken: list[FencingToken] = []
 
     async def take_over() -> bool:
         lease = await bucket.acquire("p.2", "engine-b")

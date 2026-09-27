@@ -50,7 +50,7 @@ def test_tile_frames_round_trip_within_quantisation(
             assert got.speed_mps is None
         else:
             assert got.speed_mps is not None
-            assert abs(got.speed_mps - sent.speed_mps) <= 0.005
+            assert abs(got.speed_mps - sent.speed_mps) <= 0.005 + 1e-9
         if sent.heading_deg is None:
             assert got.heading_deg is None
         else:

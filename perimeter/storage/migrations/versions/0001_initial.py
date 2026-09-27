@@ -142,7 +142,8 @@ CREATE INDEX outbox_created_at_idx ON outbox (created_at);
 
 CREATE TABLE partition_epochs (
     partition   smallint PRIMARY KEY,
-    epoch       bigint NOT NULL DEFAULT 0,
+    generation  bigint NOT NULL DEFAULT 0,
+    revision    bigint NOT NULL DEFAULT 0,
     owner       text,
     updated_at  timestamptz NOT NULL DEFAULT now()
 );

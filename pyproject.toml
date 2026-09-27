@@ -56,6 +56,17 @@ dev = [
 requires = ["uv_build>=0.12.19,<0.13"]
 build-backend = "uv_build"
 
+[tool.uv]
+# uv rebuilds a local project only when one of its cache keys changes, and by default those are
+# only the build files: a non-editable install (the container image, with its shared uv cache)
+# would otherwise reuse a wheel built from older sources. Key the build on the sources too.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "README.md" },
+    { file = "perimeter/**/*.py" },
+    { file = "perimeter/**/*.mako" },
+]
+
 [tool.uv.build-backend]
 module-root = ""
 

@@ -7,24 +7,33 @@
   expires, and anyone may then acquire it.
 
 Leases alone cannot stop a paused owner from waking up and writing after it lost the lease, so each
-lease also yields a *fencing token*: a number that strictly increases with every acquisition or
-renewal, even across a broker that was wiped and recreated. Writers present the token to the
-database, which rejects anything older than the newest token it has seen.
+lease also yields a *fencing token*: the pair (bucket generation, key revision). Revisions grow with
+every acquisition or renewal; the generation (the bucket's creation time) grows if the broker was
+wiped and the bucket recreated, so pairs compared in order strictly increase across both. Writers
+present the token to the database, which rejects anything older than the newest token it has seen.
+Comparing the pair as a row keeps both halves full 64-bit integers: nothing to pack, nothing to
+overflow.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import NamedTuple
 
 from nats.js.errors import BadRequestError, KeyValueError, KeyWrongLastSequenceError, NoKeysError
 from nats.js.kv import KeyValue
 
-TOKEN_REVISION_BITS = 32
-
 
 class LeaseLost(Exception):  # noqa: N818 - a state, not a failure of the caller
     """Somebody else holds the key now."""
+
+
+class FencingToken(NamedTuple):
+    """Ordered pair: a newer bucket beats any revision of an older one."""
+
+    generation: int
+    revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,9 +44,8 @@ class Lease:
     generation: int
 
     @property
-    def token(self) -> int:
-        """Fencing token: bucket generation in the high bits, key revision in the low bits."""
-        return (self.generation << TOKEN_REVISION_BITS) | self.revision
+    def token(self) -> FencingToken:
+        return FencingToken(self.generation, self.revision)
 
 
 def generation_of(created: datetime | None) -> int:
@@ -84,6 +92,10 @@ class LeaseBucket:
 
     async def heartbeat(self, key: str, value: bytes) -> None:
         await self._kv.put(key, value)
+
+    async def remove(self, key: str) -> None:
+        """Delete a heartbeat key right away (a member leaving) instead of letting it expire."""
+        await self._kv.delete(key)
 
     async def keys(self, prefix: str) -> list[str]:
         """Live keys starting with ``prefix`` (expired and deleted keys are not listed)."""
