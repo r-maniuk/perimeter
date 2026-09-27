@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from perimeter.api.app import create_app
 from perimeter.bus import topology
+from perimeter.bus.publish import StreamPublisher
 from perimeter.config import (
     DatabaseSettings,
     EngineSettings,
@@ -127,6 +128,13 @@ async def nc(nats_settings: NatsSettings) -> AsyncIterator[NatsClient]:
 @pytest.fixture
 async def js(nc: NatsClient) -> JetStreamContext:
     return nc.jetstream()
+
+
+@pytest.fixture
+async def stream(nc: NatsClient) -> AsyncIterator[StreamPublisher]:
+    publisher = StreamPublisher(nc)
+    yield publisher
+    await publisher.close()
 
 
 @pytest.fixture

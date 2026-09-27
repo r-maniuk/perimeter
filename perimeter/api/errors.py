@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from http import HTTPStatus
 from typing import Any
 
@@ -15,7 +16,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 log = structlog.get_logger(__name__)
 
-PROBLEM_TYPE_BASE = "https://perimeter.dev/problems/"
+# RFC 9457 allows a relative type URI; with the full path it identifies the problem on any host.
+PROBLEM_TYPE_BASE = "/problems/"
 MEDIA_TYPE = "application/problem+json"
 
 # SQLSTATE classes meaning "the database cannot serve this right now" rather than "the request is
@@ -80,6 +82,18 @@ def not_found(what: str) -> ProblemError:
 
 def unauthorized(detail: str = "sign in to continue") -> ProblemError:
     return ProblemError(401, "unauthorized", detail, headers={"WWW-Authenticate": "Bearer"})
+
+
+def rate_limited(detail: str, wait_s: float) -> ProblemError:
+    """429 with the whole seconds until a retry can succeed, as a header and in the body."""
+    retry_after = max(1, math.ceil(wait_s))
+    return ProblemError(
+        429,
+        "rate_limited",
+        detail,
+        headers={"Retry-After": str(retry_after)},
+        extra={"retry_after": retry_after},
+    )
 
 
 _STATUS_CODES = {

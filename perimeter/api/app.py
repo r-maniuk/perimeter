@@ -34,12 +34,13 @@ from perimeter.api.security import RevocationList, TokenService
 from perimeter.api.state import AppState
 from perimeter.bus import topology
 from perimeter.bus.connection import connect
+from perimeter.bus.publish import StreamPublisher
 from perimeter.bus.relay import OutboxRelay
 from perimeter.config import Settings, load_settings
 from perimeter.ops import tracing
 from perimeter.ops.heartbeat import Heartbeat, instance_id
 from perimeter.ops.looplag import LoopLagMonitor
-from perimeter.storage.engine import create_engine, session_factory
+from perimeter.storage.engine import create_engine
 
 log = structlog.get_logger(__name__)
 
@@ -104,6 +105,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     tracing.instrument_database(db)
     nc = await connect(settings.nats, name=f"perimeter-api/{instance}")
     js = nc.jetstream()
+    stream = StreamPublisher(nc)
     state: AppState | None = None
     try:
         await topology.verify(js, topology.Topology.from_settings(settings))
@@ -113,17 +115,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         await admission.sample_once()  # the first request already sees a measured backlog
         publisher = TelemetryPublisher(
-            nc, settings=settings.ingest, ack_timeout_s=settings.nats.request_timeout_s
+            stream, settings=settings.ingest, ack_timeout_s=settings.nats.request_timeout_s
         )
         # --- end ingest ---
         state = AppState(
             settings=settings,
             instance=instance,
             db=db,
-            sessions=session_factory(db),
             nc=nc,
             js=js,
-            relay=OutboxRelay(db, js),
+            relay=OutboxRelay(db, stream),
             tokens=TokenService(settings.security),
             revoked=await RevocationList.open(js),
             looplag=LoopLagMonitor(),
@@ -155,6 +156,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     asyncio.gather(*state.tasks, return_exceptions=True), SHUTDOWN_GRACE_S
                 )
             await state.revoked.close()
+        await stream.close()
         with suppress(Exception):
             await nc.drain()
         await db.dispose()
@@ -176,6 +178,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     tracing.configure(settings.observability, service="api")
     tracing.instrument_app(app)  # middleware must exist before the app starts
     app.state.login_limiter = RateLimiter(rate_per_minute=settings.security.login_rate_per_minute)
+    app.state.zone_limiter = RateLimiter(rate_per_minute=settings.zones.writes_per_minute)
     errors.install(app)
     app.add_middleware(BodyLimitMiddleware, max_bytes=settings.ingest.max_body_bytes)
     app.include_router(health.router)

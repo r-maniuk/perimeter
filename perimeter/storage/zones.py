@@ -34,7 +34,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from perimeter.storage.models import Device, GeoZone, ZonePresence
+from perimeter.storage.models import Device, GeoZone, User, ZonePresence
 
 WGS84 = 4326
 REAL_DECIMALS = 2
@@ -161,6 +161,17 @@ def _values(spec: ZoneSpec) -> dict[str, Any]:
     }
 
 
+async def count_owned(conn: AsyncConnection, owner_id: uuid.UUID) -> int | None:
+    """How many zones the owner has, with the owner's row locked against concurrent creations
+    until the transaction ends (so a limit checked here holds); ``None`` if the account is gone."""
+    owner = select(User.id).where(User.id == owner_id).with_for_update(key_share=True)
+    if (await conn.execute(owner)).first() is None:
+        return None
+    count = select(func.count()).select_from(GeoZone).where(GeoZone.owner_id == owner_id)
+    total: int = (await conn.execute(count)).scalar_one()
+    return total
+
+
 async def create(conn: AsyncConnection, owner_id: uuid.UUID, spec: ZoneSpec) -> ZoneRecord:
     statement = (
         insert(GeoZone)
@@ -171,17 +182,25 @@ async def create(conn: AsyncConnection, owner_id: uuid.UUID, spec: ZoneSpec) -> 
 
 
 async def get(
-    conn: AsyncConnection, owner_id: uuid.UUID, zone_id: uuid.UUID, *, for_update: bool = False
+    conn: AsyncConnection,
+    owner_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+    exclusive: bool = False,
 ) -> ZoneRecord | None:
     """The zone, or ``None`` when it does not exist or belongs to someone else.
 
-    With ``for_update`` the row stays locked against other edits until the transaction ends.
+    With ``for_update`` the row stays locked against other edits until the transaction ends. An
+    ``exclusive`` lock also waits for the engine batches that are reading the zone right now (they
+    hold ``FOR KEY SHARE``): taken to deactivate or delete a zone, so that no batch that saw it
+    active writes presence for it afterwards.
     """
     statement = select(*_COLUMNS, _OCCUPANCY).where(
         GeoZone.id == zone_id, GeoZone.owner_id == owner_id
     )
     if for_update:
-        statement = statement.with_for_update(key_share=True, of=GeoZone)
+        statement = statement.with_for_update(key_share=not exclusive, of=GeoZone)
     row = (await conn.execute(statement)).one_or_none()
     return _record(row) if row is not None else None
 

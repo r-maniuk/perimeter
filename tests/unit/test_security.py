@@ -63,10 +63,13 @@ def test_ingest_token_comparison() -> None:
     assert not ingest_token_valid("abc", "")
 
 
-def _socket(origin: str | None, cookie: bool) -> MagicMock:
+def _socket(origin: str | None, cookie: bool, bearer: str | None = None) -> MagicMock:
     socket = MagicMock()
     socket.headers = {"origin": origin} if origin else {}
+    if bearer:
+        socket.headers["authorization"] = f"Bearer {bearer}"
     socket.cookies = {"perimeter_session": "t"} if cookie else {}
+    socket.query_params = {}
     return socket
 
 
@@ -78,12 +81,15 @@ def test_origin_check_protects_cookie_authenticated_sockets() -> None:
 
 
 def test_explicit_tokens_win_over_the_ambient_cookie() -> None:
-    socket = _socket(None, cookie=True)
-    socket.query_params = {"token": "explicit"}
+    socket = _socket(None, cookie=True, bearer="explicit")
     assert websocket_credential(socket) == SocketCredential("explicit", ambient=False)
     cookie_only = _socket("http://localhost:8080", cookie=True)
-    cookie_only.query_params = {}
     assert websocket_credential(cookie_only) == SocketCredential("t", ambient=True)
-    nothing = _socket(None, cookie=False)
-    nothing.query_params = {}
-    assert websocket_credential(nothing) is None
+    assert websocket_credential(_socket(None, cookie=False)) is None
+
+
+def test_tokens_in_the_url_are_not_accepted() -> None:
+    # URLs end up in proxy logs, traces and browser history.
+    socket = _socket(None, cookie=False)
+    socket.query_params = {"token": "in-the-url"}
+    assert websocket_credential(socket) is None

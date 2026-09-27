@@ -178,14 +178,13 @@ class SocketCredential:
 def websocket_credential(websocket: WebSocket) -> SocketCredential | None:
     """The token a socket authenticates with.
 
-    An explicit ``?token=`` or bearer header wins: no other site can make a browser send it, so it
-    needs no origin check. The session cookie is ambient authority — it rides along with any
-    socket a page opens to us — so it only counts together with an allowed ``Origin``
-    (:func:`origin_allowed`), which is what stops cross-site WebSocket hijacking.
+    A bearer header wins: no other site can make a browser send it, so it needs no origin check.
+    The session cookie is ambient authority — it rides along with any socket a page opens to us —
+    so it only counts together with an allowed ``Origin`` (:func:`origin_allowed`), which is what
+    stops cross-site WebSocket hijacking. Tokens in the URL are not accepted: URLs end up in
+    proxy logs, traces and browser history.
     """
-    explicit = websocket.query_params.get("token") or _bearer(
-        websocket.headers.get("authorization")
-    )
+    explicit = _bearer(websocket.headers.get("authorization"))
     if explicit:
         return SocketCredential(explicit, ambient=False)
     cookie = websocket.cookies.get(COOKIE_NAME)

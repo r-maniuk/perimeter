@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
@@ -72,8 +73,51 @@ async def test_reports_older_than_every_slot_are_cleared(db: AsyncEngine) -> Non
         await tracks.maintain(conn, retention_min=30)
         await put(conn, "late", now - timedelta(hours=5))  # no slot covers it: the default one
         assert await count(conn, "device_tracks_default") == 1
-        await tracks.maintain(conn, retention_min=30)
+        rolled = await tracks.maintain(conn, retention_min=30)
         assert await count(conn, "device_tracks_default") == 0
+    assert rolled.purged == 1
+
+
+def slot_of(at: datetime) -> str:
+    start = at.replace(minute=at.minute - at.minute % 10, second=0, microsecond=0)
+    return f"device_tracks_{start:%Y%m%d%H%M}"
+
+
+async def test_reports_that_arrived_while_maintenance_lagged_move_into_their_slot(
+    db: AsyncEngine,
+) -> None:
+    # Once the default partition holds rows of a slot's range, that slot can no longer simply be
+    # created; the maintenance must move them in, or it would fail on every round from then on.
+    now = datetime.now(UTC)
+    async with db.begin() as conn:
+        await tracks.maintain(conn, retention_min=30)
+        await conn.execute(text(f"DROP TABLE {slot_of(now)}"))  # as if it was never created
+        await put(conn, "veh-7", now)
+        assert await count(conn, "device_tracks_default") == 1
+        rolled = await tracks.maintain(conn, retention_min=30)
+        assert await count(conn, "device_tracks_default") == 0
+        assert await count(conn, slot_of(now)) == 1
+        assert await count(conn) == 1
+    assert (rolled.created, rolled.moved, rolled.failed) == (1, 1, 0)
+
+
+async def test_a_step_that_cannot_get_its_lock_waits_for_the_next_round(db: AsyncEngine) -> None:
+    async with db.begin() as conn:
+        await tracks.maintain(conn, retention_min=60)
+    async with db.connect() as backup, backup.begin():
+        # What pg_dump holds on every table it reads, for as long as it runs.
+        await backup.execute(text("LOCK TABLE device_tracks IN ACCESS SHARE MODE"))
+        started = time.monotonic()
+        async with db.begin() as conn:
+            blocked = await tracks.maintain(conn, retention_min=30)
+        waited = time.monotonic() - started
+    assert blocked.dropped == 0
+    assert blocked.failed >= 3  # the expired slots, each given up after half a second
+    assert waited < 10
+    async with db.begin() as conn:
+        caught_up = await tracks.maintain(conn, retention_min=30)
+    assert caught_up.failed == 0
+    assert caught_up.dropped == blocked.failed
 
 
 async def test_recent_returns_the_newest_points_oldest_first(db: AsyncEngine) -> None:

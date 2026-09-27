@@ -51,6 +51,7 @@ from perimeter.wire import subjects, telemetry
 log = structlog.get_logger(__name__)
 
 LEASE_POLL_S = 0.1
+MIN_FETCH_S = 0.05  # a lease about to lapse fetches nothing rather than a sliver
 DRAIN_FETCH_TIMEOUT_S = 0.1
 
 _DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -88,6 +89,10 @@ class LeaseHandle:
 
     def valid(self, now: float) -> bool:
         return now < self._valid_until
+
+    def remaining(self, now: float) -> float:
+        """Seconds the lease is still known to be valid (none once it is not)."""
+        return max(0.0, self._valid_until - now)
 
     def refresh(self, lease: Lease, *, valid_until: float) -> None:
         self._lease = lease
@@ -320,8 +325,14 @@ class PartitionWorker:
                 # transaction carries many of them. Under a backlog batches are full and nobody
                 # waits; at idle the next fetch simply blocks until the first report arrives.
                 await self._sleep(self._linger_s)
+            # A pull request must not outlive the lease: messages it brought in after the lease
+            # lapsed could reach this worker once a new owner had taken the partition over.
+            wait_s = min(self._fetch_wait_s, self._lease.remaining(self._clock.monotonic()))
+            if wait_s < MIN_FETCH_S:
+                await self._sleep(LEASE_POLL_S)
+                continue
             try:
-                msgs = await sub.fetch(self._batch_max, timeout=self._fetch_wait_s)
+                msgs = await sub.fetch(self._batch_max, timeout=wait_s)
             except TimeoutError:  # nothing to do this time
                 continue
             except Exception as exc:  # the broker is unreachable or the consumer went away

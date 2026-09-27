@@ -1,8 +1,8 @@
 """``WS /v1/live``: the client realtime channel (protocol in :mod:`perimeter.api.live.protocol`).
 
 Authentication happens before the handshake is accepted: session cookie (browsers, which must
-also present an allowed ``Origin``) or ``?token=`` / bearer header (command-line clients), a valid
-signature and a token that was not signed out. Failures are reported *after* accepting, as close
+also present an allowed ``Origin``) or bearer header (command-line clients), a valid signature
+and a token that was not signed out. Failures are reported *after* accepting, as close
 code 4003: a browser cannot read the status of a rejected handshake, but it can read a close code.
 """
 

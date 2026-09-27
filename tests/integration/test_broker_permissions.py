@@ -31,7 +31,8 @@ from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 from perimeter.api.security import RevocationList
 from perimeter.bus import topology
 from perimeter.bus.connection import connect
-from perimeter.bus.leases import LeaseBucket, generation_of
+from perimeter.bus.leases import LeaseBucket
+from perimeter.bus.publish import StreamPublisher
 from perimeter.bus.relay import OutboxRelay
 from perimeter.config import NatsSettings
 from perimeter.domain import tiles
@@ -106,12 +107,16 @@ async def service(
     await nc.drain()
 
 
-async def _relay_through(db: AsyncEngine, js: JetStreamContext, subject: str) -> int:
+async def _relay_through(db: AsyncEngine, nc: NatsClient, subject: str) -> int:
     async with db.begin() as conn:
         rows = await outbox.insert(
             conn, [PendingEvent(subject, f"test-{secrets.token_hex(8)}", b'{"n":1}')]
         )
-    return await OutboxRelay(db, js).relay(rows)
+    stream = StreamPublisher(nc)
+    try:
+        return await OutboxRelay(db, stream).relay(rows)
+    finally:
+        await stream.close()
 
 
 async def _publish_reports(broker: SecuredBroker, *, devices: int) -> None:
@@ -168,17 +173,17 @@ async def test_the_api_can_do_everything_it_needs(
     ):
         await nc.subscribe(subject, cb=collect)
 
-    # ingest: acknowledged publishes, de-duplicated by id
+    # ingest: acknowledged publishes, de-duplicated by id, answered on the api's own inbox
+    stream = StreamPublisher(nc)
     ack = await (
-        await js.publish_async(
-            subjects.telemetry("dev-1"), b"r", headers={"Nats-Msg-Id": "dev-1:1"}
-        )
+        await stream.publish(subjects.telemetry("dev-1"), b"r", {"Nats-Msg-Id": "dev-1:1"})
     )
+    await stream.close()
     assert ack.stream == subjects.TELEMETRY_STREAM
     assert len(await js.consumers_info(subjects.TELEMETRY_STREAM)) == TOPOLOGY.partitions
 
     # zone events through the outbox relay, republished for live delivery
-    assert await _relay_through(db, js, subjects.events("u1")) == 1
+    assert await _relay_through(db, nc, subjects.events("u1")) == 1
     await eventually(lambda: any(m.subject == "live.evt.u1" for m in received))
     info = await js.stream_info(subjects.EVENTS_STREAM, subjects_filter=subjects.events("u1"))
     assert info.state.messages >= 1
@@ -232,10 +237,7 @@ async def test_the_engine_can_do_everything_it_needs(
     await topology.verify(js, TOPOLOGY)
 
     # membership and partition leases
-    info = await js.stream_info(f"KV_{subjects.KV_ENGINE}")
-    leases = LeaseBucket(
-        await js.key_value(subjects.KV_ENGINE), generation=generation_of(info.created)
-    )
+    leases = LeaseBucket(await js.key_value(subjects.KV_ENGINE))
     await leases.heartbeat("m.engine-test", b"{}")
     lease = await leases.acquire("p.0", "engine-test")
     assert lease is not None
@@ -277,7 +279,7 @@ async def test_the_engine_can_do_everything_it_needs(
     assert subjects.partition_of(reread.subject) == partition
 
     # alerts through the outbox (fast path and sweeper), positions, pulses, heartbeat
-    assert await _relay_through(db, js, subjects.events("u2")) == 1
+    assert await _relay_through(db, nc, subjects.events("u2")) == 1
     await nc.publish(tiles.subject_for(tiles.quadkey_for(4.9041, 52.3676, 12)), b"\xb7")
     await nc.publish(subjects.live_pulses("u2"), b"{}")
     await _one_heartbeat(nc, "engine")

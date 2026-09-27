@@ -1,10 +1,10 @@
 """Durable publishing of validated reports into the TELEMETRY stream.
 
-A report is accepted only once JetStream has stored it: every record is published with
-``publish_async`` (one round trip per batch rather than per report), and the caller gets an answer
-only after every acknowledgement arrived. Each message carries ``Nats-Msg-Id`` =
-``<device>:<recorded_at_ms>``, so a device that retries a report it never saw acknowledged is
-stored once within the stream's de-duplication window.
+A report is accepted only once JetStream has stored it: every record of a batch is published
+without waiting (:class:`~perimeter.bus.publish.StreamPublisher`, one round trip per batch rather
+than per report), and the caller gets an answer only after every acknowledgement arrived. Each
+message carries ``Nats-Msg-Id`` = ``<device>:<recorded_at_ms>``, so a device that retries a report
+it never saw acknowledged is stored once within the stream's de-duplication window.
 
 Memory is bounded by an in-flight budget of reports awaiting acknowledgement, shared by every
 request and socket of the replica (``INGEST_MAX_INFLIGHT``). A caller that cannot get budget
@@ -24,10 +24,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from nats.aio.client import Client as NatsClient
-from nats.js.api import PubAck
+from nats.errors import Error as NatsError
 from prometheus_client import Counter, Gauge, Histogram
 
+from perimeter.bus.publish import Ack, StreamPublisher
 from perimeter.config import IngestSettings
 from perimeter.domain.clock import SYSTEM_CLOCK, Clock
 from perimeter.domain.reports import TelemetryRecord
@@ -174,16 +174,14 @@ class PublishOutcome:
 class TelemetryPublisher:
     def __init__(
         self,
-        nc: NatsClient,
+        stream: StreamPublisher,
         *,
         settings: IngestSettings,
         ack_timeout_s: float,
         budget_wait_s: float = 0.5,
         clock: Clock = SYSTEM_CLOCK,
     ) -> None:
-        # A private JetStream context: its publish_async window must never be the bottleneck
-        # below our own budget (the client blocks without a timeout when that window is full).
-        self._js = nc.jetstream(publish_async_max_pending=settings.max_inflight)
+        self._stream = stream
         self._budget = InflightBudget(settings.max_inflight)
         self._ack_timeout_s = ack_timeout_s
         self._budget_wait_s = budget_wait_s
@@ -223,20 +221,23 @@ class TelemetryPublisher:
         self._accepted.add(count)
         return PublishOutcome(accepted=count, duplicates=duplicates)
 
-    async def _publish_all(self, records: Sequence[TelemetryRecord]) -> list[PubAck]:
-        futures: list[asyncio.Future[PubAck]] = []
+    async def _publish_all(self, records: Sequence[TelemetryRecord]) -> list[Ack]:
+        futures: list[asyncio.Future[Ack]] = []
         try:
             for record in records:
-                headers = {"Nats-Msg-Id": telemetry.dedup_id(record)}
-                tracing.inject(headers)
+                headers = tracing.inject({"Nats-Msg-Id": telemetry.dedup_id(record)})
                 futures.append(
-                    await self._js.publish_async(
-                        subjects.telemetry(record.device_id),
-                        telemetry.encode(record),
-                        headers=headers,
+                    await self._stream.publish(
+                        subjects.telemetry(record.device_id), telemetry.encode(record), headers
                     )
                 )
             done, pending = await asyncio.wait(futures, timeout=self._ack_timeout_s)
+        except NatsError as exc:  # the client could not send (closed, draining, buffer full)
+            for future in futures:
+                future.cancel()
+            PUBLISH_FAILURES.inc()
+            log.warning("ingest.publish_failed", reports=len(records), error=repr(exc))
+            raise IngestUnavailable from exc
         except BaseException:
             for future in futures:
                 future.cancel()

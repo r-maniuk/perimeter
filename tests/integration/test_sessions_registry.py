@@ -24,6 +24,7 @@ from perimeter.wire import subjects
 from tests.integration.conftest import TEST_ORIGIN
 from tests.integration.live_support import (
     LiveClient,
+    LiveTarget,
     Replica,
     create_user,
     live_client,
@@ -243,8 +244,9 @@ async def test_sockets_without_valid_credentials_are_refused_with_4003(
         algorithm="HS256",
     )
     replica = cluster[0]
-    refused: list[tuple[str, dict[str, str]]] = [
+    refused: list[tuple[LiveTarget, dict[str, str]]] = [
         (replica.ws(), {}),  # no credentials at all
+        (LiveTarget(f"{replica.ws().url}?token={token}"), {}),  # tokens in URLs do not count
         (replica.ws("garbage"), {}),
         (replica.ws(forged), {}),  # signed with another key
         (replica.ws(), {"cookie": token, "origin": "https://evil.example"}),  # cross-site

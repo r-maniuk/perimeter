@@ -60,8 +60,11 @@ async def sign_in(base: str) -> str:
 async def viewer(
     base: str, token: str, bbox: tuple[float, ...], until: float, tally: Tally
 ) -> None:
-    url = base.replace("http", "ws", 1) + f"/v1/live?token={token}"
-    async with connect(url, max_size=None, compression=None, proxy=None) as ws:
+    url = base.replace("http", "ws", 1) + "/v1/live"
+    headers = {"Authorization": f"Bearer {token}"}
+    async with connect(
+        url, additional_headers=headers, max_size=None, compression=None, proxy=None
+    ) as ws:
         await ws.send(json.dumps({"type": "viewport", "bbox": list(bbox), "zoom": 11}))
         loop = asyncio.get_running_loop()
         while (left := until - loop.time()) > 0:

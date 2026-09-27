@@ -20,9 +20,11 @@
 }
 
 # The api replicas, found through Docker's DNS: every address behind the service name `api`.
-# Caddy runs no active health checks for dynamic upstreams, so the list is refreshed often and
-# replicas that fail or answer 5xx are taken out of rotation by passive checks; requests that
-# cannot reach one replica are retried on another.
+# Caddy runs no active health checks for dynamic upstreams, so the list is refreshed often and a
+# replica that cannot be reached is taken out of rotation by passive checks; requests that cannot
+# reach one replica are retried on another. Only failed connections count: a replica's own 503 is
+# deliberate (ingest shedding load, a database that is momentarily unavailable) and taking it out
+# of rotation for that would turn load shedding into an outage of the whole API.
 (api_upstreams) {
 	reverse_proxy {
 		dynamic a {
@@ -37,7 +39,6 @@
 		lb_try_interval 250ms
 		fail_duration 10s
 		max_fails 3
-		unhealthy_status 502 503 504
 		# Stream every write straight through (ingest acks, live frames).
 		flush_interval -1
 		transport http {
@@ -70,7 +71,7 @@
 		output stdout
 		format filter {
 			wrap json
-			# Command-line clients may authenticate the live channel with ?token=.
+			# Tokens are not accepted in URLs; one a client puts there anyway is not logged.
 			request>uri query {
 				replace token REDACTED
 			}
@@ -136,7 +137,7 @@
 		handle @api_error {
 			header Content-Type application/problem+json
 			header Retry-After 2
-			respond `{"type":"https://perimeter.dev/problems/unavailable","title":"Service Unavailable","status":503,"detail":"no API replica is reachable right now","code":"unavailable"}` 503
+			respond `{"type":"/problems/unavailable","title":"Service Unavailable","status":503,"detail":"no API replica is reachable right now","code":"unavailable"}` 503
 		}
 	}
 }

@@ -26,8 +26,8 @@ from pydantic import (
 from perimeter.domain.presence import TransitionKind
 
 DEFAULT_COLOR = "#6d5dfc"
-USERNAME_PATTERN = r"^[a-z0-9][a-z0-9_.-]{1,31}$"
-COLOR_PATTERN = r"^#[0-9a-f]{6}$"
+USERNAME_PATTERN = r"^[a-z0-9][a-z0-9_.-]{1,31}\z"
+COLOR_PATTERN = r"^#[0-9a-f]{6}\z"
 
 
 def _stripped_lower(value: object) -> object:

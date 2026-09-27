@@ -1,4 +1,4 @@
-"""Session tokens given to ``/v1/live?token=`` must never reach the logs."""
+"""A token a client puts in a URL anyway (the API accepts none there) never reaches the logs."""
 
 import logging
 

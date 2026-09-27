@@ -11,7 +11,9 @@ from typing import Annotated
 
 import msgspec
 
-DEVICE_ID_PATTERN = r"^[A-Za-z0-9_-]+$"
+# ``\z``, not ``$``: in Python ``$`` also matches before a final newline, and a device id ends up
+# in a broker subject, where a newline is not allowed (``\z`` means end of text in Rust regex too).
+DEVICE_ID_PATTERN = r"^[A-Za-z0-9_-]+\z"
 EPOCH_MS_THRESHOLD = 100_000_000_000  # below: seconds, above: milliseconds
 
 DeviceId = Annotated[str, msgspec.Meta(min_length=1, max_length=64, pattern=DEVICE_ID_PATTERN)]

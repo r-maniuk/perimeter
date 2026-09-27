@@ -9,12 +9,7 @@ timeouts back that up, so one runaway statement cannot hold a connection hostage
 from __future__ import annotations
 
 from sqlalchemy.engine import URL
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from perimeter.config import DatabaseSettings
 
@@ -58,7 +53,3 @@ def create_engine(
             },
         },
     )
-
-
-def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
-    return async_sessionmaker(engine, expire_on_commit=False, autoflush=False)

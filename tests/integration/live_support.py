@@ -14,7 +14,7 @@ import socket
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlencode
 
 import pytest
@@ -43,6 +43,13 @@ class InProcessServer(uvicorn.Server):
         yield
 
 
+class LiveTarget(NamedTuple):
+    """Where to open a live socket, and the bearer token to open it with (if any)."""
+
+    url: str
+    token: str | None = None
+
+
 @dataclass
 class Replica:
     name: str
@@ -60,11 +67,10 @@ class Replica:
     def http(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def ws(self, token: str | None = None, **params: object) -> str:
-        query = {"token": token} if token else {}
-        query.update({k: str(v) for k, v in params.items()})
+    def ws(self, token: str | None = None, **params: object) -> LiveTarget:
+        query = {k: str(v) for k, v in params.items()}
         suffix = f"?{urlencode(query)}" if query else ""
-        return f"ws://127.0.0.1:{self.port}/v1/live{suffix}"
+        return LiveTarget(f"ws://127.0.0.1:{self.port}/v1/live{suffix}", token)
 
     async def settle(self) -> None:
         """Position subscriptions match the viewports and the broker has seen them."""
@@ -130,6 +136,7 @@ def with_live(settings: Settings, **overrides: Any) -> Settings:
         engine=settings.engine,
         live=live,
         observability=settings.observability,
+        zones=settings.zones,
     )
 
 
@@ -157,17 +164,21 @@ class LiveClient:
     @classmethod
     async def open(
         cls,
-        url: str,
+        target: LiveTarget,
         *,
         origin: str | None = None,
         cookie: str | None = None,
         max_queue: int = 16,
     ) -> LiveClient:
-        headers = {"Cookie": f"{COOKIE_NAME}={cookie}"} if cookie else None
+        headers: dict[str, str] = {}
+        if target.token:
+            headers["Authorization"] = f"Bearer {target.token}"
+        if cookie:
+            headers["Cookie"] = f"{COOKIE_NAME}={cookie}"
         ws = await connect(
-            url,
+            target.url,
             origin=origin,  # type: ignore[arg-type]
-            additional_headers=headers,
+            additional_headers=headers or None,
             proxy=None,
             max_size=None,
             max_queue=max_queue,
@@ -272,8 +283,8 @@ def of_type(items: list[Frame], kind: str) -> list[dict[str, Any]]:
 
 
 @contextlib.asynccontextmanager
-async def live_client(url: str, **options: Any) -> AsyncIterator[LiveClient]:
-    client = await LiveClient.open(url, **options)
+async def live_client(target: LiveTarget, **options: Any) -> AsyncIterator[LiveClient]:
+    client = await LiveClient.open(target, **options)
     try:
         yield client
     finally:

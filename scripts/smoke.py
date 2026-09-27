@@ -203,7 +203,10 @@ async def await_alert_and_position(
 @asynccontextmanager
 async def live_session(base_url: str, token: str) -> AsyncIterator[ClientConnection]:
     url = base_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
-    async with connect(f"{url}/v1/live?token={token}", open_timeout=5, max_size=None) as live:
+    headers = {"Authorization": f"Bearer {token}"}
+    async with connect(
+        f"{url}/v1/live", additional_headers=headers, open_timeout=5, max_size=None
+    ) as live:
         yield live
 
 

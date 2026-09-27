@@ -6,16 +6,16 @@ Inside the transaction, in this order:
    already recorded there means another instance owns the partition now, and nothing is written;
 2. the newest committed event time of each device in the batch;
 3. which active zones contain each report newer than that, in one indexed statement for the whole
-   batch (every report, not only the newest, so a device crossing a zone between two batches
-   still yields both ``enter`` and ``exit``);
+   batch (every report, not only the newest, so a device that enters and leaves a zone within
+   one batch still yields both ``enter`` and ``exit``);
 4. the devices' current presence, and the rules of every zone involved, locked against deletion;
 5. the presence state machine (:mod:`perimeter.domain.presence`), in pure Python;
-6. set-based writes: newest positions, the track of every applied report, presence changes,
-   alerts and their outbox events.
+6. set-based writes: newest positions, the track (every report, late ones included), presence
+   changes, alerts and their outbox events.
 
-After the commit the new events are relayed to JetStream straight away (the outbox sweeper covers
-a crash in between), moved devices go to the tile publisher and occupancy to the pulse publisher.
-Only then does the worker acknowledge the batch's messages.
+After the commit moved devices go to the tile publisher, occupancy to the pulse publisher, and the
+new events are relayed to JetStream straight away (the outbox sweeper covers a crash in between,
+or a relay that could not finish). Only then does the worker acknowledge the batch's messages.
 """
 
 from __future__ import annotations
@@ -155,9 +155,9 @@ class BatchProcessor:
                 written = await _write(conn, outcome)
             batch_s = self._clock.monotonic() - started
             committed_ms = self._clock.now_ms()
-            await self._relay.relay(written.events)
             self._live.positions(written.moved)
             self._live.pulses(outcome.pulses(zones))
+            await self._relay.relay(written.events)
         self._observe(records, outcome, written, batch_s=batch_s, committed_ms=committed_ms)
         return Applied(
             reports=len(records),
@@ -226,9 +226,7 @@ async def _evaluate(
 async def _write(conn: AsyncConnection, outcome: BatchOutcome) -> _Written:
     latest = outcome.latest()
     moved = await sql.upsert_devices(conn, latest)
-    await sql.insert_tracks(
-        conn, [r for device in outcome.devices.values() for r in device.accepted]
-    )
+    await sql.insert_tracks(conn, outcome.tracked())
     await sql.delete_presence(conn, outcome.deletes())
     await sql.upsert_presence(conn, outcome.upserts())
     candidates = [(new_id(), transition) for transition in outcome.alerts()]

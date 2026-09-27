@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Literal
+from collections.abc import Mapping
+from typing import Literal
 
 import pytest
-from nats.js.api import PubAck
-from nats.js.errors import NoStreamResponseError
+from nats.errors import ConnectionClosedError
 
 from perimeter.api.ingest.publisher import (
     InflightBudget,
@@ -15,44 +15,37 @@ from perimeter.api.ingest.publisher import (
     RateCounter,
     TelemetryPublisher,
 )
+from perimeter.bus.publish import Ack, PublishError
 from perimeter.config import IngestSettings
 from perimeter.domain.clock import ManualClock
 from perimeter.domain.reports import TelemetryRecord
 from perimeter.wire import telemetry
 
-Mode = Literal["ack", "duplicate", "fail_second", "silent"]
+Mode = Literal["ack", "duplicate", "fail_second", "silent", "unsendable_second"]
 
 
-class FakeJetStream:
+class FakeStream:
+    """Stands in for :class:`perimeter.bus.publish.StreamPublisher`."""
+
     def __init__(self, mode: Mode = "ack") -> None:
         self.mode = mode
         self.published: list[tuple[str, bytes, dict[str, str]]] = []
-        self.futures: list[asyncio.Future[PubAck]] = []
+        self.futures: list[asyncio.Future[Ack]] = []
 
-    async def publish_async(
-        self, subject: str, payload: bytes, headers: dict[str, str] | None = None
-    ) -> asyncio.Future[PubAck]:
-        future: asyncio.Future[PubAck] = asyncio.get_running_loop().create_future()
+    async def publish(
+        self, subject: str, payload: bytes, headers: Mapping[str, str] | None = None
+    ) -> asyncio.Future[Ack]:
+        if self.mode == "unsendable_second" and len(self.published) == 1:
+            raise ConnectionClosedError
+        future: asyncio.Future[Ack] = asyncio.get_running_loop().create_future()
         self.published.append((subject, payload, dict(headers or {})))
         self.futures.append(future)
         index = len(self.futures)
         if self.mode in {"ack", "duplicate"}:
-            future.set_result(
-                PubAck(stream="TELEMETRY", seq=index, duplicate=self.mode == "duplicate")
-            )
+            future.set_result(Ack("TELEMETRY", index, duplicate=self.mode == "duplicate"))
         elif self.mode == "fail_second" and index == 2:
-            future.set_exception(NoStreamResponseError())
+            future.set_exception(PublishError("no stream listens on 'tlm.veh-1'"))
         return future
-
-
-class FakeNats:
-    def __init__(self, js: FakeJetStream) -> None:
-        self.js = js
-        self.options: dict[str, Any] = {}
-
-    def jetstream(self, **options: Any) -> FakeJetStream:
-        self.options = options
-        return self.js
 
 
 def records(count: int) -> list[TelemetryRecord]:
@@ -64,25 +57,24 @@ def records(count: int) -> list[TelemetryRecord]:
 
 def publisher(
     mode: Mode = "ack", *, max_inflight: int = 100, ack_timeout_s: float = 0.2
-) -> tuple[TelemetryPublisher, FakeNats]:
-    nc = FakeNats(FakeJetStream(mode))
+) -> tuple[TelemetryPublisher, FakeStream]:
+    stream = FakeStream(mode)
     settings = IngestSettings(max_inflight=max_inflight)
     publisher_ = TelemetryPublisher(
-        nc,  # type: ignore[arg-type]
+        stream,  # type: ignore[arg-type]
         settings=settings,
         ack_timeout_s=ack_timeout_s,
         budget_wait_s=0.05,
     )
-    return publisher_, nc
+    return publisher_, stream
 
 
 async def test_publishes_every_record_with_its_dedup_id_and_waits_for_acks() -> None:
-    publisher_, nc = publisher()
+    publisher_, stream = publisher()
     outcome = await publisher_.publish(records(3))
     assert outcome.accepted == 3
     assert outcome.duplicates == 0
-    assert nc.options == {"publish_async_max_pending": 100}
-    subject, payload, headers = nc.js.published[1]
+    subject, payload, headers = stream.published[1]
     assert subject == "tlm.veh-1"
     assert telemetry.decode(payload) == records(3)[1]
     assert headers["Nats-Msg-Id"] == "veh-1:1790000000001"
@@ -96,26 +88,35 @@ async def test_duplicates_count_as_accepted() -> None:
 
 
 async def test_empty_batches_publish_nothing() -> None:
-    publisher_, nc = publisher()
+    publisher_, stream = publisher()
     assert (await publisher_.publish([])).accepted == 0
-    assert nc.js.published == []
+    assert stream.published == []
 
 
 async def test_one_failed_ack_fails_the_batch_and_frees_the_budget() -> None:
-    publisher_, nc = publisher("fail_second")
+    publisher_, stream = publisher("fail_second")
     with pytest.raises(IngestUnavailable) as error:
         await publisher_.publish(records(3))
-    assert isinstance(error.value.__cause__, NoStreamResponseError)
+    assert isinstance(error.value.__cause__, PublishError)
     assert publisher_.budget.in_use == 0
     # the acknowledgements still outstanding were given up, not leaked
-    assert all(future.done() for future in nc.js.futures)
+    assert all(future.done() for future in stream.futures)
+
+
+async def test_a_report_that_cannot_be_sent_fails_the_batch_and_nothing_waits_on() -> None:
+    publisher_, stream = publisher("unsendable_second")
+    with pytest.raises(IngestUnavailable) as error:
+        await publisher_.publish(records(3))
+    assert isinstance(error.value.__cause__, ConnectionClosedError)
+    assert all(future.cancelled() for future in stream.futures)
+    assert publisher_.budget.in_use == 0
 
 
 async def test_missing_acks_time_out_and_are_cancelled() -> None:
-    publisher_, nc = publisher("silent", ack_timeout_s=0.05)
+    publisher_, stream = publisher("silent", ack_timeout_s=0.05)
     with pytest.raises(IngestUnavailable):
         await publisher_.publish(records(2))
-    assert all(future.cancelled() for future in nc.js.futures)
+    assert all(future.cancelled() for future in stream.futures)
     assert publisher_.budget.in_use == 0
 
 
@@ -134,9 +135,8 @@ async def test_a_full_budget_refuses_quickly() -> None:
 
 async def test_snapshot_reports_rates_and_latency() -> None:
     clock = ManualClock()
-    nc = FakeNats(FakeJetStream())
     publisher_ = TelemetryPublisher(
-        nc,  # type: ignore[arg-type]
+        FakeStream(),  # type: ignore[arg-type]
         settings=IngestSettings(),
         ack_timeout_s=1,
         clock=clock,

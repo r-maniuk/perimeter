@@ -9,10 +9,11 @@
 Leases alone cannot stop a paused owner from waking up and writing after it lost the lease, so each
 lease also yields a *fencing token*: the pair (bucket generation, key revision). Revisions grow with
 every acquisition or renewal; the generation (the bucket's creation time) grows if the broker was
-wiped and the bucket recreated, so pairs compared in order strictly increase across both. Writers
-present the token to the database, which rejects anything older than the newest token it has seen.
-Comparing the pair as a row keeps both halves full 64-bit integers: nothing to pack, nothing to
-overflow.
+wiped and the bucket recreated, so pairs compared in order strictly increase across both. The
+generation is read afresh for every acquisition, because a bucket can be recreated under running
+engines, and its revisions start again from 1. Writers present the token to the database, which
+rejects anything older than the newest token it has seen. Comparing the pair as a row keeps both
+halves full 64-bit integers: nothing to pack, nothing to overflow.
 """
 
 from __future__ import annotations
@@ -62,15 +63,21 @@ def generation_of(created: datetime | None) -> int:
 
 
 class LeaseBucket:
-    def __init__(self, kv: KeyValue, *, generation: int) -> None:
+    def __init__(self, kv: KeyValue) -> None:
         self._kv = kv
-        self._generation = generation
+
+    async def generation(self) -> int:
+        """The bucket's generation now (it changes when the bucket is created anew)."""
+        return generation_of((await self._kv.status()).stream_info.created)
 
     async def acquire(self, key: str, owner: str) -> Lease | None:
         # ``KeyValue.create`` answers "taken" with a second round trip that reads the key back (to
         # tell a live key from a delete marker). When the holder's entry expires between the two,
         # that read finds nothing and raises KeyNotFoundError: the key has just become free, so
         # create it again. A new holder in the meantime answers "taken" like any other.
+        # The generation is read first: should the bucket be recreated in between, the token is
+        # too old rather than too new, and a newer acquisition supersedes it.
+        generation = await self.generation()
         for _ in range(_CREATE_ATTEMPTS):
             try:
                 revision = await self._kv.create(key, owner.encode())
@@ -78,7 +85,7 @@ class LeaseBucket:
                 return None
             except KeyNotFoundError:
                 continue
-            return Lease(key, owner, revision, self._generation)
+            return Lease(key, owner, revision, generation)
         return None
 
     async def renew(self, lease: Lease) -> Lease:

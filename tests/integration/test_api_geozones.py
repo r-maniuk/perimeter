@@ -292,6 +292,36 @@ async def test_deactivation_forgets_presence_but_geometry_edits_keep_it(
     assert resumed.json()["occupancy"] == 0
 
 
+async def test_deactivation_waits_for_a_batch_that_saw_the_zone_active(
+    client: httpx.AsyncClient, db: AsyncEngine
+) -> None:
+    # An engine batch reads the rules of its zones FOR KEY SHARE and writes presence for them
+    # before it commits; a zone deactivated in between must not keep that presence.
+    alice, _ = await auth(client, "alice")
+    created = await create(client, alice)
+    zone_id = uuid.UUID(created["id"])
+    async with db.connect() as batch, batch.begin():
+        await batch.execute(
+            text("SELECT id FROM geozones WHERE id = :z FOR KEY SHARE"), {"z": zone_id}
+        )
+        pausing = asyncio.create_task(
+            client.patch(f"/v1/geozones/{zone_id}", json={"is_active": False}, headers=alice)
+        )
+        await asyncio.sleep(0.3)
+        assert not pausing.done()  # it waits for the batch
+        await batch.execute(
+            text(
+                "INSERT INTO zone_presence (device_id, zone_id, entered_at, last_seen_at) "
+                "VALUES ('veh-1', :z, now(), now())"
+            ),
+            {"z": zone_id},
+        )
+    paused = await pausing
+    assert paused.status_code == 200
+    assert paused.json()["occupancy"] == 0
+    assert await presence_count(db, created["id"]) == 0
+
+
 async def test_every_change_is_published_as_an_event_with_its_sequence(
     client: httpx.AsyncClient, nc: NatsClient, js: JetStreamContext, db: AsyncEngine
 ) -> None:

@@ -1823,8 +1823,8 @@ class Observer:
 
 # --- configuration -------------------------------------------------------------------------------
 
-USERNAME_PATTERN: Final = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,31}$")
-ID_PREFIX_PATTERN: Final = re.compile(r"^[A-Za-z0-9_-]{0,32}$")
+USERNAME_PATTERN: Final = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,31}\Z")
+ID_PREFIX_PATTERN: Final = re.compile(r"^[A-Za-z0-9_-]{0,32}\Z")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

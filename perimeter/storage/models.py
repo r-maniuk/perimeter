@@ -144,6 +144,7 @@ class OutboxMessage(Base):
     msg_id: Mapped[str] = mapped_column(Text)
     payload: Mapped[bytes] = mapped_column(LargeBinary)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PartitionEpoch(Base):

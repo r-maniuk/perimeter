@@ -127,13 +127,24 @@ class TelemetrySettings(_Group):
     dedup_window_s: int = Field(default=30, ge=1)
 
 
+class ZoneSettings(_Group):
+    """Per-user limits on geofences: every active zone around a device costs each of its reports
+    a presence row, so one account must not be able to make everyone's reports expensive."""
+
+    model_config = SettingsConfigDict(env_prefix="ZONE_")
+
+    max_per_user: int = Field(default=1_000, ge=1, le=100_000)
+    writes_per_minute: int = Field(default=120, ge=1)
+
+
 class TrackSettings(_Group):
     """Device tracks: every applied report, kept in time partitions for a while."""
 
     model_config = SettingsConfigDict(env_prefix="TRACK_")
 
     retention_min: int = Field(default=30, ge=10, le=24 * 60)
-    maintenance_s: float = Field(default=60.0, ge=5.0)
+    # Slots are created 20 minutes ahead: rounds must come well within that.
+    maintenance_s: float = Field(default=60.0, ge=5.0, le=600.0)
 
 
 class IngestSettings(_Group):
@@ -196,6 +207,7 @@ class Settings:
         "security",
         "telemetry",
         "tracks",
+        "zones",
     )
 
     def __init__(
@@ -210,6 +222,7 @@ class Settings:
         engine: EngineSettings,
         live: LiveSettings,
         observability: ObservabilitySettings,
+        zones: ZoneSettings,
     ) -> None:
         self.database = database
         self.nats = nats
@@ -220,6 +233,7 @@ class Settings:
         self.engine = engine
         self.live = live
         self.observability = observability
+        self.zones = zones
 
     @property
     def is_development(self) -> bool:
@@ -238,6 +252,7 @@ def load_settings(**overrides: Any) -> Settings:
         "engine": EngineSettings,
         "live": LiveSettings,
         "observability": ObservabilitySettings,
+        "zones": ZoneSettings,
     }
     built = {name: overrides.get(name) or factory() for name, factory in groups.items()}
     return Settings(**built)

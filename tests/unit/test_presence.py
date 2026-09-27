@@ -96,7 +96,7 @@ def test_late_and_duplicate_reports_change_nothing() -> None:
     outcome = run(
         [obs(4_000), obs(5_000), obs(6_000, Z1), obs(6_000)], stays={Z1: stay}, last=5_000
     )
-    assert outcome.late == 3
+    assert len(outcome.late) == 3
     assert outcome.alerts == []
     assert outcome.latest is not None
     assert outcome.latest.recorded_at_ms == 6_000
@@ -221,7 +221,7 @@ def test_replaying_already_applied_reports_is_a_no_op(
     outcome = run(again, stays=stays, last=last)
     assert outcome.alerts == []
     assert outcome.upserts == {}
-    assert outcome.late == len(again)
+    assert len(outcome.late) == len(again)
 
 
 @given(track=tracks)

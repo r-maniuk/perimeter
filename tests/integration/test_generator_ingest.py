@@ -73,7 +73,7 @@ class Stream:
 
 def problem(status: int, code: str, headers: dict[str, str] | None = None) -> web.Response:
     return web.json_response(
-        {"type": f"https://perimeter.dev/problems/{code}", "status": status, "code": code},
+        {"type": f"/problems/{code}", "status": status, "code": code},
         status=status,
         content_type="application/problem+json",
         headers=headers,

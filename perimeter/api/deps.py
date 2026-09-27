@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import Depends, Request
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from perimeter.api.errors import unauthorized
 from perimeter.api.security import AuthError, Principal, request_token
@@ -18,14 +16,6 @@ def app_state(request: Request) -> AppState:
 
 
 State = Annotated[AppState, Depends(app_state)]
-
-
-async def db_session(state: State) -> AsyncIterator[AsyncSession]:
-    async with state.sessions() as session:
-        yield session
-
-
-DbSession = Annotated[AsyncSession, Depends(db_session)]
 
 
 def current_principal(request: Request, state: State) -> Principal:

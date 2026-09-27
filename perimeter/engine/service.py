@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Coroutine
 from contextlib import suppress
+from dataclasses import asdict
 from typing import Any
 
 import sqlalchemy.exc
@@ -31,12 +32,20 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from perimeter.bus import topology
 from perimeter.bus.connection import connect
-from perimeter.bus.leases import LeaseBucket, generation_of
+from perimeter.bus.leases import LeaseBucket
+from perimeter.bus.publish import StreamPublisher
 from perimeter.bus.relay import RELAY_BACKLOG, OutboxRelay
 from perimeter.config import Settings
 from perimeter.engine.batch import BatchProcessor, is_transient
 from perimeter.engine.coordinator import Coordinator
-from perimeter.engine.metrics import EngineStats, gauge_value, heartbeat_payload
+from perimeter.engine.metrics import (
+    TRACK_DEFAULT_ROWS,
+    TRACK_FAILURES,
+    TRACK_SLOTS,
+    EngineStats,
+    gauge_value,
+    heartbeat_payload,
+)
 from perimeter.engine.tiles import TilePublisher
 from perimeter.engine.worker import Backoff, LeaseHandle, PartitionWorker, unacknowledged
 from perimeter.ops import tracing
@@ -90,6 +99,7 @@ class EngineService:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._db: AsyncEngine | None = None
         self._nc: NatsClient | None = None
+        self._stream: StreamPublisher | None = None
         self._coordinator: Coordinator | None = None
         self._started = False
         self._stopping = False
@@ -124,7 +134,8 @@ class EngineService:
         except BaseException:
             await self._close(drain=False)
             raise
-        relay = OutboxRelay(self._db, js)
+        self._stream = StreamPublisher(self._nc)
+        relay = OutboxRelay(self._db, self._stream)
         tiles = TilePublisher(
             self._nc, zoom=settings.live.tile_zoom, flush_ms=settings.live.tile_flush_ms
         )
@@ -241,7 +252,7 @@ class EngineService:
             )
         js = nc.jetstream(timeout=lease_timeout(self.settings, ttl_s))
         kv = await js.key_value(subjects.KV_ENGINE)
-        return ttl_s, kv, LeaseBucket(kv, generation=generation_of(info.created))
+        return ttl_s, kv, LeaseBucket(kv)
 
     async def _wait_for_database(self, db: AsyncEngine) -> None:
         """Wait for PostgreSQL to accept connections; refuse to start without the schema."""
@@ -274,10 +285,19 @@ class EngineService:
             try:
                 async with db.begin() as conn:
                     done = await tracks.maintain(conn, retention_min=retention_min)
-                if done.created or done.dropped:
-                    log.info("engine.tracks_rolled", created=done.created, dropped=done.dropped)
             except Exception as exc:  # retried next round; inserts fall back to the default slot
+                TRACK_FAILURES.inc()
                 log.warning("engine.tracks_maintenance_failed", error=repr(exc))
+            else:
+                TRACK_SLOTS.labels("attached").inc(done.created)
+                TRACK_SLOTS.labels("dropped").inc(done.dropped)
+                TRACK_DEFAULT_ROWS.labels("moved").inc(done.moved)
+                TRACK_DEFAULT_ROWS.labels("purged").inc(done.purged)
+                TRACK_FAILURES.inc(done.failed)
+                if done.failed:
+                    log.warning("engine.tracks_maintenance_incomplete", **asdict(done))
+                elif done.created or done.dropped or done.moved or done.purged:
+                    log.info("engine.tracks_rolled", **asdict(done))
             with suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), interval_s)
 
@@ -323,6 +343,8 @@ class EngineService:
             await asyncio.wait({task}, timeout=1.0)
 
     async def _close(self, *, drain: bool) -> None:
+        if self._stream is not None:
+            await self._stream.close()
         if self._nc is not None and not self._nc.is_closed:
             with suppress(Exception):
                 await (self._nc.drain() if drain else self._nc.close())

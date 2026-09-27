@@ -54,6 +54,18 @@ LEASE_EVENTS = Counter(
 FRAMES = Counter("perimeter_engine_frames_published_total", "Live position frames published")
 FRAME_BYTES = Counter("perimeter_engine_frame_bytes_total", "Bytes of live position frames")
 PULSES = Counter("perimeter_engine_pulses_published_total", "Occupancy pulses published")
+TRACK_SLOTS = Counter(
+    "perimeter_tracks_slots_total", "Track partitions attached or dropped", ["action"]
+)
+TRACK_DEFAULT_ROWS = Counter(
+    "perimeter_tracks_default_rows_total",
+    "Reports the default track partition held: moved into their new slot, or purged as expired",
+    ["action"],
+)
+TRACK_FAILURES = Counter(
+    "perimeter_tracks_maintenance_failures_total",
+    "Track maintenance steps or rounds that failed (a step that missed its lock is retried)",
+)
 PUBLISH_FAILURES = Counter(
     "perimeter_engine_publish_failures_total",
     "Core NATS publishes (frames, pulses) that failed",

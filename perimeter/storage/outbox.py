@@ -47,12 +47,17 @@ _DELETE = text("DELETE FROM outbox WHERE id = ANY(CAST(:ids AS bigint[]))").bind
 
 _CLAIM = text(
     """
-    SELECT id, subject, msg_id, payload
-    FROM outbox
-    WHERE created_at < now() - make_interval(secs => :min_age_s)
-    ORDER BY id
-    LIMIT :limit
-    FOR UPDATE SKIP LOCKED
+    UPDATE outbox SET claimed_until = now() + make_interval(secs => :hold_s)
+    WHERE id IN (
+        SELECT id
+        FROM outbox
+        WHERE created_at < now() - make_interval(secs => :min_age_s)
+          AND (claimed_until IS NULL OR claimed_until < now())
+        ORDER BY id
+        LIMIT :limit
+        FOR UPDATE SKIP LOCKED
+    )
+    RETURNING id, subject, msg_id, payload
     """
 )
 
@@ -82,9 +87,18 @@ async def delete(conn: AsyncConnection, ids: Sequence[int]) -> None:
         await conn.execute(_DELETE, {"ids": list(ids)})
 
 
-async def claim_stale(conn: AsyncConnection, *, min_age_s: float, limit: int) -> list[OutboxRow]:
-    result = await conn.execute(_CLAIM, {"min_age_s": min_age_s, "limit": limit})
-    return [OutboxRow(r.id, r.subject, r.msg_id, bytes(r.payload)) for r in result]
+async def claim_stale(
+    conn: AsyncConnection, *, min_age_s: float, limit: int, hold_s: float
+) -> list[OutboxRow]:
+    """Rows older than ``min_age_s``, reserved for this caller for ``hold_s`` seconds.
+
+    The reservation is its own short transaction, so nothing stays open while the rows are
+    published; rows of a caller that died before deleting them can be claimed again once it lapses.
+    """
+    result = await conn.execute(_CLAIM, {"min_age_s": min_age_s, "limit": limit, "hold_s": hold_s})
+    rows = [OutboxRow(r.id, r.subject, r.msg_id, bytes(r.payload)) for r in result]
+    rows.sort(key=lambda row: row.id)  # publish in commit order
+    return rows
 
 
 async def backlog(conn: AsyncConnection) -> tuple[int, float]:

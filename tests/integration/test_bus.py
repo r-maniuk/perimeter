@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
+import nats
 import pytest
 from nats.aio.client import Client as NatsClient
 from nats.aio.msg import Msg
+from nats.errors import BadSubjectError, ConnectionClosedError
 from nats.js import JetStreamContext
 from nats.js.api import KeyValueConfig
 from nats.js.errors import NotFoundError
@@ -17,7 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from perimeter.bus import topology
 from perimeter.bus.leases import FencingToken, LeaseBucket, LeaseLost, generation_of
+from perimeter.bus.publish import Ack, PublishError, StreamPublisher
 from perimeter.bus.relay import OutboxRelay
+from perimeter.config import NatsSettings
 from perimeter.storage import outbox
 from perimeter.storage.outbox import PendingEvent
 from perimeter.wire import subjects
@@ -91,8 +95,7 @@ async def test_events_are_republished_with_their_per_user_sequence_chain(
 
 async def _bucket(js: JetStreamContext, ttl: float = 1.0) -> LeaseBucket:
     kv = await js.create_key_value(KeyValueConfig(bucket="lease-test", ttl=ttl, history=1))
-    info = await js.stream_info("KV_lease-test")
-    return LeaseBucket(kv, generation=generation_of(info.created))
+    return LeaseBucket(kv)
 
 
 async def test_a_lease_has_one_holder_and_survives_renewals(js: JetStreamContext) -> None:
@@ -131,7 +134,7 @@ async def test_a_lease_that_expires_while_it_is_being_acquired_is_taken(
     # The client's create answers "taken" with a second round trip that reads the key back; hold
     # that read until the holder's entry has expired, which is the window a busy engine can hit.
     kv = await js.create_key_value(KeyValueConfig(bucket="lease-race", ttl=1.0, history=1))
-    bucket = LeaseBucket(kv, generation=1)
+    bucket = LeaseBucket(kv)
     first = await bucket.acquire("p.4", "engine-a")
     assert first is not None
     read_back = kv._get
@@ -153,6 +156,23 @@ async def test_a_lease_that_expires_while_it_is_being_acquired_is_taken(
     assert second is not None
     assert second.token > first.token
     assert await bucket.holder("p.4") == "engine-b"
+
+
+async def test_a_recreated_bucket_raises_the_generation_of_new_tokens(js: JetStreamContext) -> None:
+    # A broker whose store was lost gets its buckets back empty, revisions starting from 1, while
+    # engines keep running: tokens they take from then on must still beat every older one.
+    bucket = await _bucket(js)
+    before = await bucket.acquire("p.5", "engine-a")
+    assert before is not None
+    for _ in range(3):
+        before = await bucket.renew(before)
+    await js.delete_key_value("lease-test")
+    await asyncio.sleep(1.1)  # generations are creation seconds
+    await js.create_key_value(KeyValueConfig(bucket="lease-test", ttl=1.0, history=1))
+    after = await bucket.acquire("p.5", "engine-b")
+    assert after is not None
+    assert after.revision < before.revision
+    assert after.token > before.token
 
 
 async def test_releasing_a_lost_lease_does_not_touch_the_new_owner(js: JetStreamContext) -> None:
@@ -181,6 +201,61 @@ def test_generation_of_missing_timestamp_is_zero() -> None:
     assert generation_of(datetime(2026, 1, 1, tzinfo=UTC)) == 1_767_225_600
 
 
+async def test_the_stream_publisher_is_acknowledged_and_sees_duplicates(
+    stream: StreamPublisher, provisioned: topology.Topology
+) -> None:
+    first = await (await stream.publish(subjects.events("u9"), b"{}", {"Nats-Msg-Id": "d1"}))
+    again = await (await stream.publish(subjects.events("u9"), b"{}", {"Nats-Msg-Id": "d1"}))
+    assert first.stream == subjects.EVENTS_STREAM
+    assert not first.duplicate
+    assert again.duplicate
+    assert again.seq == first.seq
+    assert stream.pending == 0
+
+
+async def test_a_subject_without_a_stream_fails_the_publish(stream: StreamPublisher) -> None:
+    with pytest.raises(PublishError, match="no stream"):
+        await (await stream.publish("nowhere.at.all", b"{}"))
+    assert stream.pending == 0
+
+
+async def test_messages_that_cannot_be_sent_leave_nothing_behind(
+    stream: StreamPublisher, provisioned: topology.Topology
+) -> None:
+    # The client refuses the subject before anything is sent; each refusal used to cost the
+    # JetStream client a pending slot for good, until publishing hung.
+    for _ in range(3):
+        with pytest.raises(BadSubjectError):
+            await stream.publish("tlm.veh-1\n", b"r")
+    assert stream.pending == 0
+    ack = await (await stream.publish(subjects.telemetry("veh-1"), b"r"))
+    assert ack.stream == subjects.TELEMETRY_STREAM
+
+
+async def test_a_closed_connection_leaves_nothing_behind(
+    nats_settings: NatsSettings, provisioned: topology.Topology
+) -> None:
+    nc = await nats.connect(nats_settings.url)
+    stream = StreamPublisher(nc)
+    assert (await (await stream.publish(subjects.telemetry("veh-2"), b"r"))).seq > 0
+    await nc.close()
+    with pytest.raises(ConnectionClosedError):
+        await stream.publish(subjects.telemetry("veh-2"), b"r")
+    assert stream.pending == 0
+    await stream.close()
+
+
+async def test_a_publish_nobody_waits_for_is_forgotten(
+    stream: StreamPublisher, provisioned: topology.Topology
+) -> None:
+    future = await stream.publish(subjects.telemetry("veh-3"), b"r")
+    future.cancel()
+    await asyncio.sleep(0)
+    assert stream.pending == 0
+    await asyncio.sleep(0.2)  # its acknowledgement still arrives, and is ignored
+    assert stream.pending == 0
+
+
 async def _pending(db: AsyncEngine, *events: PendingEvent) -> list[outbox.OutboxRow]:
     async with db.begin() as conn:
         return await outbox.insert(conn, list(events))
@@ -193,14 +268,14 @@ async def _count_outbox(db: AsyncEngine) -> int:
 
 
 async def test_fast_path_publishes_and_clears_the_outbox(
-    db: AsyncEngine, js: JetStreamContext, provisioned: topology.Topology
+    db: AsyncEngine, js: JetStreamContext, stream: StreamPublisher, provisioned: topology.Topology
 ) -> None:
     rows = await _pending(
         db,
         PendingEvent(subjects.events("u1"), "e1", b'{"n":1}'),
         PendingEvent(subjects.events("u1"), "e2", b'{"n":2}'),
     )
-    relay = OutboxRelay(db, js)
+    relay = OutboxRelay(db, stream)
     assert await relay.relay(rows) == 2
     assert await _count_outbox(db) == 0
     info = await js.stream_info(subjects.EVENTS_STREAM)
@@ -208,10 +283,10 @@ async def test_fast_path_publishes_and_clears_the_outbox(
 
 
 async def test_sweeper_recovers_events_left_behind_and_duplicates_are_dropped(
-    db: AsyncEngine, js: JetStreamContext, provisioned: topology.Topology
+    db: AsyncEngine, js: JetStreamContext, stream: StreamPublisher, provisioned: topology.Topology
 ) -> None:
     rows = await _pending(db, PendingEvent(subjects.events("u2"), "e3", b"{}"))
-    relay = OutboxRelay(db, js, sweep_min_age_s=0.0)
+    relay = OutboxRelay(db, stream, sweep_min_age_s=0.0)
     # simulate a crash after publishing but before deleting: publish, keep the row
     await js.publish(rows[0].subject, rows[0].payload, headers={"Nats-Msg-Id": rows[0].msg_id})
     fresh = await _pending(db, PendingEvent(subjects.events("u2"), "e4", b"{}"))
@@ -223,19 +298,77 @@ async def test_sweeper_recovers_events_left_behind_and_duplicates_are_dropped(
 
 
 async def test_sweeper_leaves_young_rows_to_the_fast_path(
-    db: AsyncEngine, js: JetStreamContext, provisioned: topology.Topology
+    db: AsyncEngine, stream: StreamPublisher, provisioned: topology.Topology
 ) -> None:
     await _pending(db, PendingEvent(subjects.events("u3"), "e5", b"{}"))
-    relay = OutboxRelay(db, js, sweep_min_age_s=60.0)
+    relay = OutboxRelay(db, stream, sweep_min_age_s=60.0)
     assert await relay.sweep_once() == 0
     assert await _count_outbox(db) == 1
     await relay.refresh_backlog_metrics()
 
 
+async def test_a_claimed_row_waits_until_its_hold_lapses(
+    db: AsyncEngine, provisioned: topology.Topology
+) -> None:
+    rows = await _pending(db, PendingEvent(subjects.events("u4"), "e7", b"{}"))
+    async with db.begin() as conn:
+        first = await outbox.claim_stale(conn, min_age_s=0, limit=10, hold_s=0)
+    async with db.begin() as conn:
+        again = await outbox.claim_stale(conn, min_age_s=0, limit=10, hold_s=60)
+    async with db.begin() as conn:
+        held = await outbox.claim_stale(conn, min_age_s=0, limit=10, hold_s=60)
+    assert [r.id for r in first] == [rows[0].id]
+    assert [r.id for r in again] == [rows[0].id]  # the first hold lapsed at once
+    assert held == []  # the second one has not
+
+
+class SlowStream:
+    """Acknowledges only once ``answer`` is set, like a broker that is slow to reply."""
+
+    def __init__(self) -> None:
+        self.answer = asyncio.Event()
+        self._replies: list[asyncio.Task[None]] = []
+
+    async def publish(
+        self, subject: str, payload: bytes, headers: object = None
+    ) -> asyncio.Future[Ack]:
+        future: asyncio.Future[Ack] = asyncio.get_running_loop().create_future()
+
+        async def reply() -> None:
+            await self.answer.wait()
+            future.set_result(Ack(subjects.EVENTS_STREAM, 1))
+
+        self._replies.append(asyncio.create_task(reply()))
+        return future
+
+
+async def test_the_sweeper_holds_no_lock_while_the_broker_answers(
+    db: AsyncEngine, provisioned: topology.Topology
+) -> None:
+    rows = await _pending(db, PendingEvent(subjects.events("u5"), "e8", b"{}"))
+    stream = SlowStream()
+    relay = OutboxRelay(db, stream, sweep_min_age_s=0.0)  # type: ignore[arg-type]
+    sweeping = asyncio.create_task(relay.sweep_once())
+
+    async def claimed() -> bool:
+        async with db.connect() as conn:
+            query = text("SELECT claimed_until IS NOT NULL FROM outbox WHERE id = :id")
+            return bool((await conn.execute(query, {"id": rows[0].id})).scalar_one())
+
+    await eventually(claimed)
+    # the fast path deleting the same row meanwhile must not wait for the sweeper
+    async with db.begin() as conn:
+        await conn.execute(text("SET LOCAL lock_timeout = '200ms'"))
+        await outbox.delete(conn, [rows[0].id])
+    stream.answer.set()
+    assert await sweeping == 1
+    assert await _count_outbox(db) == 0
+
+
 async def test_events_without_a_stream_stay_in_the_outbox(
-    db: AsyncEngine, js: JetStreamContext, provisioned: topology.Topology
+    db: AsyncEngine, stream: StreamPublisher, provisioned: topology.Topology
 ) -> None:
     rows = await _pending(db, PendingEvent("nowhere.subject", "e6", b"{}"))
-    relay = OutboxRelay(db, js, publish_timeout_s=0.5)
+    relay = OutboxRelay(db, stream, publish_timeout_s=0.5)
     assert await relay.relay(rows) == 0
     assert await _count_outbox(db) == 1

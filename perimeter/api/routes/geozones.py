@@ -22,13 +22,14 @@ from datetime import datetime
 from typing import Annotated, Any
 
 import structlog
-from fastapi import APIRouter, Header, Path, Query, Response, status
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response, status
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from perimeter.api.deps import CurrentUser, State
-from perimeter.api.errors import ProblemError, not_found, unauthorized
+from perimeter.api.errors import ProblemError, not_found, rate_limited, unauthorized
 from perimeter.api.pagination import CursorError, decode_cursor, encode_cursor
+from perimeter.api.ratelimit import RateLimiter
 from perimeter.api.schemas import (
     LatLon,
     Occupant,
@@ -52,7 +53,6 @@ router = APIRouter(prefix="/geozones", tags=["geozones"])
 CURSOR_KIND = "zones"
 TRANSACTION_ATTEMPTS = 3
 RETRYABLE_SQLSTATES = frozenset({"40001", "40P01"})  # serialization failure, deadlock detected
-FOREIGN_KEY_VIOLATION = "23503"
 
 ZoneId = Annotated[uuid.UUID, Path(description="Zone id")]
 IfMatch = Annotated[
@@ -66,6 +66,23 @@ _NOT_FOUND: dict[int | str, dict[str, Any]] = {
 _PRECONDITION: dict[int | str, dict[str, Any]] = {
     412: {"description": "The zone changed since the If-Match ETag was read"}
 }
+_RATE_LIMITED: dict[int | str, dict[str, Any]] = {
+    429: {"description": "Too many zone changes by this account; retry after `Retry-After`"}
+}
+
+
+def zone_limiter(request: Request) -> RateLimiter:
+    limiter: RateLimiter = request.app.state.zone_limiter
+    return limiter
+
+
+def limit_zone_writes(
+    principal: CurrentUser, limiter: Annotated[RateLimiter, Depends(zone_limiter)]
+) -> None:
+    """Every change of a zone is an event for every session of its owner: keep them in reason."""
+    wait_s = limiter.acquire(str(principal.user_id))
+    if wait_s > 0:
+        raise rate_limited("too many zone changes; retry later", wait_s)
 
 
 def etag(version: int) -> str:
@@ -182,6 +199,11 @@ async def list_zones(
     "",
     status_code=status.HTTP_201_CREATED,
     response_model=Zone,
+    dependencies=[Depends(limit_zone_writes)],
+    responses={
+        409: {"description": "The account already has `ZONE_MAX_PER_USER` zones"},
+        **_RATE_LIMITED,
+    },
     summary="Create a zone",
 )
 async def create_zone(
@@ -199,14 +221,20 @@ async def create_zone(
         dwell_s=body.dwell_s,
     )
 
+    limit = state.settings.zones.max_per_user
+
     async def work(conn: AsyncConnection) -> tuple[Zone, list[OutboxRow]]:
-        try:
-            record = await zones.create(conn, principal.user_id, spec)
-        except IntegrityError as exc:
-            if _sqlstate(exc) == FOREIGN_KEY_VIOLATION:  # the token outlived its account
-                raise unauthorized("this account no longer exists") from exc
-            raise
-        zone = zone_body(record)
+        owned = await zones.count_owned(conn, principal.user_id)
+        if owned is None:  # the token outlived its account
+            raise unauthorized("this account no longer exists")
+        if owned >= limit:
+            raise ProblemError(
+                409,
+                "zone_limit_reached",
+                f"an account keeps at most {limit} zones; delete one first",
+                extra={"limit": limit},
+            )
+        zone = zone_body(await zones.create(conn, principal.user_id, spec))
         event = _event(EventType.ZONE_CREATED, principal.user_id, zone.model_dump(mode="json"))
         return zone, await outbox.insert(conn, [event])
 
@@ -232,7 +260,8 @@ async def get_zone(
 @router.patch(
     "/{zone_id}",
     response_model=Zone,
-    responses={**_NOT_FOUND, **_PRECONDITION},
+    dependencies=[Depends(limit_zone_writes)],
+    responses={**_NOT_FOUND, **_PRECONDITION, **_RATE_LIMITED},
     summary="Change a zone (partial update)",
 )
 async def update_zone(
@@ -245,7 +274,9 @@ async def update_zone(
     if_match: IfMatch = None,
 ) -> Zone:
     async def work(conn: AsyncConnection) -> tuple[Zone, list[OutboxRow]]:
-        current = await zones.get(conn, principal.user_id, zone_id, for_update=True)
+        current = await zones.get(
+            conn, principal.user_id, zone_id, for_update=True, exclusive=body.is_active is False
+        )
         if current is None:
             raise not_found("zone")
         _precondition(if_match, current.version)
@@ -267,14 +298,15 @@ async def update_zone(
 @router.delete(
     "/{zone_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    responses={**_NOT_FOUND, **_PRECONDITION},
+    dependencies=[Depends(limit_zone_writes)],
+    responses={**_NOT_FOUND, **_PRECONDITION, **_RATE_LIMITED},
     summary="Delete a zone (its alerts stay in the history)",
 )
 async def delete_zone(
     zone_id: ZoneId, principal: CurrentUser, state: State, if_match: IfMatch = None
 ) -> Response:
     async def work(conn: AsyncConnection) -> list[OutboxRow]:
-        current = await zones.get(conn, principal.user_id, zone_id, for_update=True)
+        current = await zones.get(conn, principal.user_id, zone_id, for_update=True, exclusive=True)
         if current is None:
             raise not_found("zone")
         _precondition(if_match, current.version)

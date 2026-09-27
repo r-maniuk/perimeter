@@ -67,36 +67,38 @@ TRACKS_FUNCTION = r"""
 CREATE FUNCTION perimeter_maintain_tracks(
     retention interval, ahead interval DEFAULT interval '20 minutes'
 )
-RETURNS TABLE (created integer, dropped integer)
+RETURNS TABLE (created integer, dropped integer, moved bigint, purged bigint, failed integer)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
 SET timezone = 'UTC'
+-- A step that cannot get its lock soon gives up until the next round, rather than queueing the
+-- engines' inserts behind it (a long backup holds locks on every table it reads, for example).
+SET lock_timeout = '500ms'
 AS $$
 DECLARE
     slot     CONSTANT interval := interval '10 minutes';
     origin   CONSTANT timestamptz := timestamptz '2000-01-01 00:00:00+00';
-    start_at timestamptz := date_bin(slot, now() - retention, origin);
-    last_at  timestamptz := date_bin(slot, now() + ahead, origin);
+    first_at CONSTANT timestamptz := date_bin(slot, now() - retention, origin);
+    last_at  CONSTANT timestamptz := date_bin(slot, now() + ahead, origin);
+    at       timestamptz;
+    name     text;
+    n        bigint;
     part     record;
 BEGIN
     created := 0;
     dropped := 0;
+    moved := 0;
+    purged := 0;
+    failed := 0;
     -- One maintainer at a time: whoever does not get the lock has nothing to do this round.
     IF NOT pg_try_advisory_xact_lock(hashtext('perimeter_maintain_tracks')) THEN
         RETURN NEXT;
         RETURN;
     END IF;
-    WHILE start_at <= last_at LOOP
-        IF to_regclass('public.device_tracks_' || to_char(start_at, 'YYYYMMDDHH24MI')) IS NULL THEN
-            EXECUTE format(
-                'CREATE TABLE public.%I PARTITION OF public.device_tracks FOR VALUES FROM (%L) TO (%L)',
-                'device_tracks_' || to_char(start_at, 'YYYYMMDDHH24MI'), start_at, start_at + slot
-            );
-            created := created + 1;
-        END IF;
-        start_at := start_at + slot;
-    END LOOP;
+
+    -- Expired slots go whole. Every step below is its own subtransaction, so one that cannot get
+    -- its lock is retried next round without holding up the others.
     FOR part IN
         SELECT c.relname
         FROM pg_inherits AS i
@@ -105,13 +107,61 @@ BEGIN
           AND c.relname ~ '^device_tracks_[0-9]{12}$'
           AND to_timestamp(substr(c.relname, 15), 'YYYYMMDDHH24MI') + slot <= now() - retention
     LOOP
-        EXECUTE format('DROP TABLE public.%I', part.relname);
-        dropped := dropped + 1;
+        BEGIN
+            EXECUTE format('DROP TABLE public.%I', part.relname);
+            dropped := dropped + 1;
+        EXCEPTION WHEN lock_not_available THEN
+            failed := failed + 1;
+        END;
     END LOOP;
-    -- Only reports older than every slot land in the default partition: they are past retention.
-    IF EXISTS (SELECT 1 FROM public.device_tracks_default) THEN
-        TRUNCATE public.device_tracks_default;
-    END IF;
+
+    -- The default partition holds only reports no slot covered: those past retention, purged
+    -- here, and those that arrived while maintenance could not run, moved into their slot below.
+    BEGIN
+        DELETE FROM public.device_tracks_default WHERE recorded_at < first_at;
+        GET DIAGNOSTICS n = ROW_COUNT;
+        purged := n;
+    EXCEPTION WHEN lock_not_available THEN
+        failed := failed + 1;
+    END;
+
+    at := first_at;
+    WHILE at <= last_at LOOP
+        name := 'device_tracks_' || to_char(at, 'YYYYMMDDHH24MI');
+        IF to_regclass('public.' || name) IS NULL THEN
+            BEGIN
+                -- Built apart and attached: ATTACH locks the parent only against schema changes,
+                -- so reports keep flowing (CREATE ... PARTITION OF would stop them). A slot can
+                -- only be attached once the default partition holds none of its rows, so those
+                -- move in first, with the default locked against new ones meanwhile.
+                LOCK TABLE public.device_tracks_default IN ACCESS EXCLUSIVE MODE;
+                EXECUTE format(
+                    'CREATE TABLE public.%I (LIKE public.device_tracks INCLUDING ALL, '
+                    'CONSTRAINT %I CHECK (recorded_at >= %L AND recorded_at < %L))',
+                    name, name || '_range', at, at + slot
+                );
+                EXECUTE format(
+                    'WITH taken AS (DELETE FROM public.device_tracks_default '
+                    'WHERE recorded_at >= %L AND recorded_at < %L RETURNING *) '
+                    'INSERT INTO public.%I SELECT * FROM taken',
+                    at, at + slot, name
+                );
+                GET DIAGNOSTICS n = ROW_COUNT;
+                EXECUTE format(
+                    'ALTER TABLE public.device_tracks ATTACH PARTITION public.%I '
+                    'FOR VALUES FROM (%L) TO (%L)',
+                    name, at, at + slot
+                );
+                -- The check spared ATTACH a scan of the slot; the partition bound replaces it.
+                EXECUTE format('ALTER TABLE public.%I DROP CONSTRAINT %I', name, name || '_range');
+                created := created + 1;
+                moved := moved + n;
+            EXCEPTION WHEN lock_not_available THEN
+                failed := failed + 1;
+            END;
+        END IF;
+        at := at + slot;
+    END LOOP;
     RETURN NEXT;
 END
 $$
@@ -205,11 +255,12 @@ CREATE TABLE alerts (
 CREATE INDEX alerts_owner_id_idx ON alerts (owner_id, occurred_at DESC, id DESC);
 
 CREATE TABLE outbox (
-    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    subject     text NOT NULL,
-    msg_id      text NOT NULL,
-    payload     bytea NOT NULL,
-    created_at  timestamptz NOT NULL DEFAULT now()
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    subject        text NOT NULL,
+    msg_id         text NOT NULL,
+    payload        bytea NOT NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    claimed_until  timestamptz  -- the outbox sweeper's reservation while it publishes the row
 );
 CREATE INDEX outbox_created_at_idx ON outbox (created_at);
 

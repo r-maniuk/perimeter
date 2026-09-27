@@ -40,6 +40,7 @@ from nats.js.errors import NotFoundError
 
 from perimeter.api.live import metrics
 from perimeter.api.live.protocol import CloseCode, ResumeMode
+from perimeter.ops import tracing
 from perimeter.wire import subjects
 from perimeter.wire.events import live_frame
 
@@ -378,9 +379,12 @@ class UserFeed:
         async with self._lock:
             if seq <= self.last_seq:
                 return
-            if prev > self.last_seq:
-                await self._heal(until=prev)
-            self._deliver(seq, prev, msg.data, path="live")
+            # The event carries the trace of the transaction that raised it (the relay adds it), so
+            # one trace runs from the device's report to the sockets that show the alert.
+            with tracing.span("live.deliver", headers=headers, seq=seq, sessions=len(self.members)):
+                if prev > self.last_seq:
+                    await self._heal(until=prev)
+                self._deliver(seq, prev, msg.data, path="live")
 
     async def audit(self) -> None:
         """Compare with the stream: fill gaps nothing followed, detect a recreated stream."""

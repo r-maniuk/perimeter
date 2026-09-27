@@ -4,8 +4,11 @@ The engine inserts the reports of each batch in the batch's own transaction (one
 statement, :data:`perimeter.engine.sql.INSERT_TRACKS`). The table is range-partitioned by event
 time in 10-minute slots, and :func:`maintain` keeps the window rolling through the migration's
 ``perimeter_maintain_tracks`` function: expired slots are dropped whole, which costs the same
-however many reports they hold. A device's trail is then one index range scan on
-``(device_id, recorded_at)`` in the few newest partitions.
+however many reports they hold, and new slots are attached ahead of time. Reports no slot covers
+land in a default partition; the next round purges the expired ones and moves the rest into the
+slot it creates for them, so maintenance that could not run for a while catches up by itself. A
+device's trail is then one index range scan on ``(device_id, recorded_at)`` in the few newest
+partitions.
 """
 
 from __future__ import annotations
@@ -19,7 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from perimeter.storage.zones import real
 
 _MAINTAIN = text(
-    "SELECT created, dropped FROM perimeter_maintain_tracks(make_interval(mins => :retention_min))"
+    "SELECT created, dropped, moved, purged, failed"
+    " FROM perimeter_maintain_tracks(make_interval(mins => :retention_min))"
 )
 
 _RECENT = text(
@@ -51,14 +55,23 @@ class TrackPoint:
 
 @dataclass(frozen=True, slots=True)
 class Maintenance:
-    created: int
-    dropped: int
+    created: int  # slots attached
+    dropped: int  # expired slots dropped
+    moved: int  # reports moved out of the default partition into their new slot
+    purged: int  # expired reports removed from the default partition
+    failed: int  # steps that could not get their lock in time; retried next round
 
 
 async def maintain(conn: AsyncConnection, *, retention_min: int) -> Maintenance:
     """Create the upcoming slots and drop the expired ones (a no-op most of the time)."""
     row = (await conn.execute(_MAINTAIN, {"retention_min": retention_min})).one()
-    return Maintenance(created=int(row.created), dropped=int(row.dropped))
+    return Maintenance(
+        created=int(row.created),
+        dropped=int(row.dropped),
+        moved=int(row.moved),
+        purged=int(row.purged),
+        failed=int(row.failed),
+    )
 
 
 async def recent(

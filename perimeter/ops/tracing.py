@@ -1,8 +1,9 @@
 """Optional OpenTelemetry tracing.
 
 Enabled only when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set (the ``observability`` compose profile
-points it at Jaeger). Trace context crosses NATS in the standard ``traceparent`` header, so one
-trace follows a report from the ingest request through the engine batch to the live push.
+points it at Jaeger). Trace context crosses NATS in the standard ``traceparent`` header: from the
+ingest request into the engine batch that applies the report, from that batch's transaction into
+the alert events it writes, and from those to the API replicas that deliver them to sockets.
 """
 
 from __future__ import annotations

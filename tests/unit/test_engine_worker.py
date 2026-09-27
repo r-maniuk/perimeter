@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from itertools import pairwise
@@ -96,6 +97,7 @@ class Subscription:
     def __init__(self, *results: Sequence[Msg] | BaseException) -> None:
         self.results: deque[Sequence[Msg] | BaseException] = deque(results)
         self.fetches: list[float] = []
+        self.timeouts: list[float | None] = []
         self.buffered: list[Msg] = []
         self.unsubscribed = False
         self.drained = asyncio.Event()
@@ -106,6 +108,7 @@ class Subscription:
 
     async def fetch(self, batch: int = 1, timeout: float | None = 5) -> list[Msg]:  # noqa: ASYNC109
         self.fetches.append(asyncio.get_running_loop().time())
+        self.timeouts.append(timeout)
         if self.buffered:
             taken, self.buffered = self.buffered[:batch], self.buffered[batch:]
             return taken
@@ -364,6 +367,35 @@ async def test_fetch_errors_do_not_end_the_loop() -> None:
     processor = Processor()
     await run_until_drained(worker(subscription, processor, backoff_s=0.01), subscription)
     assert wire.transport.verdicts(batch) == ["ack"]
+
+
+async def test_a_fetch_never_outlives_the_lease() -> None:
+    # A pull request still open after the lease lapsed could deliver messages to this worker once
+    # a new owner had taken the partition over.
+    subscription, processor = Subscription(), Processor()
+    handle = lease()
+
+    async def subscribe() -> Subscription:
+        return subscription
+
+    subject = PartitionWorker(
+        0,
+        subscribe=subscribe,
+        in_flight=nothing_in_flight,
+        processor=processor,
+        lease=handle,
+        batch_max=100,
+        fetch_wait_s=30.0,
+        backoff=Backoff(initial_s=0.01, cap_s=0.04),
+    )
+    handle.refresh(handle.lease, valid_until=time.monotonic() + 0.3)
+    task = asyncio.create_task(subject.run())
+    await eventually(lambda: subscription.timeouts)
+    subject.stop()
+    await asyncio.wait_for(task, 5)
+    first = subscription.timeouts[0]
+    assert first is not None
+    assert 0 < first <= 0.3
 
 
 async def test_nothing_is_fetched_while_the_lease_is_not_known_to_be_valid() -> None:

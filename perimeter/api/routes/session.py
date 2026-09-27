@@ -7,7 +7,6 @@ scripts can never read it); command-line clients and devices use the returned be
 
 from __future__ import annotations
 
-import math
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
@@ -15,7 +14,7 @@ import nats.errors
 from fastapi import APIRouter, Depends, Request, Response, status
 
 from perimeter.api.deps import CurrentUser, State
-from perimeter.api.errors import ProblemError, unauthorized
+from perimeter.api.errors import ProblemError, rate_limited, unauthorized
 from perimeter.api.ratelimit import RateLimiter, client_key
 from perimeter.api.schemas import Me, Session, SessionCreate, User
 from perimeter.api.security import COOKIE_NAME, AuthError, request_token
@@ -36,14 +35,7 @@ def login_limiter(request: Request) -> RateLimiter:
 def limit_logins(request: Request, limiter: Annotated[RateLimiter, Depends(login_limiter)]) -> None:
     wait_s = limiter.acquire(client_key(request.client.host if request.client else None))
     if wait_s > 0:
-        retry_after = max(1, math.ceil(wait_s))
-        raise ProblemError(
-            429,
-            "rate_limited",
-            "too many sign-in attempts from this address; retry later",
-            headers={"Retry-After": str(retry_after)},
-            extra={"retry_after": retry_after},
-        )
+        raise rate_limited("too many sign-in attempts from this address; retry later", wait_s)
 
 
 @router.post(

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from fastapi import Request, WebSocket
 from nats.aio.client import Client as NatsClient
 from nats.js import JetStreamContext
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from perimeter.api.ingest.admission import AdmissionController
 from perimeter.api.ingest.publisher import TelemetryPublisher
@@ -26,7 +26,6 @@ class AppState:
     settings: Settings
     instance: str
     db: AsyncEngine
-    sessions: async_sessionmaker[AsyncSession]
     nc: NatsClient
     js: JetStreamContext
     relay: OutboxRelay

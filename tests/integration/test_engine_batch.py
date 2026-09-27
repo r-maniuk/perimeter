@@ -12,12 +12,12 @@ import pytest
 import sqlalchemy.exc
 from nats.aio.client import Client as NatsClient
 from nats.aio.msg import Msg
-from nats.js import JetStreamContext
 from sqlalchemy import TextClause, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from perimeter.bus import topology
 from perimeter.bus.leases import FencingToken
+from perimeter.bus.publish import StreamPublisher
 from perimeter.bus.relay import OutboxRelay
 from perimeter.domain.presence import ZoneRules
 from perimeter.domain.reports import TelemetryRecord
@@ -67,9 +67,11 @@ def live() -> LiveRecorder:
 
 @pytest.fixture
 def processor(
-    db: AsyncEngine, js: JetStreamContext, provisioned: topology.Topology, live: LiveRecorder
+    db: AsyncEngine, stream: StreamPublisher, provisioned: topology.Topology, live: LiveRecorder
 ) -> BatchProcessor:
-    return BatchProcessor(db, OutboxRelay(db, js), live, owner="engine-test", stats=EngineStats())
+    return BatchProcessor(
+        db, OutboxRelay(db, stream), live, owner="engine-test", stats=EngineStats()
+    )
 
 
 async def make_user(db: AsyncEngine, name: str = "alice") -> uuid.UUID:
@@ -314,11 +316,11 @@ async def test_a_zone_cannot_be_deleted_under_a_running_batch(
 
 
 async def test_an_older_fencing_token_cannot_commit(
-    processor: BatchProcessor, db: AsyncEngine, js: JetStreamContext, live: LiveRecorder
+    processor: BatchProcessor, db: AsyncEngine, stream: StreamPublisher, live: LiveRecorder
 ) -> None:
     await make_zone(db, await make_user(db))
     successor = BatchProcessor(
-        db, OutboxRelay(db, js), LiveRecorder(), owner="engine-new", stats=EngineStats()
+        db, OutboxRelay(db, stream), LiveRecorder(), owner="engine-new", stats=EngineStats()
     )
     await processor.apply(PARTITION, TOKEN, [report(T0, AWAY)])
     await successor.apply(PARTITION, NEWER, [report(T0 + 1_000, AWAY)])
@@ -440,16 +442,16 @@ def plan_nodes(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 
 async def test_an_alert_whose_publish_failed_is_swept_to_the_owner_exactly_once(
-    db: AsyncEngine, js: JetStreamContext, provisioned: topology.Topology, nc: NatsClient
+    db: AsyncEngine, stream: StreamPublisher, provisioned: topology.Topology, nc: NatsClient
 ) -> None:
     owner = await make_user(db)
     await make_zone(db, owner)
     unlucky = BatchProcessor(
-        db, UnreachableRelay(db, js), LiveRecorder(), owner="engine-test", stats=EngineStats()
+        db, UnreachableRelay(db, stream), LiveRecorder(), owner="engine-test", stats=EngineStats()
     )
     await unlucky.apply(PARTITION, TOKEN, [report(T0)])
     assert await outbox_rows(db) == 1  # committed with the alert, waiting for the sweeper
-    relay = OutboxRelay(db, js, sweep_min_age_s=0.0)
+    relay = OutboxRelay(db, stream, sweep_min_age_s=0.0)
     received: list[Msg] = []
 
     async def collect(msg: Msg) -> None:
@@ -465,11 +467,12 @@ async def test_an_alert_whose_publish_failed_is_swept_to_the_owner_exactly_once(
     assert json.loads(received[0].data)["data"]["kind"] == "enter"
 
 
-async def test_every_applied_report_is_kept_in_the_track_and_late_ones_are_not(
+async def test_every_report_is_kept_in_the_track_once_late_ones_included(
     processor: BatchProcessor, db: AsyncEngine
 ) -> None:
     await processor.apply(PARTITION, TOKEN, [report(T0), report(T0 + 1_000), report(T0 + 2_000)])
-    await processor.apply(PARTITION, TOKEN, [report(T0 + 500), report(T0 + 2_000)])  # late, replay
+    # buffered history uploaded late, and a redelivered report
+    await processor.apply(PARTITION, TOKEN, [report(T0 + 500), report(T0 + 2_000)])
     async with db.connect() as conn:
         stored: list[int] = list(
             (
@@ -481,4 +484,4 @@ async def test_every_applied_report_is_kept_in_the_track_and_late_ones_are_not(
                 )
             ).scalars()
         )
-    assert stored == [T0, T0 + 1_000, T0 + 2_000]
+    assert stored == [T0, T0 + 500, T0 + 1_000, T0 + 2_000]

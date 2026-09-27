@@ -84,6 +84,13 @@ def test_invalid_reports_are_rejected_individually_with_codes() -> None:
     assert batch.size == 6
 
 
+def test_a_device_id_with_a_trailing_newline_is_rejected() -> None:
+    # It would become the subject ``tlm.veh-1\n``, which the broker client refuses.
+    batch = body(as_json([report("veh-1\n"), report("veh-2")]))
+    assert [(r.index, r.code) for r in batch.rejected] == [(0, "invalid_device_id")]
+    assert [r.device_id for r in batch.records] == ["veh-2"]
+
+
 def test_a_non_object_report_is_an_invalid_report() -> None:
     batch = body(as_json([report(), 42]))
     assert [(r.index, r.code) for r in batch.rejected] == [(1, "invalid_report")]

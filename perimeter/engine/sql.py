@@ -70,11 +70,11 @@ PRESENCE = text(
     """
 ).bindparams(bindparam("device_ids", type_=_TEXTS))
 
-# FOR KEY SHARE holds off a concurrent DELETE of these zones until the batch commits (it does not
-# block renames, moves or deactivation), so every presence row and alert the batch writes still
-# has its zone at commit time. Checking existence with a subquery instead would only narrow that
-# race: the foreign key is checked against the latest committed state, not the statement's
-# snapshot.
+# FOR KEY SHARE holds off deleting or deactivating these zones until the batch commits (the API
+# takes a full row lock for those; renames and moves go ahead), so every presence row and alert the
+# batch writes still has its zone, active, at commit time. Checking existence with a subquery
+# instead would only narrow that race: the foreign key is checked against the latest committed
+# state, not the statement's snapshot.
 ZONE_RULES = text(
     """
     SELECT id, owner_id, name, is_active, notify_enter, notify_exit, dwell_s

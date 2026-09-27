@@ -351,7 +351,17 @@ class LiveHub:
             after=plan.after,
             replayed=replayed,
         )
-        await session.conn.wait_closing()
+        await self._until_closed_or_expired(session)
+
+    @staticmethod
+    async def _until_closed_or_expired(session: LiveSession) -> None:
+        """Serve until the socket closes; a socket must not outlive the token that opened it."""
+        left_s = session.principal.expires_at - now_ms() / 1000
+        try:
+            async with asyncio.timeout(max(0.0, left_s)):
+                await session.conn.wait_closing()
+        except TimeoutError:
+            session.close(CloseCode.SIGNED_OUT, "session expired: sign in again")
 
     async def _opening(self, session: LiveSession) -> tuple[int | None, ClientMessage | None]:
         """The resume point, and a first message that was not a resume (handled later)."""
@@ -438,6 +448,10 @@ class LiveHub:
     # --- client messages ---------------------------------------------------------------------
 
     async def _on_message(self, session: LiveSession, message: ClientMessage) -> None:
+        if self._sessions.get(session.sid) is not session:
+            # Torn down already (its reader may still hand over a message while the teardown
+            # awaits): nothing a closed session asks for may be set up again, or it would leak.
+            return
         match message:
             case Viewport():
                 self._set_viewport(session, message)

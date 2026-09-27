@@ -6,9 +6,9 @@ the part with the subtle rules small and exhaustively testable.
 
 Rules, per device, over reports in event-time order:
 
-* A report not newer than the last committed one is *late*. It is kept in the telemetry log (it
-  still draws the device's trail) but never changes presence or raises an alert: out-of-order and
-  redelivered messages are therefore harmless.
+* A report not newer than the last committed one is *late*. It is kept in the device's track (a
+  device that uploads buffered history still draws its trail) but never changes presence or
+  raises an alert: out-of-order and redelivered messages are therefore harmless.
 * Zones the device was in but the report is not in produce ``exit``; zones it is in but was not
   produce ``enter``; zones it stays in refresh ``last_seen`` and may produce a single ``dwell``
   once the stay lasts ``dwell_s`` seconds.
@@ -78,7 +78,7 @@ class Transition:
 class DeviceOutcome:
     device_id: str
     accepted: list[TelemetryRecord] = field(default_factory=list)
-    late: int = 0
+    late: list[TelemetryRecord] = field(default_factory=list)
     alerts: list[Transition] = field(default_factory=list)
     upserts: dict[UUID, Stay] = field(default_factory=dict)
     deletes: set[UUID] = field(default_factory=set)
@@ -95,7 +95,7 @@ class BatchOutcome:
 
     @property
     def late(self) -> int:
-        return sum(outcome.late for outcome in self.devices.values())
+        return sum(len(outcome.late) for outcome in self.devices.values())
 
     @property
     def accepted(self) -> int:
@@ -103,6 +103,10 @@ class BatchOutcome:
 
     def latest(self) -> list[TelemetryRecord]:
         return [o.latest for o in self.devices.values() if o.latest is not None]
+
+    def tracked(self) -> list[TelemetryRecord]:
+        """The reports for the device tracks: applied and late ones (a replay is stored once)."""
+        return [r for o in self.devices.values() for r in (*o.accepted, *o.late)]
 
     def alerts(self) -> list[Transition]:
         return [alert for o in self.devices.values() for alert in o.alerts]
@@ -150,7 +154,7 @@ def evaluate_device(
         record = obs.record
         at = record.recorded_at_ms
         if last is not None and at <= last:
-            outcome.late += 1
+            outcome.late.append(record)
             continue
         last = at
         outcome.accepted.append(record)
