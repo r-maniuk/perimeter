@@ -157,7 +157,8 @@ Found in code review:
    asynchronous JetStream publishing; after enough of them (an invalid subject, a closed
    connection, a full reconnect buffer) every publish would wait. Ingest and the outbox relay
    publish through a small `StreamPublisher` of their own that cleans up on every path, and a
-   device id can no longer end in a newline (`$` in a Python pattern allows one; `\z` does not).
+   device id can no longer end in a newline (`$` in a Python pattern allows one), whichever
+   validator checks it; the patterns published in the API reference mean the same in JavaScript.
 7. **The edge took shedding replicas out of rotation.** It counted any `503` as a failed replica, so
    ingest shedding would soon have taken every replica out, and sign-in and every REST call with
    them (§4).

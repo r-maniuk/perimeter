@@ -9,6 +9,8 @@ interface SessionState {
   user: User | null;
   /** Shown on the sign-in card after an involuntary sign-out. */
   notice: string | null;
+  /** How many times this tab has been signed out: each time gets a sign-in card of its own. */
+  signOuts: number;
   signedIn(user: User): void;
   signedOut(notice?: string | null): void;
 }
@@ -17,8 +19,10 @@ export const useSession = create<SessionState>()((set) => ({
   status: "checking",
   user: null,
   notice: null,
+  signOuts: 0,
   signedIn: (user) => set({ status: "signedIn", user, notice: null }),
-  signedOut: (notice = null) => set({ status: "signedOut", user: null, notice }),
+  signedOut: (notice = null) =>
+    set((s) => ({ status: "signedOut", user: null, notice, signOuts: s.signOuts + 1 })),
 }));
 
 const LAST_USER_KEY = "perimeter.lastUsername";

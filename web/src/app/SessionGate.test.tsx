@@ -148,3 +148,26 @@ describe("tabs of one browser", () => {
     }
   });
 });
+
+describe("the sign-in card", () => {
+  it("is ready again when a sign-out comes while the last card is still leaving", async () => {
+    // The card leaves with an animation, which waits while its tab is hidden: a sign-out made in
+    // another tab meanwhile brings the card back before it ever left.
+    const off = useSession.subscribe((now, before) => {
+      if (now.status === "signedIn" && before.status !== "signedIn") {
+        off();
+        useSession.getState().signedOut("You were signed out. Sign in again.");
+      }
+    });
+    openTab(null);
+    const username = await screen.findByLabelText("Username");
+    await userEvent.clear(username);
+    await userEvent.type(username, "grace{Enter}");
+    await waitFor(() => expect(api.signIn).toHaveBeenCalledWith("grace"));
+    await waitFor(() => expect(useSession.getState().status).toBe("signedOut"));
+    const button = await screen.findByRole("button", { name: /Continue/ });
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+    // The card that was signing in finishes leaving; only the fresh one stays.
+    await waitFor(() => expect(screen.queryByText("Signing in")).toBeNull(), { timeout: 3_000 });
+  });
+});

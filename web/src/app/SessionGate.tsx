@@ -29,6 +29,7 @@ function prefetchShell(): () => void {
 export function SessionGate() {
   const status = useSession((s) => s.status);
   const user = useSession((s) => s.user);
+  const signOuts = useSession((s) => s.signOuts);
 
   useEffect(() => {
     // Who the session cookie belongs to decides where this tab starts, and it keeps following it
@@ -51,7 +52,11 @@ export function SessionGate() {
   return (
     <>
       <MapStage signedIn={status === "signedIn"} />
-      <AnimatePresence>{status === "signedOut" && <SignIn key="sign-in" />}</AnimatePresence>
+      {/* A card of its own for every sign-out: one still leaving (its exit waits for a hidden tab
+          to be shown) would otherwise come back as it left, busy signing in for good. */}
+      <AnimatePresence>
+        {status === "signedOut" && <SignIn key={`sign-in-${signOuts}`} />}
+      </AnimatePresence>
       {status === "signedIn" && user && <Workspace key={user.id} user={user} />}
     </>
   );

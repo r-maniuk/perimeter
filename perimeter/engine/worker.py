@@ -41,6 +41,7 @@ from nats.aio.client import Client as NatsClient
 from nats.aio.msg import Msg
 from nats.aio.subscription import Subscription
 from nats.js import JetStreamContext
+from nats.js.client import DEFAULT_JS_SUB_PENDING_BYTES_LIMIT, DEFAULT_JS_SUB_PENDING_MSGS_LIMIT
 from nats.js.errors import NotFoundError
 
 from perimeter.bus.leases import FencingToken, Lease
@@ -151,7 +152,11 @@ class PartitionSubscription:
     @classmethod
     async def bind(cls, nc: NatsClient, partition: int) -> PartitionSubscription:
         """What ``pull_subscribe_bind`` does, keeping hold of the inbox subscription."""
-        inbox = await nc.subscribe(nc.new_inbox())
+        inbox = await nc.subscribe(
+            nc.new_inbox(),
+            pending_msgs_limit=DEFAULT_JS_SUB_PENDING_MSGS_LIMIT,
+            pending_bytes_limit=DEFAULT_JS_SUB_PENDING_BYTES_LIMIT,
+        )
         pull = JetStreamContext.PullSubscription(
             js=nc.jetstream(),
             sub=inbox,

@@ -380,7 +380,8 @@ Without uv, `pip install aiohttp` and `python3 generator.py …` works the same 
   frames with credit flow control (`--transport ws`); `--batch 1` sends a request per report.
   `Retry-After` pauses only the connection that got it.
 - **Observe mode:** `--observe NAME` signs in, creates demo zones (`--zones`, kept with
-  `--keep-zones`), watches the live channel and measures device-to-browser latency.
+  `--keep-zones`; the API's limit on zone changes is waited out), watches the live channel and
+  measures device-to-browser latency.
 - **A summary that balances:** every report ends accepted, rejected (by code) or dropped (by
   reason); `--json FILE` (`-` for standard output) writes it for scripts.
 
@@ -393,7 +394,7 @@ make lint typecheck
 cd web && npm ci && npm test
 ```
 
-798 Python tests (494 unit, 304 integration) with 94 % line and branch coverage, and 576 web
+830 Python tests (509 unit, 321 integration) with 94 % line and branch coverage, and 630 web
 tests; `mypy --strict`, Ruff, TypeScript and Biome are clean. Integration tests run against real
 PostgreSQL + PostGIS and NATS started by testcontainers (or services named by
 `TEST_DATABASE_URL` / `TEST_NATS_URL`).
