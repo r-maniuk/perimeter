@@ -1,12 +1,14 @@
 """Structured logging: JSON lines in production, readable console output in development.
 
 Standard-library loggers (uvicorn, alembic, nats) are routed through the same processors so every
-line of a container's output has the same shape.
+line of a container's output has the same shape. Credentials passed in URLs (``?token=`` of
+command-line WebSocket clients, which uvicorn logs with the request path) are redacted on the way.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from typing import Any
 
@@ -14,10 +16,21 @@ import msgspec
 import structlog
 
 _json = msgspec.json.Encoder(enc_hook=str)
+_CREDENTIAL_IN_URL = re.compile(r"([?&](?:token|access_token)=)[^&#\s\"']+")
 
 
 def _serialize(event: Any, **_: Any) -> str:
     return _json.encode(event).decode()
+
+
+def redact_credentials(
+    _: Any, __: str, event_dict: structlog.types.EventDict
+) -> structlog.types.EventDict:
+    """Replace the value of ``token=`` / ``access_token=`` query parameters in the message."""
+    event = event_dict.get("event")
+    if isinstance(event, str) and "token=" in event:
+        event_dict["event"] = _CREDENTIAL_IN_URL.sub(r"\1[redacted]", event)
+    return event_dict
 
 
 def configure_logging(*, service: str, level: str = "INFO", json: bool = True) -> None:
@@ -27,6 +40,7 @@ def configure_logging(*, service: str, level: str = "INFO", json: bool = True) -
         structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
+        redact_credentials,
     ]
     renderer: structlog.types.Processor
     if json:

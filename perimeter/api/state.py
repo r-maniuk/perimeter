@@ -10,6 +10,9 @@ from nats.aio.client import Client as NatsClient
 from nats.js import JetStreamContext
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from perimeter.api.live.hub import LiveHub
+from perimeter.api.live.ops import OpsBoard
+from perimeter.api.live.sessions import SessionRegistry
 from perimeter.api.security import RevocationList, TokenService
 from perimeter.bus.relay import OutboxRelay
 from perimeter.config import Settings
@@ -28,6 +31,10 @@ class AppState:
     tokens: TokenService
     revoked: RevocationList
     looplag: LoopLagMonitor
+    # --- live --- (set by the lifespan's live block, once the broker connection is up)
+    registry: SessionRegistry = field(init=False)
+    hub: LiveHub = field(init=False)
+    ops: OpsBoard = field(init=False)
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     tasks: list[asyncio.Task[None]] = field(default_factory=list)
 

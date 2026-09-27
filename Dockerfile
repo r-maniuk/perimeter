@@ -19,8 +19,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project --extra tracing --extra load
 COPY pyproject.toml uv.lock README.md ./
 COPY perimeter ./perimeter
+# Always rebuild the project's own wheel: uv keys cached builds of a local project on its
+# pyproject.toml, so the shared cache mount would otherwise serve a stale build of changed sources.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable --extra tracing --extra load
+    uv sync --frozen --no-dev --no-editable --extra tracing --extra load \
+        --reinstall-package perimeter
 
 FROM python:${PYTHON_VERSION}-slim-trixie AS runtime
 LABEL org.opencontainers.image.title="perimeter" \

@@ -43,8 +43,8 @@ def test_tile_frames_round_trip_within_quantisation(
     assert len(frame.points) == len(batch)
     for got, sent in zip(frame.points, batch, strict=True):
         assert got.device_id == sent.device_id
-        assert abs(got.lat - sent.lat) <= 5e-8
-        assert abs(got.lon - sent.lon) <= 5e-8
+        assert abs(got.lat - sent.lat) <= 5e-8 + 1e-12  # half a unit of 1e-7, plus float error
+        assert abs(got.lon - sent.lon) <= 5e-8 + 1e-12
         assert got.recorded_at_ms == sent.recorded_at_ms
         if sent.speed_mps is None:
             assert got.speed_mps is None
