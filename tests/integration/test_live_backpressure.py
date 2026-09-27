@@ -52,6 +52,9 @@ def area(lon: float, lat: float) -> tuple[float, float, float, float]:
     return lon - 0.01, lat - 0.005, lon + 0.01, lat + 0.005
 
 
+EVENTS_LIMIT = 2_000  # far past any lane and buffer, well inside what a resume replays
+
+
 def heavy_frame(lon: float, lat: float, points: int = 1_000) -> tuple[str, bytes]:
     tile = tiles.tile_for(lon, lat, 12)
     now = int(time.time() * 1000)
@@ -165,16 +168,23 @@ async def test_a_client_that_falls_behind_its_events_gets_4008_and_resumes_the_r
         conn = connection_of(replica, hello["session_id"])
         subject, frame = heavy_frame(*AMSTERDAM)
         await flood_until(nc, subject, frame, lambda: conn.positions_paused)  # socket stuck
+        # The lane holds 16 events, but how many more the socket's buffers still take depends on
+        # how far the kernel has grown them: events go out until the lane overflows.
         published = []
-        for n in range(24):
+        for n in range(EVENTS_LIMIT):
             event = make_event(EventType.ALERT, {"n": n})
             ack = await js.publish(
                 subjects.events(alice), encode_event(event), headers={"Nats-Msg-Id": event.id}
             )
             published.append(ack.seq)
-        await eventually(lambda: conn.closing)
+            if n % 8 == 7:
+                await asyncio.sleep(0.01)  # deliveries catch up
+                if conn.closing:
+                    break
+        await eventually(lambda: conn.closing, within=15)
         assert conn.close_code == 4008
-        assert await slow.closed(within=5) == 4008
+        # The client reads its backlog of stuck frames before it gets to the close.
+        assert await slow.closed(within=15) == 4008
         got = [frame["seq"] for frame in of_type(slow.backlog, "event")]
     last = got[-1] if got else hello["resume"]["after"]
     async with live_client(replica.ws(token, resume_after=last)) as again:
