@@ -61,7 +61,7 @@ _request_encoder = msgspec.json.Encoder()
 
 def feed_subject(user_id: uuid.UUID) -> str:
     """Everything live about one user: ``live.evt``, ``live.occ`` and ``live.ses``."""
-    return f"live.*.{user_id}"
+    return subjects.live_of_user(user_id)
 
 
 class EventStoreError(RuntimeError):

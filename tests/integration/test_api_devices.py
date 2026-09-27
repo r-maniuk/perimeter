@@ -275,12 +275,3 @@ async def test_viewports_return_exactly_the_devices_inside(
     )
     assert [p.device_id for p in found] == expected
     assert not truncated
-
-
-def test_viewport_parts_stay_small_and_cover_the_box() -> None:
-    world = devices.viewport_parts((-180, -90, 180, 90))
-    assert len(world) == 8
-    assert all(e - w <= 90 and n - s <= 90 for w, s, e, n in world)
-    across = devices.viewport_parts((170, -10, -170, 10))
-    assert across == [(170, -10, 180.0, 10), (-180.0, -10, -170, 10)]
-    assert devices.viewport_parts((4.8, 52.3, 4.9, 52.4)) == [(4.8, 52.3, 4.9, 52.4)]

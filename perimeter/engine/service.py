@@ -39,6 +39,7 @@ from perimeter.engine.coordinator import Coordinator
 from perimeter.engine.metrics import EngineStats, gauge_value, heartbeat_payload
 from perimeter.engine.tiles import TilePublisher
 from perimeter.engine.worker import Backoff, LeaseHandle, PartitionWorker, unacknowledged
+from perimeter.ops import tracing
 from perimeter.ops.heartbeat import Heartbeat, instance_id
 from perimeter.ops.looplag import LoopLagMonitor
 from perimeter.storage.engine import create_engine
@@ -112,6 +113,7 @@ class EngineService:
             application_name=f"perimeter-engine/{self.instance}",
             pool_size=pool_size(settings),
         )
+        tracing.instrument_database(self._db)
         try:
             self._nc = await connect(settings.nats, name=f"perimeter-engine/{self.instance}")
             js = self._nc.jetstream()

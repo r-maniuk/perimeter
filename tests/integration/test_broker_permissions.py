@@ -161,9 +161,7 @@ async def test_the_api_can_do_everything_it_needs(
         received.append(msg)
 
     for subject in (
-        "live.evt.u1",
-        "live.occ.*",
-        "live.ses.*",
+        subjects.live_of_user("u1"),  # exactly the api's per-user feed subscription
         "ctl.ses.*",
         "pos.>",
         "sys.metrics.>",

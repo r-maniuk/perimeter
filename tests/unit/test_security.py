@@ -8,9 +8,11 @@ from pydantic import SecretStr
 
 from perimeter.api.security import (
     AuthError,
+    SocketCredential,
     TokenService,
     ingest_token_valid,
     origin_allowed,
+    websocket_credential,
 )
 from perimeter.config import SecuritySettings
 
@@ -73,4 +75,15 @@ def test_origin_check_protects_cookie_authenticated_sockets() -> None:
     assert origin_allowed(_socket("http://localhost:8080/", cookie=True), allowed)
     assert not origin_allowed(_socket("https://evil.test", cookie=True), allowed)
     assert not origin_allowed(_socket(None, cookie=True), allowed)
-    assert origin_allowed(_socket(None, cookie=False), allowed)
+
+
+def test_explicit_tokens_win_over_the_ambient_cookie() -> None:
+    socket = _socket(None, cookie=True)
+    socket.query_params = {"token": "explicit"}
+    assert websocket_credential(socket) == SocketCredential("explicit", ambient=False)
+    cookie_only = _socket("http://localhost:8080", cookie=True)
+    cookie_only.query_params = {}
+    assert websocket_credential(cookie_only) == SocketCredential("t", ambient=True)
+    nothing = _socket(None, cookie=False)
+    nothing.query_params = {}
+    assert websocket_credential(nothing) is None

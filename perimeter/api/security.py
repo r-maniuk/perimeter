@@ -168,25 +168,34 @@ def request_token(request: Request) -> str | None:
     return _bearer(request.headers.get("authorization")) or request.cookies.get(COOKIE_NAME)
 
 
-def websocket_token(websocket: WebSocket) -> str | None:
-    """Cookie for browsers, ``?token=`` or a bearer header for command-line clients."""
-    return (
-        websocket.cookies.get(COOKIE_NAME)
-        or websocket.query_params.get("token")
-        or _bearer(websocket.headers.get("authorization"))
+@dataclass(frozen=True, slots=True)
+class SocketCredential:
+    token: str
+    ambient: bool
+    """True for a cookie: the browser attaches it whichever page opened the socket."""
+
+
+def websocket_credential(websocket: WebSocket) -> SocketCredential | None:
+    """The token a socket authenticates with.
+
+    An explicit ``?token=`` or bearer header wins: no other site can make a browser send it, so it
+    needs no origin check. The session cookie is ambient authority — it rides along with any
+    socket a page opens to us — so it only counts together with an allowed ``Origin``
+    (:func:`origin_allowed`), which is what stops cross-site WebSocket hijacking.
+    """
+    explicit = websocket.query_params.get("token") or _bearer(
+        websocket.headers.get("authorization")
     )
+    if explicit:
+        return SocketCredential(explicit, ambient=False)
+    cookie = websocket.cookies.get(COOKIE_NAME)
+    return SocketCredential(cookie, ambient=True) if cookie else None
 
 
 def origin_allowed(websocket: WebSocket, allowed: frozenset[str]) -> bool:
-    """Cross-site WebSocket hijacking guard for cookie-authenticated sockets.
-
-    Browsers always send ``Origin`` on WebSocket handshakes; non-browser clients (the generator,
-    tests) usually do not and authenticate with an explicit token instead.
-    """
+    """Whether the handshake comes from one of our own pages (browsers always send ``Origin``)."""
     origin = websocket.headers.get("origin")
-    if origin is None:
-        return websocket.cookies.get(COOKIE_NAME) is None
-    return origin.rstrip("/") in allowed
+    return origin is not None and origin.rstrip("/") in allowed
 
 
 def ingest_token_valid(presented: str | None, expected: str) -> bool:

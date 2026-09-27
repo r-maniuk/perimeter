@@ -242,6 +242,7 @@ async def test_sockets_without_valid_credentials_are_refused_with_4003(
         (replica.ws(forged), {}),  # signed with another key
         (replica.ws(), {"cookie": token, "origin": "https://evil.example"}),  # cross-site
         (replica.ws(), {"cookie": token}),  # a cookie without an Origin: not a browser
+        (replica.ws(token), {"origin": "https://evil.example"}),  # a page elsewhere, even with it
     ]
     for url, options in refused:
         async with live_client(url, **options) as client:
@@ -249,3 +250,6 @@ async def test_sockets_without_valid_credentials_are_refused_with_4003(
     async with live_client(replica.ws(), cookie=token, origin=TEST_ORIGIN) as browser:
         hello = await browser.expect("hello")
         assert hello["user"]["username"] == "alice"
+    # A command-line client that also kept the cookie: its explicit token decides.
+    async with live_client(replica.ws(token), cookie=token) as tool:
+        assert (await tool.expect("hello"))["user"]["username"] == "alice"

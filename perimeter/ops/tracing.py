@@ -12,6 +12,8 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any
 
 import structlog
+from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from perimeter.config import ObservabilitySettings
 
@@ -52,6 +54,27 @@ def configure(settings: ObservabilitySettings, *, service: str) -> bool:
 
 def enabled() -> bool:
     return _enabled
+
+
+def instrument_app(app: FastAPI) -> None:
+    """Server spans for every request (health and metrics probes excluded)."""
+    if _enabled:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor  # noqa: PLC0415
+
+        FastAPIInstrumentor.instrument_app(app, excluded_urls="healthz,readyz,metrics")
+
+
+def instrument_database(engine: AsyncEngine) -> None:
+    """Client spans for every SQL statement of this engine.
+
+    The instrumentation hooks SQLAlchemy's cursor events, which 2.1 keeps unchanged; its package
+    metadata simply predates 2.1, so the version gate is skipped deliberately (the spans are
+    checked end to end in the observability profile).
+    """
+    if _enabled:
+        from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor  # noqa: PLC0415
+
+        SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine, skip_dep_check=True)
 
 
 def inject(headers: MutableMapping[str, str]) -> MutableMapping[str, str]:

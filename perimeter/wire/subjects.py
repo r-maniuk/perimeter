@@ -75,6 +75,11 @@ def live_sessions(user_id: object) -> str:
     return f"live.ses.{user_id}"
 
 
+def live_of_user(user_id: object) -> str:
+    """One subscription for everything live of one user: events, pulses and session notices."""
+    return f"live.*.{user_id}"
+
+
 def session_control(session_id: str) -> str:
     return f"ctl.ses.{session_id}"
 

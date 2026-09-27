@@ -100,8 +100,8 @@ async def _stop_live(state: AppState) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
     instance = instance_id()
-    tracing.configure(settings.observability, service="api")
     db = create_engine(settings.database, application_name=f"perimeter-api/{instance}")
+    tracing.instrument_database(db)
     nc = await connect(settings.nats, name=f"perimeter-api/{instance}")
     js = nc.jetstream()
     state: AppState | None = None
@@ -173,6 +173,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/openapi.json",
     )
     app.state.settings = settings
+    tracing.configure(settings.observability, service="api")
+    tracing.instrument_app(app)  # middleware must exist before the app starts
     app.state.login_limiter = RateLimiter(rate_per_minute=settings.security.login_rate_per_minute)
     errors.install(app)
     app.add_middleware(BodyLimitMiddleware, max_bytes=settings.ingest.max_body_bytes)

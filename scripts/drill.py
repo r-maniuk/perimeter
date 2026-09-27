@@ -1,0 +1,240 @@
+"""Failure drill: kill a replica under load, then prove nothing was lost, duplicated or missed.
+
+The drill drives the running stack with ``generator.py`` through the edge (with an observer that
+creates demo zones and watches the live channel), kills one replica of ``--kill`` mid-run with
+SIGKILL, starts it again after ``--down`` seconds, lets the pipeline drain, and then checks:
+
+1. **no accepted report is lost**: the TELEMETRY stream grew by exactly the number of reports the
+   API acknowledged, and every engine consumer drained (nothing pending, nothing unacknowledged:
+   the engine acknowledges only after the batch committed);
+2. **no transition is doubled or dropped**: per device and zone, the stored alerts alternate
+   ``enter``/``exit`` and start with ``enter`` — a replayed or half-applied batch breaks that;
+3. **no alert is missed live**: the observer received exactly the alerts stored for its user, even
+   if the replica holding its socket died (it resumes by sequence).
+
+Run against a stack started with ``make up``::
+
+    uv run python scripts/drill.py --kill engine
+    uv run python scripts/drill.py --kill api --devices 10000 --duration 120
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+DRAIN_TIMEOUT_S = 120.0
+
+
+def compose(*args: str, input_text: str | None = None, check: bool = True) -> str:
+    result = subprocess.run(  # noqa: S603 - fixed program, arguments built here
+        ["docker", "compose", *args],  # noqa: S607 - docker is looked up on PATH on purpose
+        cwd=ROOT,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        msg = f"docker compose {' '.join(args)} failed: {result.stderr.strip()}"
+        raise RuntimeError(msg)
+    return result.stdout
+
+
+def docker(*args: str) -> str:
+    result = subprocess.run(  # noqa: S603
+        ["docker", *args],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def sql(query: str) -> list[list[str]]:
+    """Run a read-only query as the database superuser over the container's local socket."""
+    out = compose(
+        "exec", "-T", "db", "psql", "-U", "postgres", "-d", "perimeter", "-AtF", "\t", "-c", query
+    )
+    return [line.split("\t") for line in out.splitlines() if line]
+
+
+def jetstream() -> dict[str, Any]:
+    """Stream and consumer state from the broker's monitoring endpoint (internal only)."""
+    out = compose(
+        "exec",
+        "-T",
+        "nats",
+        "wget",
+        "-qO-",
+        "http://127.0.0.1:8222/jsz?accounts=true&streams=true&consumers=true",
+    )
+    report: dict[str, Any] = json.loads(out)
+    return report
+
+
+@dataclass(frozen=True, slots=True)
+class Telemetry:
+    last_seq: int
+    pending: int
+    unacked: int
+
+
+def telemetry_state() -> Telemetry:
+    for account in jetstream().get("account_details", []):
+        for stream in account.get("stream_detail", []):
+            if stream["name"] != "TELEMETRY":
+                continue
+            consumers = stream.get("consumer_detail", [])
+            return Telemetry(
+                last_seq=int(stream["state"]["last_seq"]),
+                pending=sum(int(c.get("num_pending", 0)) for c in consumers),
+                unacked=sum(int(c.get("num_ack_pending", 0)) for c in consumers),
+            )
+    msg = "the TELEMETRY stream was not found; is the stack running?"
+    raise RuntimeError(msg)
+
+
+def wait_drained(deadline_s: float) -> Telemetry:
+    until = time.monotonic() + deadline_s
+    while True:
+        state = telemetry_state()
+        if (state.pending == 0 and state.unacked == 0) or time.monotonic() > until:
+            return state
+        time.sleep(1.0)
+
+
+def alert_checks(username: str) -> dict[str, int]:
+    rows = sql(
+        f"""
+        WITH mine AS (
+            SELECT a.* FROM alerts a JOIN users u ON u.id = a.owner_id
+            WHERE u.username = '{username}'
+        ), ordered AS (
+            SELECT kind, lag(kind) OVER (
+                       PARTITION BY zone_id, zone_name, device_id ORDER BY occurred_at, id
+                   ) AS previous
+            FROM mine WHERE kind IN ('enter', 'exit')
+        )
+        SELECT (SELECT count(*) FROM mine),
+               (SELECT count(*) FROM ordered WHERE kind = previous),
+               (SELECT count(*) FROM ordered WHERE previous IS NULL AND kind = 'exit'),
+               (SELECT count(*) - count(DISTINCT (zone_name, device_id, kind, occurred_at))
+                FROM mine)
+        """  # noqa: S608 - the username is generated by this script
+    )
+    stored, repeated, orphan_exits, duplicates = (int(v) for v in rows[0])
+    return {
+        "stored": stored,
+        "repeated_transitions": repeated,
+        "exits_without_enter": orphan_exits,
+        "duplicates": duplicates,
+    }
+
+
+def takeover_seconds(service: str, killed_at: datetime) -> float | None:
+    """Seconds from the kill until the last partition was acquired by a surviving engine."""
+    if service != "engine":
+        return None
+    logs = compose(
+        "logs", "--no-color", "--no-log-prefix", "--since", killed_at.isoformat(), "engine"
+    )
+    stamps = [
+        datetime.fromisoformat(match.group(1))
+        for line in logs.splitlines()
+        if '"engine.partition_acquired"' in line
+        and (match := re.search(r'"timestamp":"([^"]+)"', line))
+    ]
+    return max((s - killed_at).total_seconds() for s in stamps) if stamps else None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--kill", choices=["engine", "api", "none"], default="engine")
+    parser.add_argument("--devices", type=int, default=10_000)
+    parser.add_argument("--interval", type=float, default=3.0)
+    parser.add_argument("--duration", type=float, default=90.0)
+    parser.add_argument("--at", type=float, default=35.0, help="seconds into the run to kill")
+    parser.add_argument("--down", type=float, default=15.0, help="seconds before restarting")
+    parser.add_argument("--zones", type=int, default=20)
+    parser.add_argument("--url", default=f"http://127.0.0.1:{os.environ.get('HTTP_PORT', '8080')}")
+    args = parser.parse_args()
+
+    username = f"drill-{int(time.time())}"
+    workdir = Path(tempfile.mkdtemp(prefix="perimeter-drill-"))
+    token_file = workdir / "ingest_token"
+    token_file.write_text(compose("exec", "-T", "api", "cat", "/run/secrets/ingest_token"))
+    token_file.chmod(0o600)
+    summary_file = workdir / "summary.json"
+    before = telemetry_state()
+
+    options = {
+        "--url": args.url,
+        "--token-file": str(token_file),
+        "--devices": str(args.devices),
+        "--interval": str(args.interval),
+        "--duration": str(args.duration),
+        "--observe": username,
+        "--zones": str(args.zones),
+        "--report-every": "15",
+        "--json": str(summary_file),
+    }
+    command = [sys.executable, str(ROOT / "generator.py")]
+    for flag, value in options.items():
+        command += [flag, value]
+    generator = subprocess.Popen(command, cwd=ROOT)  # noqa: S603
+    killed_at: datetime | None = None
+    victim = ""
+    if args.kill != "none":
+        time.sleep(args.at)
+        victim = compose("ps", "-q", args.kill).split()[0]
+        killed_at = datetime.now(UTC)
+        docker("kill", victim)
+        print(f"drill: killed {args.kill} container {victim[:12]} at {killed_at:%H:%M:%S}")
+        time.sleep(args.down)
+        docker("start", victim)
+        print(f"drill: started it again after {args.down:g} s")
+    generator.wait()
+    after = wait_drained(DRAIN_TIMEOUT_S)
+    summary = json.loads(summary_file.read_text())
+    accepted = int(summary["reports"]["accepted"])
+    observed = sum(summary.get("observe", {}).get("alerts", {}).values())
+    checks = alert_checks(username)
+    takeover = takeover_seconds(args.kill, killed_at) if killed_at else None
+
+    results = [
+        ("accepted reports stored once", after.last_seq - before.last_seq == accepted,
+         f"{accepted} accepted, stream grew by {after.last_seq - before.last_seq}"),
+        ("every stored report applied", after.pending == 0 and after.unacked == 0,
+         f"pending {after.pending}, unacknowledged {after.unacked}"),
+        ("transitions alternate", checks["repeated_transitions"] == 0,
+         f"{checks['repeated_transitions']} repeated"),
+        ("every exit follows an enter", checks["exits_without_enter"] == 0,
+         f"{checks['exits_without_enter']} orphan exits"),
+        ("no duplicate alerts", checks["duplicates"] == 0, f"{checks['duplicates']} duplicates"),
+        ("observer saw every stored alert", observed == checks["stored"],
+         f"{observed} received live, {checks['stored']} stored"),
+    ]  # fmt: skip
+    print()
+    print(f"drill ({args.kill}) ---------------------------------------------------------------")
+    for name, ok, detail in results:
+        print(f"  {'PASS' if ok else 'FAIL'}  {name:<34} {detail}")
+    if takeover is not None:
+        print(f"        takeover: last partition re-acquired {takeover:.1f} s after the kill")
+    print(f"        summary: {summary_file}")
+    return 0 if all(ok for _, ok, _ in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

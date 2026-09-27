@@ -12,7 +12,7 @@ COMPOSE ?= docker compose
 UV ?= uv
 ALL_PROFILES := --profile observability --profile load
 
-.PHONY: help up down destroy ps logs observe load smoke audit-broker ingest-token \
+.PHONY: help up down destroy ps logs observe load smoke drill audit-broker ingest-token \
 	test test-unit lint typecheck fmt web-dev
 
 help: ## Show this list
@@ -42,6 +42,9 @@ load: ## Drive 10,000 simulated devices through the edge (ARGS="--devices 20000 
 smoke: ## End-to-end check through the edge: sign-in, zone, ingest, live alert and position
 	$(COMPOSE) exec -T api cat /run/secrets/ingest_token \
 		| $(UV) run python scripts/smoke.py --base-url http://127.0.0.1:$(HTTP_PORT) --ingest-token-file -
+
+drill: ## Kill a replica under load, then prove no loss or duplicates (KILL=engine|api|none)
+	$(UV) run python scripts/drill.py --kill $(or $(KILL),engine) $(ARGS)
 
 audit-broker: ## Fail if the broker refused anything: any "Violation" in its log
 	@log="$$($(COMPOSE) logs --no-color nats)"; \

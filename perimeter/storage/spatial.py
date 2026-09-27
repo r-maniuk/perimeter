@@ -46,6 +46,9 @@ _DEVICES_IN_BBOX = text(
            recorded_at, speed_mps, heading_deg
     FROM devices
     WHERE position::geometry && ST_MakeEnvelope(:west, :south, :east, :north, 4326)
+      -- the index compares float4-rounded boxes (rounded outwards); decide the edge exactly
+      AND ST_X(position::geometry) BETWEEN :west AND :east
+      AND ST_Y(position::geometry) BETWEEN :south AND :north
       AND recorded_at > now() - make_interval(secs => :stale_s)
     ORDER BY device_id
     LIMIT :limit

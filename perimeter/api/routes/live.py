@@ -11,7 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter, WebSocket
 
 from perimeter.api.live.protocol import CloseCode
-from perimeter.api.security import AuthError, Principal, origin_allowed, websocket_token
+from perimeter.api.security import AuthError, Principal, origin_allowed, websocket_credential
 from perimeter.api.state import AppState, state_of
 
 router = APIRouter(tags=["live"])
@@ -19,13 +19,18 @@ router = APIRouter(tags=["live"])
 
 def _authenticate(websocket: WebSocket, state: AppState) -> Principal | str:
     """The principal, or why the socket is refused."""
-    if not origin_allowed(websocket, state.settings.security.origins):
-        return "origin not allowed"
-    token = websocket_token(websocket)
-    if token is None:
+    credential = websocket_credential(websocket)
+    if credential is None:
         return "sign in to continue"
+    # A browser always sends Origin: whatever the credential, a page elsewhere is refused. Without
+    # an Origin only an explicit token counts (a command-line client, not a page).
+    from_browser = websocket.headers.get("origin") is not None
+    if (credential.ambient or from_browser) and not origin_allowed(
+        websocket, state.settings.security.origins
+    ):
+        return "origin not allowed"
     try:
-        principal = state.tokens.verify(token)
+        principal = state.tokens.verify(credential.token)
     except AuthError as exc:
         return str(exc)
     if state.revoked.is_revoked(principal.token_id):
