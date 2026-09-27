@@ -13,7 +13,10 @@ docs
 tests
 # Images with other needs bring their own ignore file (infra/edge/Dockerfile.dockerignore).
 infra
-scripts
+# Only the end-to-end checks the image runs itself (make smoke).
+scripts/*
+!scripts/smoke.py
+!scripts/viewers.py
 web
 .env
 .secrets

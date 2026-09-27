@@ -7,9 +7,12 @@
  *   (4001 signed out, 4003 forbidden, 4008 resume now, 4009 too many sessions, 1013 overloaded);
  * - exactly-once events: `seq`/`prev` sequencing, `last_seq` persisted per tab, `resume_after` on
  *   every reconnect, a client-side gap check that reconnects to heal;
+ * - one account: a socket whose hello speaks for another user (the browser signed in as someone
+ *   else in another tab) is refused before any of that account's data is taken in;
  * - liveness: application ping/pong with a deadline (half-open sockets are detected and replaced),
- *   latency and server clock offset;
- * - re-sending the viewport and the ops subscription after every (re)connect and on `resync`;
+ *   checked at once when the tab wakes or the network returns, latency and server clock offset;
+ * - re-sending the viewport and the ops subscription after every (re)connect and on `resync`, and
+ *   otherwise sending a viewport only when it covers other tiles, a few times a second at most;
  * - resource hygiene: the socket is released while the tab stays hidden and resumed on return,
  *   and reconnection waits for the browser to report connectivity.
  */
@@ -22,8 +25,9 @@ import {
   type OpsFrame,
   type PulseFrame,
   ServerFrameSchema,
+  type User,
 } from "@/api/schemas";
-import { foldBBox } from "@/lib/tiles";
+import { foldBBox, tileSpan } from "@/lib/tiles";
 import { backoffDelay, DEFAULT_BACKOFF } from "./backoff";
 import { ClockSync } from "./clock";
 import { EventSequencer } from "./sequencer";
@@ -43,7 +47,23 @@ export const CloseCode = {
 const LOCAL_GAP = 4900;
 const LOCAL_DEAD = 4901;
 const LOCAL_NO_HELLO = 4902;
+const LOCAL_OTHER_ACCOUNT = 4903;
 const IMMEDIATE_RESUME_SPACING_MS = 5_000;
+/**
+ * Viewport messages go out at most this often. The server closes a socket that sends more than 20
+ * messages a second, and a camera following a device moves on every frame.
+ */
+const VIEWPORT_SPACING_MS = 250;
+/** The server's `LIVE_TILE_ZOOM` default, until `hello.tile_zoom` says otherwise. */
+const DEFAULT_TILE_ZOOM = 12;
+
+type Timer = ReturnType<typeof setTimeout>;
+
+/** Clear a pending timeout, if any; returns the `null` its holder resets to. */
+function cancel(timer: Timer | null): null {
+  if (timer) clearTimeout(timer);
+  return null;
+}
 
 export interface SocketLike {
   binaryType: BinaryType;
@@ -83,6 +103,8 @@ export type LiveEvent =
   | { type: "resync" }
   | { type: "ops"; frame: OpsFrame }
   | { type: "latency"; rttMs: number }
+  /** A hello announced another account than the client's: that socket was refused. */
+  | { type: "accountChanged"; user: User }
   | { type: "protocolError"; message: string };
 
 export interface SeqStore {
@@ -101,11 +123,23 @@ export interface LiveClientOptions {
   /** Absolute `ws(s)://…/v1/live` URL, without query. */
   url: string;
   seqStore: SeqStore;
+  /**
+   * The account the client streams for. Sockets authenticate with the browser's session cookie,
+   * which signing in elsewhere in the same browser replaces, so a hello may speak for someone
+   * else; such a socket is refused (and retried with back-off) rather than trusted.
+   */
+  userId?: string | null;
   createSocket?: (url: string) => SocketLike;
   environment?: Environment;
   random?: () => number;
   pingIntervalMs?: number;
   pongTimeoutMs?: number;
+  /**
+   * How long an open socket may take to answer the check made when the tab is shown again or the
+   * network comes back — the moments a socket most often died without a word (a laptop slept, a
+   * network changed under it).
+   */
+  probeTimeoutMs?: number;
   /** How long a hidden tab keeps its socket before releasing it. */
   hiddenGraceMs?: number;
   /** A connection that stayed up this long resets the back-off. */
@@ -154,18 +188,22 @@ export class LiveClient {
   #attempt = 0;
   #lastCode: number | null = null;
   #viewport: Viewport | null = null;
-  /** The viewport last sent on the current socket (re-sent only when it changed). */
+  /** The viewport last sent on the current socket, and when. */
   #sentViewport: Viewport | null = null;
+  #sentViewportAt = Number.NEGATIVE_INFINITY;
+  #viewportTimer: Timer | null = null;
+  #tileZoom = DEFAULT_TILE_ZOOM;
   #ops = false;
   #hello: HelloFrame | null = null;
   #replayUntilMs = 0;
-  #timers = new Set<ReturnType<typeof setTimeout>>();
-  #retryTimer: ReturnType<typeof setTimeout> | null = null;
-  #hiddenTimer: ReturnType<typeof setTimeout> | null = null;
+  // Every pending timer lives in one of these fields, so stopping clears them all.
+  #retryTimer: Timer | null = null;
+  #hiddenTimer: Timer | null = null;
   #pingTimer: ReturnType<typeof setInterval> | null = null;
-  #pongDeadline: ReturnType<typeof setTimeout> | null = null;
-  #stableTimer: ReturnType<typeof setTimeout> | null = null;
-  #helloDeadline: ReturnType<typeof setTimeout> | null = null;
+  #pongDeadline: Timer | null = null;
+  #pongDueAt = 0;
+  #stableTimer: Timer | null = null;
+  #helloDeadline: Timer | null = null;
   #lastImmediateAt = Number.NEGATIVE_INFINITY;
   #unsubscribe: (() => void)[] = [];
 
@@ -176,9 +214,11 @@ export class LiveClient {
       random: Math.random,
       pingIntervalMs: 15_000,
       pongTimeoutMs: 10_000,
+      probeTimeoutMs: 5_000,
       hiddenGraceMs: 120_000,
       stableAfterMs: 10_000,
       helloTimeoutMs: 10_000,
+      userId: null,
       ...options,
     };
     this.#sequencer = new EventSequencer(options.seqStore.get());
@@ -209,6 +249,9 @@ export class LiveClient {
       env.onVisibility((hidden) => this.#onVisibility(hidden)),
     );
     this.#connect();
+    // A tab opened in the background (or restored with the session) gets no visibility change
+    // until it is shown: it keeps its socket exactly as long as a tab hidden later would.
+    if (env.hidden()) this.#onVisibility(true);
   }
 
   /** Close for good (sign-out, unmount). */
@@ -230,12 +273,39 @@ export class LiveClient {
 
   setViewport(viewport: Viewport): void {
     this.#viewport = viewport;
+    this.#offerViewport();
+  }
+
+  /**
+   * Bring the server up to date with the latest viewport when that changes what it streams. The
+   * server derives nothing from a viewport but the tiles covering it, so a view still over the
+   * same leaf tiles needs no message; one that does waits out the spacing since the last one.
+   */
+  #offerViewport(): void {
+    const viewport = this.#viewport;
+    if (!viewport || this.#viewportTimer || this.#socket?.readyState !== 1) return;
+    const sent = this.#sentViewport;
+    if (sent && this.#span(sent) === this.#span(viewport)) return;
+    const wait = this.#sentViewportAt + VIEWPORT_SPACING_MS - Date.now();
+    if (wait > 0) {
+      this.#viewportTimer = setTimeout(() => {
+        this.#viewportTimer = null;
+        this.#offerViewport();
+      }, wait);
+      return;
+    }
     this.#sendViewport(viewport);
+  }
+
+  #span(viewport: Viewport): string {
+    const [west, south, east, north] = viewport.bbox;
+    return tileSpan({ west, south, east, north }, this.#tileZoom);
   }
 
   #sendViewport(viewport: Viewport): void {
     const socket = this.#socket;
     if (socket?.readyState !== 1) return;
+    this.#viewportTimer = cancel(this.#viewportTimer);
     // The map reports unwrapped longitudes once panned around the world; the protocol wants them
     // within ±540°, so they go out folded into the first world (the covered tiles are the same).
     const [west, south, east, north] = viewport.bbox;
@@ -243,6 +313,7 @@ export class LiveClient {
     const bbox = [box.west, box.south, box.east, box.north];
     socket.send(JSON.stringify({ type: "viewport", bbox, zoom: viewport.zoom }));
     this.#sentViewport = viewport;
+    this.#sentViewportAt = Date.now();
   }
 
   setOps(on: boolean): void {
@@ -254,10 +325,7 @@ export class LiveClient {
   /* ---------------------------------------------------------------- connection */
 
   #connect(): void {
-    if (this.#retryTimer) {
-      clearTimeout(this.#retryTimer);
-      this.#retryTimer = null;
-    }
+    this.#retryTimer = cancel(this.#retryTimer);
     if (!this.#options.environment.online()) {
       this.#setStatus({ state: "offline" });
       return;
@@ -276,6 +344,7 @@ export class LiveClient {
     socket.binaryType = "arraybuffer";
     this.#socket = socket;
     this.#sentViewport = null;
+    this.#sentViewportAt = Number.NEGATIVE_INFINITY;
     this.#setStatus({ state: "connecting", attempt: this.#attempt });
     socket.onopen = () => {
       // The viewport goes out as the very first message: the server then knows no resume request
@@ -291,7 +360,7 @@ export class LiveClient {
     socket.onerror = () => {
       // Errors are always followed by a close event, which carries the decision.
     };
-    this.#helloDeadline = this.#timer(() => {
+    this.#helloDeadline = setTimeout(() => {
       this.#helloDeadline = null;
       if (this.#socket !== socket || this.#hello) return;
       this.#dropSocket(LOCAL_NO_HELLO, "no hello");
@@ -304,8 +373,8 @@ export class LiveClient {
     this.#socket = null;
     this.#hello = null;
     this.#stopHeartbeat();
-    if (this.#helloDeadline) clearTimeout(this.#helloDeadline);
-    this.#helloDeadline = null;
+    this.#helloDeadline = cancel(this.#helloDeadline);
+    this.#viewportTimer = cancel(this.#viewportTimer);
     if (!socket) return;
     socket.onmessage = null;
     socket.onclose = null;
@@ -322,8 +391,8 @@ export class LiveClient {
     this.#socket = null;
     this.#hello = null;
     this.#stopHeartbeat();
-    if (this.#helloDeadline) clearTimeout(this.#helloDeadline);
-    this.#helloDeadline = null;
+    this.#helloDeadline = cancel(this.#helloDeadline);
+    this.#viewportTimer = cancel(this.#viewportTimer);
     this.#lastCode = code;
     switch (code) {
       case CloseCode.SignedOut:
@@ -370,7 +439,7 @@ export class LiveClient {
       retryAt: Date.now() + delay,
       lastCode: code,
     });
-    this.#retryTimer = this.#timer(() => {
+    this.#retryTimer = setTimeout(() => {
       this.#retryTimer = null;
       this.#connect();
     }, delay);
@@ -380,9 +449,11 @@ export class LiveClient {
     if (online && this.#status.state === "offline") {
       this.#attempt = 0;
       this.#connect();
-    } else if (!online && this.#status.state === "waiting") {
-      if (this.#retryTimer) clearTimeout(this.#retryTimer);
-      this.#retryTimer = null;
+    } else if (online) {
+      // The route may have changed under an open socket (another network, a VPN): check it.
+      this.#probe();
+    } else if (this.#status.state === "waiting") {
+      this.#retryTimer = cancel(this.#retryTimer);
       this.#setStatus({ state: "offline" });
     }
   }
@@ -390,24 +461,24 @@ export class LiveClient {
   #onVisibility(hidden: boolean): void {
     if (hidden) {
       if (this.#hiddenTimer) return;
-      this.#hiddenTimer = this.#timer(() => {
+      this.#hiddenTimer = setTimeout(() => {
         this.#hiddenTimer = null;
         if (this.#status.state === "stopped" || this.#status.state === "signedOut") return;
-        if (this.#retryTimer) clearTimeout(this.#retryTimer);
-        this.#retryTimer = null;
+        this.#retryTimer = cancel(this.#retryTimer);
         this.#dropSocket(CloseCode.Normal, "tab hidden");
         this.#setStatus({ state: "paused" });
       }, this.#options.hiddenGraceMs);
       return;
     }
-    if (this.#hiddenTimer) {
-      clearTimeout(this.#hiddenTimer);
-      this.#hiddenTimer = null;
-    }
+    this.#hiddenTimer = cancel(this.#hiddenTimer);
     if (this.#status.state === "paused") {
       this.#attempt = 0;
       this.#connect();
+      return;
     }
+    // Background tabs and sleeping machines barely run timers: the heartbeat may not have noticed
+    // a socket that died meanwhile, and the connection would pass for live until it did.
+    this.#probe();
   }
 
   /* ---------------------------------------------------------------- frames */
@@ -468,9 +539,18 @@ export class LiveClient {
   }
 
   #onHello(hello: HelloFrame): void {
+    const expected = this.#options.userId;
+    if (expected !== null && hello.user.id !== expected) {
+      // Nothing of the other account's stream is taken in, not even its sequence numbers, which
+      // would otherwise become this user's resume point. Its listeners find out who is signed in.
+      this.#dropSocket(LOCAL_OTHER_ACCOUNT, "another account");
+      this.#scheduleReconnect(LOCAL_OTHER_ACCOUNT);
+      this.#emit({ type: "accountChanged", user: hello.user });
+      return;
+    }
     this.#hello = hello;
-    if (this.#helloDeadline) clearTimeout(this.#helloDeadline);
-    this.#helloDeadline = null;
+    this.#tileZoom = hello.tile_zoom;
+    this.#helloDeadline = cancel(this.#helloDeadline);
     this.clock.hint(hello.server_time, Date.now());
     this.#replayUntilMs = hello.resume.mode === "replay" ? hello.server_time : 0;
     // `resume.after` is the sequence after which this socket's events continue — for a replay,
@@ -480,11 +560,12 @@ export class LiveClient {
     if (hello.resume.mode === "reset") this.#emit({ type: "reset" });
     this.#setStatus({ state: "open", since: Date.now(), resume: hello.resume.mode });
     this.#emit({ type: "hello", hello });
-    if (this.#viewport && this.#viewport !== this.#sentViewport) this.#sendViewport(this.#viewport);
+    // The view may have moved since the socket opened (or opened without one).
+    this.#offerViewport();
     if (this.#ops) this.#send({ type: "ops", on: true });
     this.#startHeartbeat();
-    if (this.#stableTimer) clearTimeout(this.#stableTimer);
-    this.#stableTimer = this.#timer(() => {
+    this.#stableTimer = cancel(this.#stableTimer);
+    this.#stableTimer = setTimeout(() => {
       this.#attempt = 0;
       this.#stableTimer = null;
     }, this.#options.stableAfterMs);
@@ -523,34 +604,42 @@ export class LiveClient {
 
   #stopHeartbeat(): void {
     if (this.#pingTimer) clearInterval(this.#pingTimer);
-    if (this.#pongDeadline) clearTimeout(this.#pongDeadline);
-    if (this.#stableTimer) clearTimeout(this.#stableTimer);
     this.#pingTimer = null;
-    this.#pongDeadline = null;
-    this.#stableTimer = null;
+    this.#pongDeadline = cancel(this.#pongDeadline);
+    this.#stableTimer = cancel(this.#stableTimer);
   }
 
-  #ping(): void {
+  /**
+   * Send a ping that must be answered within `timeoutMs`. Any pong clears the deadline, so one
+   * already running covers this ping too when it is the sooner of the two.
+   */
+  #ping(timeoutMs: number = this.#options.pongTimeoutMs): void {
     // Arm the deadline before sending, so an answer can never arrive ahead of it.
-    const armed = this.#pongDeadline === null;
+    const dueAt = Date.now() + timeoutMs;
+    const armed = this.#pongDeadline === null || dueAt < this.#pongDueAt;
     if (armed) {
-      this.#pongDeadline = this.#timer(() => {
+      this.#pongDeadline = cancel(this.#pongDeadline);
+      this.#pongDueAt = dueAt;
+      this.#pongDeadline = setTimeout(() => {
         this.#pongDeadline = null;
         // No answer: the socket is half-open (sleeping laptop, NAT timeout). Replace it.
         const socket = this.#socket;
         this.#dropSocket(LOCAL_DEAD, "no pong");
         if (socket) this.#scheduleReconnect(LOCAL_DEAD);
-      }, this.#options.pongTimeoutMs);
+      }, timeoutMs);
     }
-    if (!this.#send({ type: "ping", t: Date.now() }) && armed && this.#pongDeadline) {
-      clearTimeout(this.#pongDeadline);
-      this.#pongDeadline = null;
+    if (!this.#send({ type: "ping", t: Date.now() }) && armed) {
+      this.#pongDeadline = cancel(this.#pongDeadline);
     }
   }
 
+  /** Make an open socket prove it is alive, soon. */
+  #probe(): void {
+    if (this.#status.state === "open") this.#ping(this.#options.probeTimeoutMs);
+  }
+
   #onPong(sentAt: number, serverMs: number): void {
-    if (this.#pongDeadline) clearTimeout(this.#pongDeadline);
-    this.#pongDeadline = null;
+    this.#pongDeadline = cancel(this.#pongDeadline);
     const now = Date.now();
     if (Number.isFinite(serverMs)) this.clock.sample(sentAt, serverMs, now);
     this.#emit({ type: "latency", rttMs: Math.max(0, now - sentAt) });
@@ -580,20 +669,11 @@ export class LiveClient {
     }
   }
 
-  #timer(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
-    const handle = setTimeout(() => {
-      this.#timers.delete(handle);
-      fn();
-    }, ms);
-    this.#timers.add(handle);
-    return handle;
-  }
-
   #clearTimers(): void {
-    for (const handle of this.#timers) clearTimeout(handle);
-    this.#timers.clear();
-    this.#retryTimer = null;
-    this.#hiddenTimer = null;
+    this.#retryTimer = cancel(this.#retryTimer);
+    this.#hiddenTimer = cancel(this.#hiddenTimer);
+    this.#helloDeadline = cancel(this.#helloDeadline);
+    this.#viewportTimer = cancel(this.#viewportTimer);
     this.#stopHeartbeat();
   }
 

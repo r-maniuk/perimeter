@@ -1,6 +1,7 @@
 import { Activity, CircleAlert, CircleCheck, Cpu, Server } from "lucide-react";
 import type { ReactNode } from "react";
 import type { OpsFrame } from "@/api/schemas";
+import { useServerNow } from "@/features/fleet/useFleet";
 import { PanelFrame } from "@/features/shell/PanelFrame";
 import type { PanelProps } from "@/features/shell/panels";
 import { contrast, hexToRgba } from "@/lib/color";
@@ -58,6 +59,9 @@ export function OpsPanel({ onClose, titleId }: PanelProps) {
 
 function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, number[]> }) {
   const dark = useUi((s) => s.dark);
+  // Heartbeats are stamped by the servers' clocks: their age is measured on that timeline, so a
+  // browser whose clock is off does not show every healthy process as late.
+  const serverNow = useServerNow(1_000);
   const last = (key: string) => history[key]?.at(-1) ?? 0;
   const rate = (key: string) => formatRate(recentMean(history[key]));
   const state = admission(frame);
@@ -68,7 +72,7 @@ function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, 
     const slot = owners.engines.find((e) => e.instance === instance)?.slot ?? 99;
     return palette[slot] ?? (dark ? "#6b6a78" : "#9a98a8");
   };
-  const procs = instances(frame, Date.now() / 1000);
+  const procs = instances(frame, serverNow / 1000);
 
   return (
     <>

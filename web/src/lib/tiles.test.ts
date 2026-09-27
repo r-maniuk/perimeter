@@ -9,6 +9,7 @@ import {
   tileBounds,
   tileFor,
   tileOfQuadkey,
+  tileSpan,
 } from "./tiles";
 
 /**
@@ -66,6 +67,62 @@ describe("quadkeys", () => {
 
   it("refuses an empty tile budget", () => {
     expect(() => coveringQuadkeys({ west: 0, south: 0, east: 1, north: 1 }, 0, 12)).toThrow();
+  });
+});
+
+describe("tile spans", () => {
+  const amsterdam = { west: 4.79, south: 52.33, east: 4.99, north: 52.41 };
+
+  /** Deterministic pseudo-random numbers (mulberry32), so failures reproduce. */
+  function seeded(seed: number): () => number {
+    let a = seed;
+    return () => {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4_294_967_296;
+    };
+  }
+
+  it("stays the same while a view moves inside its leaf tiles, and changes when it leaves them", () => {
+    const nudged = { ...amsterdam, west: amsterdam.west + 1e-4, east: amsterdam.east + 1e-4 };
+    expect(tileSpan(nudged, 12)).toBe(tileSpan(amsterdam, 12));
+    const moved = { ...amsterdam, west: amsterdam.west + 0.1, east: amsterdam.east + 0.1 };
+    expect(tileSpan(moved, 12)).not.toBe(tileSpan(amsterdam, 12));
+  });
+
+  it("describes both sides of a view across the antimeridian, however it is unwrapped", () => {
+    const across = { west: 170, south: -20, east: 190, north: -10 };
+    expect(tileSpan(across, 4).split(" ")).toHaveLength(2);
+    expect(tileSpan(foldBBox(across), 4)).toBe(tileSpan(across, 4));
+    expect(tileSpan({ west: 530, south: -20, east: 550, north: -10 }, 4)).toBe(tileSpan(across, 4));
+  });
+
+  it("decides the server's cover for every tile budget", () => {
+    const random = seeded(7);
+    let equalSpans = 0;
+    for (let i = 0; i < 400; i++) {
+      // Views of many sizes, and a second view panned or zoomed a little from each.
+      const size = 10 ** (-3 + random() * 4.5);
+      const west = -180 + random() * 360;
+      const south = -70 + random() * 140;
+      const a = { west, south, east: west + size * 1.6, north: Math.min(85, south + size) };
+      const shift = size * (random() - 0.5) * 0.2;
+      const grow = 1 + (random() - 0.5) * 0.1;
+      const b = {
+        west: a.west + shift,
+        south: a.south + shift / 2,
+        east: a.west + shift + (a.east - a.west) * grow,
+        north: Math.min(85, a.south + shift / 2 + (a.north - a.south) * grow),
+      };
+      if (tileSpan(a, 12) !== tileSpan(b, 12)) continue;
+      equalSpans++;
+      for (const budget of [1, 4, 16, 64, 256]) {
+        expect(coveringQuadkeys(b, budget, 12)).toEqual(coveringQuadkeys(a, budget, 12));
+      }
+    }
+    // The comparison must actually have been exercised.
+    expect(equalSpans).toBeGreaterThan(50);
   });
 });
 

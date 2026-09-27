@@ -1,7 +1,10 @@
-# The edge image needs the dashboard sources and the Caddyfile, nothing else.
+# The edge image needs the dashboard sources, the API reference page and the Caddyfile, nothing
+# else.
 *
 !web/
 !infra/caddy/
+!infra/edge/docs/
+infra/edge/docs/node_modules
 web/node_modules
 web/dist
 web/coverage

@@ -18,7 +18,8 @@ import {
 import { FleetStore } from "@/fleet/store";
 import { hexToRgba, packRgba } from "@/lib/color";
 import { decodeBundleFrames, FrameError } from "@/lib/frames";
-import { coveringQuadkeys } from "@/lib/tiles";
+import { RecentSet } from "@/lib/recent";
+import { coveredBy, coveringQuadkeys, quadkey } from "@/lib/tiles";
 import { LiveClient, type LiveEvent, liveUrl, sessionSeqStore, type Viewport } from "@/live/client";
 import { mapController } from "@/map/controller";
 import { useAlerts } from "@/state/alerts";
@@ -38,6 +39,10 @@ const COUNTERS_MS = 1_000;
 const REPORTING_WINDOW_MS = 6_000;
 /** The server's `LIVE_MAX_VIEWPORT_TILES` default: the same cover of the viewport it streams. */
 const MAX_VIEWPORT_TILES = 16;
+/** Alerts remembered to recognise one delivered twice (a few minutes of a busy fleet). */
+const ALERT_MEMORY = 4_096;
+/** A zone's occupant list is read again at most this often while alerts keep arriving. */
+const OCCUPANTS_REFRESH_MS = 1_000;
 
 export class Runtime {
   readonly user: User;
@@ -48,14 +53,29 @@ export class Runtime {
   #timers: ReturnType<typeof setInterval>[] = [];
   #unsubscribe: (() => void)[] = [];
   #tileZoom = 12;
+  #viewport: Viewport | null = null;
+  /** The tile prefixes covering the viewport: what the server is asked to stream. */
+  #prefixes: string[] | null = null;
+  #cover: string | null = null;
   #animate = new Set<string>();
-  #zoneSignature = "";
+  /** What the map was last given to draw (nothing yet), and what the fleet tints devices with. */
+  #drawnZones: string | null = null;
+  #tintZones = "";
+  /** A zone event is being folded in: it syncs the map itself, once, with its animation. */
+  #holdZoneSync = false;
+  #occupantRefresh = new Map<string, { again: boolean; timer: ReturnType<typeof setTimeout> }>();
   #reporting = new Map<string, Map<string, number>>();
+  #alerts = new RecentSet<string>(ALERT_MEMORY);
+  #stopped = false;
 
   constructor(user: User, client: QueryClient) {
     this.user = user;
     this.#client = client;
-    this.live = new LiveClient({ url: liveUrl(), seqStore: sessionSeqStore(user.id) });
+    this.live = new LiveClient({
+      url: liveUrl(),
+      seqStore: sessionSeqStore(user.id),
+      userId: user.id,
+    });
     this.patcher = new ZonePatcher(
       client,
       { update: updateZone, get: (id) => getZone(id) },
@@ -105,22 +125,43 @@ export class Runtime {
   }
 
   stop(): void {
+    this.#stopped = true;
     for (const off of this.#unsubscribe.splice(0)) off();
     for (const timer of this.#timers.splice(0)) clearInterval(timer);
+    for (const { timer } of this.#occupantRefresh.values()) clearTimeout(timer);
+    this.#occupantRefresh.clear();
     this.live.stop();
     mapController.onViewport = null;
     mapController.detachFleet();
+    // The map outlives the session: the signed-out backdrop, or the next account's workspace,
+    // must not keep drawing this account's zones.
+    mapController.setZones([]);
     this.fleet.clear();
   }
 
   setViewport(viewport: Viewport): void {
+    this.#viewport = viewport;
     this.live.setViewport(viewport);
+    this.#retainCoverage();
+  }
+
+  /**
+   * Drop the devices the stream no longer covers. Only a change of cover can strand any: a device
+   * that drives out of it is never heard from again, so it still sits where the cover reaches.
+   */
+  #retainCoverage(): void {
+    const viewport = this.#viewport;
+    if (!viewport) return;
     const [west, south, east, north] = viewport.bbox;
     const prefixes = coveringQuadkeys(
       { west, south, east, north },
       MAX_VIEWPORT_TILES,
       this.#tileZoom,
     );
+    const cover = prefixes.join(" ");
+    if (cover === this.#cover) return;
+    this.#cover = cover;
+    this.#prefixes = prefixes;
     if (this.fleet.retainCoverage(prefixes) > 0) mapController.poke();
   }
 
@@ -136,6 +177,7 @@ export class Runtime {
         this.#onPositions(event.data);
         break;
       case "event":
+        useLive.getState().setLastSeq(event.seq);
         this.#onEvent(event.event, event.replayed);
         break;
       case "hello":
@@ -155,7 +197,7 @@ export class Runtime {
         this.#onOps(event.frame);
         break;
       case "latency":
-        useLive.getState().setLatency(event.rttMs);
+        useLive.getState().setLatency(event.rttMs, this.live.clock.offsetMs);
         break;
       case "status":
         useLive.getState().setStatus(event.status);
@@ -164,6 +206,9 @@ export class Runtime {
         } else if (event.status.state === "blocked" && event.status.code === 4003) {
           void this.#checkIdentity();
         }
+        break;
+      case "accountChanged":
+        void this.#checkIdentity();
         break;
       case "resync":
         break;
@@ -174,10 +219,24 @@ export class Runtime {
   }
 
   #onHello(hello: HelloFrame): void {
-    useLive.getState().setHello(hello.session_id, hello.replica);
+    useLive.getState().setHello({
+      sessionId: hello.session_id,
+      replica: hello.replica,
+      lastSeq: hello.resume.after,
+      clockOffsetMs: this.live.clock.offsetMs,
+    });
     if (hello.tile_zoom !== this.#tileZoom) {
       this.#tileZoom = hello.tile_zoom;
       this.fleet.setLeafZoom(hello.tile_zoom);
+      this.#cover = null;
+      this.#retainCoverage();
+    }
+    if (hello.resume.mode === "replay") {
+      // What happened while the tab was away is replayed as events, but the occupancy counts
+      // are re-read instead: the list may already include those arrivals and departures (after
+      // a reload it was fetched just now), so counting them again would count them twice.
+      void this.#client.invalidateQueries({ queryKey: ZONES_KEY }, { cancelRefetch: false });
+      void this.#client.invalidateQueries({ queryKey: ["occupants"] }, { cancelRefetch: false });
     }
   }
 
@@ -193,11 +252,23 @@ export class Runtime {
       throw error;
     }
     const serverNow = this.live.clock.now();
-    for (const frame of frames) this.fleet.applyFrame(frame, serverNow);
+    const prefixes = this.#prefixes;
+    for (const frame of frames) {
+      // Tiles the view has just left keep arriving until the server has read the new viewport;
+      // taking them in would leave devices behind that no update ever reaches again.
+      if (prefixes && !coveredBy(quadkey({ x: frame.x, y: frame.y, z: frame.zoom }), prefixes)) {
+        continue;
+      }
+      this.fleet.applyFrame(frame, serverNow);
+    }
     mapController.onPositions();
   }
 
   #onEvent(event: EventEnvelope, replayed: boolean): void {
+    // One alert can reach the tab twice under different sequence numbers: when the database is
+    // down longer than the broker's de-duplication window, the outbox publishes it again. Its
+    // event id (the alert's own id) gives it away.
+    if (event.type === "alert" && !this.#alerts.add(event.id)) return;
     if (replayed) useLive.getState().addAway(1);
     if (event.type === "alert") {
       const data = event.data;
@@ -211,22 +282,29 @@ export class Runtime {
       });
       const ui = useUi.getState();
       useAlerts.getState().receive(alert, { replayed, watching: ui.panel === "alerts" });
-      if (data.kind === "enter") bumpOccupancy(this.#client, data.zone.id, 1);
-      if (data.kind === "exit") bumpOccupancy(this.#client, data.zone.id, -1);
-      if (data.kind !== "dwell") {
-        void this.#client.invalidateQueries({ queryKey: ["occupants", data.zone.id] });
-      }
+      // Replayed arrivals and departures are in the counts re-read after the replay (see hello).
+      if (replayed || data.kind === "dwell") return;
+      bumpOccupancy(this.#client, data.zone.id, data.kind === "enter" ? 1 : -1);
+      this.#refreshOccupants(data.zone.id);
       return;
     }
     const change =
       event.type === "zone.deleted"
         ? ({ type: "zone.deleted", id: event.data.id } as const)
         : ({ type: event.type, zone: event.data } as const);
-    const changedElsewhere = applyZoneEvent(this.#client, change, (id) => this.patcher.overlay(id));
+    // The cache write inside would sync the map at once, before it is known whether the change
+    // came from elsewhere, and the map would take it without the animation that shows it.
+    this.#holdZoneSync = true;
+    let changedElsewhere: boolean;
+    try {
+      changedElsewhere = applyZoneEvent(this.#client, change, this.patcher);
+    } finally {
+      this.#holdZoneSync = false;
+    }
     if (changedElsewhere) {
       this.#animate.add(change.type === "zone.deleted" ? change.id : change.zone.id);
-      this.#syncZones();
     }
+    this.#syncZones();
     if (change.type === "zone.deleted") {
       const selection = useUi.getState().selection;
       if (selection?.kind === "zone" && selection.id === change.id) useUi.getState().select(null);
@@ -250,27 +328,59 @@ export class Runtime {
     useLive.getState().pushOps(frame, seriesOf(frame));
   }
 
+  /**
+   * Find out who this browser is signed in as now. The session may have ended, or another tab may
+   * have signed in as someone else (the session cookie is shared): this tab then follows that
+   * account instead of showing its data under the old name.
+   */
   async #checkIdentity(): Promise<void> {
+    let user: User | null;
     try {
-      const user = await currentUser();
-      if (!user) useSession.getState().signedOut("Your session has ended. Sign in again.");
+      user = await currentUser();
     } catch {
-      // The network is down; the connection state already says so.
+      // The network is down: the connection state already says so, and the next hello asks again.
+      return;
+    }
+    const session = useSession.getState();
+    if (this.#stopped) return;
+    if (!user) {
+      session.signedOut("Your session has ended. Sign in again.");
+    } else if (user.id !== this.user.id && session.user?.id !== user.id) {
+      session.signedIn(user);
+      notify({
+        tone: "info",
+        title: `Signed in as ${user.username}`,
+        body: "This browser switched accounts in another tab.",
+      });
     }
   }
 
   /* ---------------------------------------------------------------- zones */
 
+  /**
+   * Hand the zones to the map and the fleet when something they draw changed. The list changes far
+   * more often than that — every arrival and departure moves an occupancy count — and rebuilding
+   * every zone layer for a count nobody sees on the map would cost a full re-tile each time.
+   */
   #syncZones(): void {
+    if (this.#holdZoneSync) return;
     const zones = readZones(this.#client);
+    const drawn = zones
+      .map(
+        (z) =>
+          `${z.id}:${z.name}:${z.center.lat}:${z.center.lon}:${z.radius_m}:${z.color}:${z.is_active}`,
+      )
+      .join("|");
+    const animate = this.#animate;
+    if (drawn === this.#drawnZones && animate.size === 0) return;
+    this.#drawnZones = drawn;
+    this.#animate = new Set();
+    mapController.setZones(zones, animate);
     const signature = zones
       .map((z) => `${z.id}:${z.center.lat}:${z.center.lon}:${z.radius_m}:${z.color}:${z.is_active}`)
       .join("|");
-    const animate = this.#animate;
-    this.#animate = new Set();
-    mapController.setZones(zones, animate);
-    if (signature !== this.#zoneSignature) {
-      this.#zoneSignature = signature;
+    if (signature !== this.#tintZones) {
+      this.#tintZones = signature;
       this.fleet.setZones(
         zones.map((z: Zone) => ({
           id: z.id,
@@ -283,6 +393,31 @@ export class Runtime {
       );
       mapController.poke();
     }
+  }
+
+  /**
+   * Read a zone's occupants again after an arrival or departure: at once, then at most once a
+   * second while more keep coming. A read already on its way is let finish rather than restarted,
+   * or a steady stream of alerts would never let one complete.
+   */
+  #refreshOccupants(zoneId: string): void {
+    const pending = this.#occupantRefresh.get(zoneId);
+    if (pending) {
+      pending.again = true;
+      return;
+    }
+    void this.#client.invalidateQueries(
+      { queryKey: ["occupants", zoneId] },
+      { cancelRefetch: false },
+    );
+    const entry = {
+      again: false,
+      timer: setTimeout(() => {
+        this.#occupantRefresh.delete(zoneId);
+        if (entry.again) this.#refreshOccupants(zoneId);
+      }, OCCUPANTS_REFRESH_MS),
+    };
+    this.#occupantRefresh.set(zoneId, entry);
   }
 
   /* ---------------------------------------------------------------- counters */

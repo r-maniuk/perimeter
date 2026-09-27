@@ -14,9 +14,12 @@ const LatLon = v.looseObject({ lat: v.number(), lon: v.number() });
 export const UserSchema = v.looseObject({ id: Id, username: v.string() });
 export type User = v.InferOutput<typeof UserSchema>;
 
-/** The browser's session: its token lives in the HttpOnly cookie and never in a response body. */
+/**
+ * `POST /v1/session`: a browser sign-in. The token itself is only ever in the `HttpOnly` cookie,
+ * never in the body, so no script on the page can read it.
+ */
 export const SessionSchema = v.looseObject({
-  expires_at: v.union([v.string(), v.number()]),
+  expires_at: Timestamp,
   user: UserSchema,
 });
 export type SignInResult = v.InferOutput<typeof SessionSchema>;
@@ -87,6 +90,16 @@ const PointGeometry = v.looseObject({
   coordinates: v.tuple([v.number(), v.number()]),
 });
 
+/** One of the viewer's zones a device is inside (the engine's presence), newest arrival first. */
+export const DeviceZoneSchema = v.looseObject({
+  id: Id,
+  name: v.string(),
+  color: v.string(),
+  entered_at: Timestamp,
+  last_seen_at: Timestamp,
+});
+
+/** `GET /v1/devices/{id}`: the device's latest state and the viewer's zones it is in. */
 export const DeviceFeatureSchema = v.looseObject({
   type: v.literal("Feature"),
   id: v.optional(v.union([v.string(), v.number()])),
@@ -98,6 +111,7 @@ export const DeviceFeatureSchema = v.looseObject({
     speed_mps: v.optional(v.nullable(v.number())),
     heading_deg: v.optional(v.nullable(v.number())),
     accuracy_m: v.optional(v.nullable(v.number())),
+    zones: v.array(DeviceZoneSchema),
   }),
 });
 export type DeviceFeature = v.InferOutput<typeof DeviceFeatureSchema>;

@@ -6,6 +6,7 @@ import { DeviceTooltip } from "@/features/fleet/DeviceTooltip";
 import { DraftLabel } from "@/features/zones/DraftLabel";
 import { useZones } from "@/features/zones/useZones";
 import { DESKTOP, useMediaQuery } from "@/lib/useMediaQuery";
+import { mapController } from "@/map/controller";
 import { useAlerts } from "@/state/alerts";
 import { type Panel, useUi } from "@/state/ui";
 import { AwayNotice } from "./AwayNotice";
@@ -84,8 +85,13 @@ export function Shell() {
         ui.togglePanel(panelKey);
         return;
       }
-      if (key === "d" || key === "n") ui.setDrawing(!ui.drawing);
-      else if (key === "t") ui.setTheme(ui.dark ? "light" : "dark");
+      if (key === "d" || key === "n") {
+        const drawing = !ui.drawing;
+        ui.setDrawing(drawing);
+        // Drawn from the keyboard, the zone goes where the map is: arrow keys move the map and
+        // Enter places the zone at its centre.
+        if (drawing) mapController.focus();
+      } else if (key === "t") ui.setTheme(ui.dark ? "light" : "dark");
       else if (key === "l" && ui.selection?.kind === "device") {
         ui.follow(ui.followId === ui.selection.id ? null : ui.selection.id);
       }

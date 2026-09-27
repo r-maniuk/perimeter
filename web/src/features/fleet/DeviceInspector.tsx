@@ -4,6 +4,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { deviceTrail, getDevice } from "@/api/endpoints";
 import { describeError, isApiError } from "@/api/http";
 import { PanelFrame } from "@/features/shell/PanelFrame";
+import { zonesContaining } from "@/features/zones/model";
 import { useZones } from "@/features/zones/useZones";
 import {
   compassPoint,
@@ -27,6 +28,12 @@ import { useFleetDevice, useServerNow } from "./useFleet";
 const TRAIL_WINDOWS = [5, 15, 30] as const; // tracks are kept 30 minutes (TRACK_RETENTION_MIN)
 const STALE_S = 60;
 
+interface ZoneTag {
+  id: string;
+  name: string;
+  color: string;
+}
+
 export function DeviceInspector({ id, onClose }: { id: string; onClose: () => void }) {
   const live = useFleetDevice(id);
   const now = useServerNow();
@@ -48,7 +55,6 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
         recordedAt: live.recordedAt,
         speedMps: live.speedMps,
         headingDeg: live.headingDeg,
-        zoneId: live.zoneId,
         moving: live.moving,
       }
     : fallback.data
@@ -58,10 +64,14 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
           recordedAt: fallback.data.recordedAt ?? 0,
           speedMps: fallback.data.speedMps,
           headingDeg: fallback.data.headingDeg,
-          zoneId: null,
           moving: (fallback.data.speedMps ?? 0) >= 0.5,
         }
       : null;
+  // A streamed device is placed against the zones as they are drawn; one outside the view as the
+  // server last decided (its zones as shown now, where this tab has them).
+  const inside: ZoneTag[] = live
+    ? zonesContaining(zones ?? [], live.lat, live.lon)
+    : (fallback.data?.zones ?? []).map((tag) => zones?.find((z) => z.id === tag.id) ?? tag);
 
   const trail = useQuery({
     queryKey: ["trail", id, minutes],
@@ -75,7 +85,6 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
   }, [trail.data, id]);
   useEffect(() => () => mapController.clearTrail(), []);
 
-  const zone = device?.zoneId ? zones?.find((z) => z.id === device.zoneId) : undefined;
   const ageS = device ? (now - device.recordedAt) / 1000 : 0;
   const stale = ageS > STALE_S;
   const status = !device ? "Unknown" : stale ? "Stale" : device.moving ? "Moving" : "Stationary";
@@ -154,19 +163,33 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
             </Tile>
           </div>
           <div className="mt-2 rounded-2xl bg-surface-2/70 px-3.5 py-3 ring-1 ring-line ring-inset">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-[12px] text-muted">Zone</span>
-              {zone ? (
-                <button
-                  type="button"
-                  onClick={() => useUi.getState().select({ kind: "zone", id: zone.id })}
-                  className="flex items-center gap-1.5 rounded-md px-1.5 py-0.5 font-medium text-[13px] text-ink hover:bg-surface-3"
+            <div className="flex items-start justify-between gap-2">
+              <span className="py-0.5 text-[12px] text-muted">
+                {inside.length > 1 ? "Zones" : "Zone"}
+              </span>
+              {inside.length > 0 ? (
+                <ul
+                  aria-label="Zones the device is in"
+                  className="flex min-w-0 flex-wrap justify-end gap-x-1 gap-y-0.5"
                 >
-                  <span className="size-2.5 rounded-full" style={{ background: zone.color }} />
-                  {zone.name}
-                </button>
+                  {inside.map((zone) => (
+                    <li key={zone.id} className="min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => useUi.getState().select({ kind: "zone", id: zone.id })}
+                        className="flex max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 font-medium text-[13px] text-ink hover:bg-surface-3"
+                      >
+                        <span
+                          className="size-2.5 shrink-0 rounded-full"
+                          style={{ background: zone.color }}
+                        />
+                        <span className="truncate">{zone.name}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
               ) : (
-                <span className="text-[13px] text-ink-2">Outside all zones</span>
+                <span className="py-0.5 text-[13px] text-ink-2">Outside all zones</span>
               )}
             </div>
             <div className="mt-2.5 flex items-center justify-between gap-2 border-line border-t pt-2.5">

@@ -262,6 +262,27 @@
   cursor: grabbing;
 }
 
+/* Focused from the keyboard (arrow keys nudge it): the accent ring every focused control wears. */
+.zone-handle:focus-visible {
+  outline: none;
+}
+
+.zone-handle:focus-visible::after {
+  transform: scale(1.25);
+  box-shadow:
+    0 0 0 2.5px var(--handle-color),
+    0 0 0 4.5px var(--surface-solid),
+    0 0 0 6.5px var(--accent),
+    0 2px 10px rgb(0 0 0 / 0.28);
+}
+
+.zone-handle--center:focus-visible::after {
+  box-shadow:
+    0 0 0 3px var(--surface-solid),
+    0 0 0 5px var(--accent),
+    0 2px 10px rgb(0 0 0 / 0.3);
+}
+
 /* ---- MapLibre chrome, restyled to match -------------------------------------------------- */
 
 .maplibregl-map {

@@ -2,7 +2,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RadiusField, ZoneNameField } from "./fields";
+import { CoordinateField, RadiusField, ZoneNameField } from "./fields";
 
 afterEach(cleanup);
 
@@ -86,6 +86,89 @@ describe("radius field", () => {
     await user.clear(input);
     await user.type(input, "2{Enter}");
     expect(onCommit).toHaveBeenLastCalledWith(10);
+  });
+});
+
+const DAM = { lat: 52.3731, lon: 4.8926 };
+
+function coordinateFields(center = DAM) {
+  const onCommit = vi.fn();
+  const fields = (at: { lat: number; lon: number }) => (
+    <>
+      <CoordinateField axis="lat" center={at} onCommit={onCommit} />
+      <CoordinateField axis="lon" center={at} onCommit={onCommit} />
+    </>
+  );
+  const view = render(fields(center));
+  const lat = screen.getByRole("textbox", { name: "Centre latitude" }) as HTMLInputElement;
+  const lon = screen.getByRole("textbox", { name: "Centre longitude" }) as HTMLInputElement;
+  return { onCommit, lat, lon, rerender: (at: typeof DAM) => view.rerender(fields(at)) };
+}
+
+describe("centre fields", () => {
+  it("shows the centre to six decimals and moves it by one coordinate on Enter", async () => {
+    const user = userEvent.setup();
+    const { onCommit, lat, lon } = coordinateFields();
+    expect([lat.value, lon.value]).toEqual(["52.373100", "4.892600"]);
+    await user.clear(lat);
+    await user.type(lat, "52,38{Enter}");
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    expect(onCommit).toHaveBeenCalledWith({ lat: 52.38, lon: 4.8926 });
+    expect(lat.value).toBe("52.380000");
+    await user.tab();
+    expect(onCommit).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads hemispheres, and moves both coordinates when a pair is pasted", async () => {
+    const user = userEvent.setup();
+    const { onCommit, lat, lon } = coordinateFields();
+    await user.clear(lon);
+    await user.type(lon, "74.006 W{Enter}");
+    expect(onCommit).toHaveBeenLastCalledWith({ lat: 52.3731, lon: -74.006 });
+    await user.clear(lat);
+    await user.click(lat);
+    await user.paste("40.712800, -74.006000");
+    await user.keyboard("{Enter}");
+    expect(onCommit).toHaveBeenLastCalledWith({ lat: 40.7128, lon: -74.006 });
+  });
+
+  it("flags what it cannot read or what lies off the globe, and restores the centre when left", async () => {
+    const user = userEvent.setup();
+    const { onCommit, lat } = coordinateFields();
+    for (const text of ["north", "91", "4.9 E"]) {
+      await user.clear(lat);
+      await user.type(lat, `${text}{Enter}`);
+      expect(lat.getAttribute("aria-invalid")).toBe("true");
+    }
+    await user.tab();
+    expect(lat.value).toBe("52.373100");
+    expect(lat.getAttribute("aria-invalid")).toBeNull();
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("puts the centre back on Escape, and sends nothing for a value it already has", async () => {
+    const user = userEvent.setup();
+    const { onCommit, lat, lon } = coordinateFields();
+    await user.clear(lat);
+    await user.type(lat, "10{Escape}");
+    expect(lat.value).toBe("52.373100");
+    await user.clear(lon);
+    await user.type(lon, "4.8926000{Enter}");
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("follows the zone while it holds no edit, and keeps a pending edit when it moves", async () => {
+    const user = userEvent.setup();
+    const { onCommit, lat, lon, rerender } = coordinateFields();
+    await user.click(lat);
+    rerender({ lat: 52.36, lon: 4.9 });
+    expect([lat.value, lon.value]).toEqual(["52.360000", "4.900000"]);
+    await user.clear(lat);
+    await user.type(lat, "52.35");
+    rerender({ lat: 52.37, lon: 4.91 });
+    expect(lat.value).toBe("52.35");
+    await user.tab();
+    expect(onCommit).toHaveBeenCalledWith({ lat: 52.35, lon: 4.91 });
   });
 });
 

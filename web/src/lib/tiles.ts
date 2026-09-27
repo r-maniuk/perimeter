@@ -151,6 +151,22 @@ export function coveringQuadkeys(bbox: BBox, maxTiles: number, maxZoom: number):
 }
 
 /**
+ * The tiles at `zoom` under `bbox` as a comparable key: one range of columns and rows per side of
+ * the antimeridian. The ranges at every coarser zoom follow from these, so two boxes with the same
+ * span get the same cover from {@link coveringQuadkeys} with `maxZoom = zoom`, whatever the tile
+ * budget — a viewport only needs to reach the server again when its span changes.
+ */
+export function tileSpan(bbox: BBox, zoom: number): string {
+  return splitAntimeridian(bbox)
+    .map((part) => {
+      const topLeft = tileFor(part.west, part.north, zoom);
+      const bottomRight = tileFor(part.east, part.south, zoom);
+      return `${topLeft.x}-${bottomRight.x}/${topLeft.y}-${bottomRight.y}`;
+    })
+    .join(" ");
+}
+
+/**
  * Membership test against a set of prefixes: is the leaf tile `key` at or below one of them?
  * Prefix sets are small (≤ the server's viewport tile budget), so a linear scan is fastest.
  */

@@ -18,6 +18,8 @@ const GROUPS: { title: string; keys: [string[], string][] }[] = [
     title: "Map",
     keys: [
       [["D"], "Draw a zone"],
+      [["D", "Enter"], "Draw at the map centre"],
+      [["←↑↓→"], "Nudge a zone handle"],
       [["L"], "Follow the selected device"],
       [["Esc"], "Cancel · deselect · close"],
       [["Shift", "drag"], "Zoom to a box"],

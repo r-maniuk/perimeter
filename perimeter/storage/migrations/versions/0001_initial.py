@@ -60,9 +60,10 @@ COMMENT ON FUNCTION perimeter_envelope(geography, double precision) IS
 """
 
 # Device tracks live in 10-minute range partitions; this function keeps the window rolling: it
-# creates the slots from `retention` ago to `ahead` from now and drops the slots that ended before
-# the retention window (a DROP, not millions of DELETEs). It runs as the schema owner (SECURITY
-# DEFINER), so the services can keep the partitions current without any DDL rights of their own.
+# drops the slots that ended before the retention window (a DROP, not millions of DELETEs) and
+# attaches the slots from `retention` ago to `ahead` from now, moving in any rows the default
+# partition took while a slot was missing. It runs as the schema owner (SECURITY DEFINER), so the
+# services can keep the partitions current without any DDL rights of their own.
 TRACKS_FUNCTION = r"""
 CREATE FUNCTION perimeter_maintain_tracks(
     retention interval, ahead interval DEFAULT interval '20 minutes'

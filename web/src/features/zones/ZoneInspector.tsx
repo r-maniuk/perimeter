@@ -13,6 +13,7 @@ import {
   formatDistance,
   formatDuration,
 } from "@/lib/format";
+import { DESKTOP, useMediaQuery } from "@/lib/useMediaQuery";
 import { useNow } from "@/lib/useNow";
 import { mapController } from "@/map/controller";
 import { useLive } from "@/state/live";
@@ -26,7 +27,7 @@ import { SectionLabel } from "@/ui/SectionLabel";
 import { Slider } from "@/ui/Slider";
 import { Switch } from "@/ui/Switch";
 import { deleteZone } from "./actions";
-import { RadiusField, ZoneNameField } from "./fields";
+import { CoordinateField, RadiusField, ZoneNameField } from "./fields";
 import {
   clampRadius,
   DWELL_PRESETS,
@@ -56,6 +57,7 @@ export function ZoneInspector({ zone, onClose }: { zone: Zone; onClose: () => vo
   const liveRadius = sliderRadius ?? editing?.radiusM ?? zone.radius_m;
   const liveCenter = editing?.center ?? zone.center;
   const now = useNow(5_000);
+  const desktop = useMediaQuery(DESKTOP);
 
   return (
     <PanelFrame
@@ -121,12 +123,28 @@ export function ZoneInspector({ zone, onClose }: { zone: Zone; onClose: () => vo
             <span>100 km</span>
           </div>
         </div>
-        <div className="mt-3 flex items-center justify-between gap-2 border-line border-t pt-3">
-          <span className="text-[12px] text-muted">Centre</span>
-          <CopyCoordinates lat={liveCenter.lat} lon={liveCenter.lon} />
+        <div className="mt-3 border-line border-t pt-3">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-medium text-[13px] text-ink">Centre</span>
+            <CopyCoordinates lat={liveCenter.lat} lon={liveCenter.lon} />
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <CoordinateField
+              axis="lat"
+              center={liveCenter}
+              onCommit={(center) => patch(zone, { center })}
+            />
+            <CoordinateField
+              axis="lon"
+              center={liveCenter}
+              onCommit={(center) => patch(zone, { center })}
+            />
+          </div>
         </div>
         <p className="mt-2 text-[11.5px] text-muted leading-relaxed">
-          Drag the centre or the edge handle on the map to reshape it.
+          {desktop
+            ? "Drag the centre or the edge handle on the map, or focus one and nudge it with the arrow keys (hold Shift for bigger steps)."
+            : "Drag the centre or the edge handle on the map to reshape it."}
         </p>
       </div>
 
@@ -412,15 +430,11 @@ function CopyCoordinates({ lat, lon }: { lat: number; lon: number }) {
           setTimeout(() => setCopied(false), 1_400);
         });
       }}
-      className="flex items-center gap-1.5 rounded-md px-1.5 py-0.5 font-mono text-[11.5px] text-ink-2 hover:bg-surface-3"
-      aria-label="Copy centre coordinates"
+      className="flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[11.5px] text-muted hover:bg-surface-3 hover:text-ink"
+      aria-label={`Copy centre coordinates, ${formatCoordinate(lat, lon)}`}
     >
-      {formatCoordinate(lat, lon)}
-      {copied ? (
-        <Check className="size-3.5 text-enter" />
-      ) : (
-        <Copy className="size-3.5 text-muted" />
-      )}
+      {copied ? "Copied" : "Copy"}
+      {copied ? <Check className="size-3.5 text-enter" /> : <Copy className="size-3.5" />}
     </button>
   );
 }

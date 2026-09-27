@@ -78,9 +78,8 @@ function ConnectionFacts() {
   const latency = useLive((s) => s.latencyMs);
   const sessionId = useLive((s) => s.sessionId);
   const replica = useLive((s) => s.replica);
-  const runtime = getRuntime();
-  const lastSeq = runtime?.live.lastSeq ?? null;
-  const offset = runtime?.live.clock.offsetMs ?? 0;
+  const lastSeq = useLive((s) => s.lastSeq);
+  const offset = useLive((s) => s.clockOffsetMs);
   const rows: [string, string][] = [
     ["Round trip", latency === null ? "–" : formatMs(latency)],
     ["Last event", lastSeq === null ? "none yet" : `#${lastSeq}`],

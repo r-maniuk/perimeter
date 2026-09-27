@@ -177,6 +177,8 @@ export interface DeviceState {
   speedMps: number | null;
   headingDeg: number | null;
   accuracyM: number | null;
+  /** The viewer's zones the device is inside right now, as the engine last decided. */
+  zones: { id: string; name: string; color: string; enteredAt: number }[];
 }
 
 export async function getDevice(id: string, signal?: AbortSignal): Promise<DeviceState> {
@@ -193,6 +195,12 @@ export async function getDevice(id: string, signal?: AbortSignal): Promise<Devic
     speedMps: p.speed_mps ?? null,
     headingDeg: p.heading_deg ?? null,
     accuracyM: p.accuracy_m ?? null,
+    zones: p.zones.map((zone) => ({
+      id: zone.id,
+      name: zone.name,
+      color: zone.color,
+      enteredAt: Date.parse(zone.entered_at),
+    })),
   };
 }
 

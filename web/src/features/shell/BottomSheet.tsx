@@ -211,11 +211,17 @@ export function BottomSheet() {
               : "Workspace"}
         </div>
         <div className="min-h-0 flex-1 border-line border-t">
+          {/* Keyed by what is selected, like the desktop inspector: a half-typed field, an open
+              dwell picker or a trail window belongs to one zone or device, not the next. */}
           {showSelection ? (
             selection?.kind === "zone" && zone ? (
-              <ZoneInspector zone={zone} onClose={closeContent} />
+              <ZoneInspector key={`zone:${zone.id}`} zone={zone} onClose={closeContent} />
             ) : selection?.kind === "device" ? (
-              <DeviceInspector id={selection.id} onClose={closeContent} />
+              <DeviceInspector
+                key={`device:${selection.id}`}
+                id={selection.id}
+                onClose={closeContent}
+              />
             ) : null
           ) : View ? (
             <View onClose={closeContent} />

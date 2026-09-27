@@ -14,6 +14,10 @@ export interface OpsSample {
 interface LiveState {
   status: LiveStatus;
   latencyMs: number | null;
+  /** How far the server's clock is ahead of this browser's. */
+  clockOffsetMs: number;
+  /** Sequence number of the last event this tab has (`hello.resume.after` until one arrives). */
+  lastSeq: number | null;
   sessionId: string | null;
   replica: string | null;
   /** Events replayed after a reconnect, shown as "N events while you were away". */
@@ -25,8 +29,14 @@ interface LiveState {
   /** Devices that reported from inside each zone during the last few seconds. */
   reporting: Record<string, number>;
   setStatus(status: LiveStatus): void;
-  setLatency(ms: number): void;
-  setHello(sessionId: string, replica: string | null): void;
+  setLatency(ms: number, clockOffsetMs: number): void;
+  setHello(hello: {
+    sessionId: string;
+    replica: string | null;
+    lastSeq: number;
+    clockOffsetMs: number;
+  }): void;
+  setLastSeq(seq: number): void;
   addAway(count: number): void;
   clearAway(): void;
   pushOps(frame: OpsFrame, series: Record<string, number>): void;
@@ -38,6 +48,8 @@ interface LiveState {
 const initial = {
   status: { state: "idle" } as LiveStatus,
   latencyMs: null,
+  clockOffsetMs: 0,
+  lastSeq: null,
   sessionId: null,
   replica: null,
   away: null,
@@ -51,8 +63,9 @@ const initial = {
 export const useLive = create<LiveState>()((set) => ({
   ...initial,
   setStatus: (status) => set({ status }),
-  setLatency: (latencyMs) => set({ latencyMs }),
-  setHello: (sessionId, replica) => set({ sessionId, replica }),
+  setLatency: (latencyMs, clockOffsetMs) => set({ latencyMs, clockOffsetMs }),
+  setHello: (hello) => set(hello),
+  setLastSeq: (lastSeq) => set({ lastSeq }),
   addAway: (count) =>
     set((s) => ({ away: { count: (s.away?.count ?? 0) + count, at: Date.now() } })),
   clearAway: () => set({ away: null }),

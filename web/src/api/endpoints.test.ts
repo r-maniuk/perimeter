@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   alertFromRecord,
   deviceTrail,
+  getDevice,
   listAlerts,
   listSessions,
   listZones,
@@ -187,6 +188,42 @@ describe("REST contract", () => {
     await expect(deviceTrail("veh-1", 5)).rejects.toBeInstanceOf(ContractError);
   });
 
+  it("reads a device with the zones of the viewer it is in", async () => {
+    respond({
+      type: "Feature",
+      id: "veh-00042",
+      geometry: { type: "Point", coordinates: [4.8931, 52.3729] },
+      properties: {
+        device_id: "veh-00042",
+        recorded_at: "2026-09-27T09:00:00Z",
+        received_at: "2026-09-27T09:00:00.120000Z",
+        speed_mps: 4.2,
+        heading_deg: 180,
+        accuracy_m: 6,
+        updated_at: "2026-09-27T09:00:00.140000Z",
+        zones: [
+          {
+            id: "0192f7e0-0000-7000-8000-0000000000z2",
+            name: "Depot",
+            color: "#3f9a2e",
+            entered_at: "2026-09-27T08:41:10Z",
+            last_seen_at: "2026-09-27T09:00:00Z",
+          },
+        ],
+      },
+    });
+    const device = await getDevice("veh-00042");
+    expect(device).toMatchObject({ id: "veh-00042", lat: 52.3729, lon: 4.8931, speedMps: 4.2 });
+    expect(device.zones).toEqual([
+      {
+        id: "0192f7e0-0000-7000-8000-0000000000z2",
+        name: "Depot",
+        color: "#3f9a2e",
+        enteredAt: Date.parse("2026-09-27T08:41:10Z"),
+      },
+    ]);
+  });
+
   it("returns occupants with the full count", async () => {
     respond({
       zone_id: "z1",
@@ -211,7 +248,7 @@ describe("REST contract", () => {
   it("sends If-Match on updates and surfaces 412 as a typed error", async () => {
     const fetchMock = respond(
       {
-        type: "https://perimeter.dev/problems/precondition_failed",
+        type: "/problems/precondition_failed",
         title: "Precondition Failed",
         status: 412,
         detail: "stale",
@@ -222,6 +259,8 @@ describe("REST contract", () => {
     const error = await updateZone("z1", { radius_m: 300 }, 3).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).status).toBe(412);
+    // Problems are told apart by `code`; the `type` URI is informational only.
+    expect((error as ApiError).code).toBe("precondition_failed");
     const init = (fetchMock.mock.calls[0] as unknown[])[1] as RequestInit;
     expect((init.headers as Record<string, string>)["if-match"]).toBe('"v3"');
     expect(init.method).toBe("PATCH");

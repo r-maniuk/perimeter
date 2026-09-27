@@ -6,6 +6,7 @@ import {
   CirclePlus,
   House,
   Keyboard,
+  LocateFixed,
   LogOut,
   Maximize2,
   MonitorSmartphone,
@@ -71,6 +72,13 @@ export function CommandPalette() {
         run: () => useUi.getState().setDrawing(true),
       },
       {
+        id: "draw-centre",
+        label: "New zone at map centre",
+        icon: <LocateFixed className="size-4" />,
+        keywords: "create add place geofence circle here center keyboard",
+        run: () => mapController.drawAtCentre(),
+      },
+      {
         id: "theme",
         label: dark ? "Switch to light theme" : "Switch to dark theme",
         icon: dark ? <Sun className="size-4" /> : <Moon className="size-4" />,
@@ -118,7 +126,7 @@ export function CommandPalette() {
 
   const shownActions = needle
     ? actions.filter((a) => matches(`${a.label} ${a.keywords ?? ""}`, needle))
-    : actions.slice(0, 7);
+    : actions.slice(0, 8);
   const shownZones = (zones ?? []).filter((z) => !needle || matches(z.name, needle)).slice(0, 8);
   const devices = useMemo(() => {
     const fleet = getRuntime()?.fleet;

@@ -1,11 +1,12 @@
 import { MousePointer2, X } from "lucide-react";
 import { AnimatePresence, m } from "motion/react";
 import { DESKTOP, useMediaQuery } from "@/lib/useMediaQuery";
+import { mapController } from "@/map/controller";
 import { usePointer } from "@/state/pointer";
 import { useUi } from "@/state/ui";
 import { Kbd } from "@/ui/Kbd";
 
-/** Instructions while drawing a zone. */
+/** Instructions while drawing a zone: with the pointer, or from the keyboard at the map centre. */
 export function DrawHint() {
   const drawing = useUi((s) => s.drawing);
   const dragging = usePointer((s) => s.draft !== null);
@@ -27,7 +28,20 @@ export function DrawHint() {
                 ? "Press at the centre and drag out the radius"
                 : "Touch the centre and drag out the radius"}
             </span>
-            {desktop && <Kbd tone="inverse">Esc</Kbd>}
+            {desktop && (
+              <>
+                <span className="h-4 w-px bg-bg/20" aria-hidden="true" />
+                <button
+                  type="button"
+                  onClick={() => mapController.drawAtCentre()}
+                  className="flex items-center gap-2 rounded-full py-0.5 text-bg/85 hover:text-bg"
+                >
+                  <Kbd tone="inverse">Enter</Kbd>
+                  <span>at the map centre</span>
+                </button>
+                <Kbd tone="inverse">Esc</Kbd>
+              </>
+            )}
             <button
               type="button"
               aria-label="Cancel drawing"

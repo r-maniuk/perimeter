@@ -127,3 +127,44 @@ export function parseDistance(input: string): number | null {
   const unit = (match[2] ?? "m").toLowerCase();
   return unit === "m" ? value : value * 1_000;
 }
+
+export type Axis = "lat" | "lon";
+
+const AXIS_LIMIT: Record<Axis, number> = { lat: 90, lon: 180 };
+const HEMISPHERES: Record<Axis, string> = { lat: "NS", lon: "EW" };
+const DEGREES = String.raw`([+-]?\d+(?:[.,]\d+)?)\s*°?\s*([NSEW])?`;
+
+function degrees(number: string, hemisphere: string | undefined, axis: Axis): number | null {
+  let value = Number(number.replace(",", "."));
+  if (!Number.isFinite(value)) return null;
+  if (hemisphere) {
+    const letter = hemisphere.toUpperCase();
+    // "4.9 N" is not a longitude, and "-4.9 W" could mean either side.
+    if (!HEMISPHERES[axis].includes(letter) || value < 0) return null;
+    if (letter === "S" || letter === "W") value = -value;
+  }
+  return Math.abs(value) <= AXIS_LIMIT[axis] ? value : null;
+}
+
+/**
+ * Parse a latitude or longitude typed by a person, in decimal degrees: "52.3731", "52,3731",
+ * "-4.5", "52.3731° N", "4.89 W". Returns `null` for anything else or anything out of range.
+ */
+export function parseDegrees(input: string, axis: Axis): number | null {
+  const match = new RegExp(`^\\s*${DEGREES}\\s*$`, "i").exec(input);
+  if (!match) return null;
+  return degrees(match[1] ?? "", match[2], axis);
+}
+
+/**
+ * Parse a latitude/longitude pair as maps copy it: "52.3731, 4.8926", "52.3731 4.8926",
+ * "52.37310° N  4.89260° E". Decimal commas are only read in a single value, never in a pair.
+ */
+export function parseCoordinatePair(input: string): { lat: number; lon: number } | null {
+  const part = String.raw`([+-]?\d+(?:\.\d+)?)\s*°?\s*([NSEW])?`;
+  const match = new RegExp(`^\\s*${part}\\s*(?:[,;]\\s*|\\s+)${part}\\s*$`, "i").exec(input);
+  if (!match) return null;
+  const lat = degrees(match[1] ?? "", match[2], "lat");
+  const lon = degrees(match[3] ?? "", match[4], "lon");
+  return lat === null || lon === null ? null : { lat, lon };
+}

@@ -45,13 +45,12 @@ describe("sign-in form", () => {
   });
 
   it("signs in, normalising the name, and remembers it", async () => {
+    // The session token travels in the HttpOnly cookie only: the body names the user.
     const fetchMock = vi.fn(async () =>
-      Response.json({
-        token: "t",
-        token_type: "bearer",
-        expires_at: "2026-09-27T12:00:00Z",
-        user: { id: "u-1", username: "ada.lovelace" },
-      }),
+      Response.json(
+        { expires_at: "2026-09-27T12:00:00Z", user: { id: "u-1", username: "ada.lovelace" } },
+        { status: 201 },
+      ),
     );
     vi.stubGlobal("fetch", fetchMock);
     render(<SignIn />);
@@ -70,7 +69,7 @@ describe("sign-in form", () => {
       vi.fn(async () =>
         Response.json(
           {
-            type: "https://perimeter.dev/problems/rate_limited",
+            type: "/problems/rate_limited",
             title: "Too Many Requests",
             status: 429,
             code: "rate_limited",

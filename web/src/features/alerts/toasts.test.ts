@@ -64,6 +64,19 @@ describe("toast coalescing", () => {
     expect(toasts.map((t) => t.alerts[0]?.id)).toEqual(["4", "5", "6"]);
   });
 
+  it("keeps a toast held under the pointer when another alert joins it", () => {
+    const held = 1_000 + 3_600_000;
+    let toasts = addAlert([], alert("1"), 1_000);
+    const id = toasts[0]?.id as string;
+    // The pointer rests on it: the stack holds its expiry far out.
+    toasts = toasts.map((t) => (t.id === id ? { ...t, expiresAt: held } : t));
+    toasts = addAlert(toasts, alert("2"), 3_000);
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]?.count).toBe(2);
+    expect(toasts[0]?.expiresAt).toBe(held);
+    expect(expire(toasts, 60_000)).toHaveLength(1);
+  });
+
   it("expires on time, later when held", () => {
     const toasts = addAlert([], alert("1"), 0);
     const id = toasts[0]?.id as string;

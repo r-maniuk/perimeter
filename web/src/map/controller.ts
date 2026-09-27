@@ -2,9 +2,10 @@
  * The one map of the application and everything that happens on it.
  *
  * React mounts it into a container and forwards state changes (theme, selection, drawing mode);
- * the controller owns MapLibre, the layers, and the pointer interactions — hover and click
- * picking, drawing a zone by press-and-drag, dragging a zone's centre and radius handles, and
- * camera follow — and reports back through a small typed event emitter.
+ * the controller owns MapLibre, the layers, and the interactions — hover and click picking,
+ * drawing a zone by press-and-drag (or placing one at the centre from the keyboard), dragging or
+ * nudging a zone's centre and radius handles, and camera follow — and reports back through a
+ * small typed event emitter.
  *
  * MapLibre is loaded on demand so the application shell paints before the ~800 kB renderer has
  * arrived; the page shows the basemap's land colour until then.
@@ -17,8 +18,9 @@ import type {
   StyleSpecification,
 } from "maplibre-gl";
 import type { Zone } from "@/api/schemas";
-import { clampRadius } from "@/features/zones/model";
+import { clampRadius, RADIUS_MAX_M, RADIUS_MIN_M } from "@/features/zones/model";
 import type { FleetStore } from "@/fleet/store";
+import { formatDistance } from "@/lib/format";
 import {
   destination,
   inverse,
@@ -131,6 +133,22 @@ function prefersReducedMotion(): boolean {
 
 /** Room kept around fitted zones, inside the space the chrome leaves. */
 const FIT_MARGIN = 56;
+/** The camera's viewport is reported at most this often while it moves. */
+const VIEWPORT_INTERVAL_MS = 250;
+/** A followed device this close to the camera centre (~0.1 mm) is centred already. */
+const CENTRED_DEG = 1e-9;
+/** Screen pixels a zone handle moves per arrow key press, and with Shift (as MapLibre's markers). */
+const NUDGE_PX = 1;
+const NUDGE_LARGE_PX = 10;
+/** Screen direction of each arrow key. */
+const ARROWS: Record<string, [number, number]> = {
+  ArrowLeft: [-1, 0],
+  ArrowRight: [1, 0],
+  ArrowUp: [0, -1],
+  ArrowDown: [0, 1],
+};
+/** Metres per screen pixel at the equator and zoom 0 (512-pixel tiles). */
+const METERS_PER_PIXEL_Z0 = 78_271.517;
 /** The signed-out backdrop turns this slowly, redrawn at this pace (motion is sub-pixel per step). */
 const DRIFT_DEG_PER_S = 0.375;
 const DRIFT_FRAME_MS = 33;
@@ -166,7 +184,7 @@ export class MapController {
   #followId: string | null = null;
   #followFrame = 0;
   #viewportTimer: ReturnType<typeof setTimeout> | null = null;
-  #lastViewportAt = 0;
+  #lastViewportAt = Number.NEGATIVE_INFINITY;
   #interactive = true;
   /** The signed-out backdrop's slow turn: its frame request, and the bearing it started from. */
   #drift: { frame: number; from: number } | null = null;
@@ -436,6 +454,11 @@ export class MapController {
     if (deviceId) this.#followTick();
   }
 
+  /**
+   * Keep the followed device centred, frame by frame, where it is drawn (the GPU glides it
+   * between reports). A device at rest under a camera that stayed put needs no move; every move
+   * also reports the viewport, which the viewport throttle turns into a few reports a second.
+   */
   #followTick = (): void => {
     const map = this.map;
     const fleet = this.#fleet;
@@ -444,8 +467,17 @@ export class MapController {
     const index = fleet.indexOf(id);
     if (index !== undefined) {
       const [x, y] = fleet.positionAt(index);
-      const center: [number, number] = [this.#nearCamera(lonFromMercatorX(x)), latFromMercatorY(y)];
-      map.jumpTo({ center, padding: this.#padding(0) });
+      const lon = this.#nearCamera(lonFromMercatorX(x));
+      const lat = latFromMercatorY(y);
+      const padding = this.#padding(0);
+      const center = map.getCenter();
+      if (
+        Math.abs(center.lng - lon) > CENTRED_DEG ||
+        Math.abs(center.lat - lat) > CENTRED_DEG ||
+        !sameInsets(map.getPadding(), padding)
+      ) {
+        map.jumpTo({ center: [lon, lat], padding });
+      }
     }
     this.#followFrame = requestAnimationFrame(this.#followTick);
   };
@@ -561,6 +593,33 @@ export class MapController {
 
   /* ---------------------------------------------------------------- drawing */
 
+  /** Give the map keyboard focus: arrow keys pan it, and while drawing Enter places a zone. */
+  focus(): void {
+    this.map?.getCanvas().focus({ preventScroll: true });
+  }
+
+  /**
+   * Create a zone at the centre of the map area the chrome leaves free, sized for the current
+   * zoom: drawing without a pointer. It is reported like a drawn zone.
+   */
+  drawAtCentre(): void {
+    const map = this.map;
+    if (!map || !this.#interactive) return;
+    const canvas = map.getCanvas();
+    const { top, right, bottom, left } = this.#padding(0);
+    const x = left + (canvas.clientWidth - left - right) / 2;
+    const y = top + (canvas.clientHeight - top - bottom) / 2;
+    const center = map.unproject([x, y]);
+    this.#draft = null;
+    this.#zones?.setDraft(null);
+    this.events.emit("draft", null);
+    this.events.emit("drawn", {
+      lat: center.lat,
+      lon: normalizeLon(center.lng),
+      radiusM: clampRadius(this.#defaultRadius()),
+    });
+  }
+
   setDrawing(drawing: boolean): void {
     this.#drawing = drawing;
     const map = this.map;
@@ -623,20 +682,23 @@ export class MapController {
     map.on("dragstart", onDragStart);
     map.on("wheel", onDragStart);
 
+    // Every camera change, the end of one included, goes through the same throttle: a camera that
+    // jumps on every frame (following a device) also ends a move on every frame. The trailing
+    // report always carries the camera as it is by then, so the final view is never lost.
     const emitSoon = () => {
-      const now = performance.now();
-      if (now - this.#lastViewportAt > 250) {
+      if (this.#viewportTimer) return;
+      const wait = this.#lastViewportAt + VIEWPORT_INTERVAL_MS - performance.now();
+      if (wait <= 0) {
         this.#emitViewport();
         return;
       }
-      if (this.#viewportTimer) return;
       this.#viewportTimer = setTimeout(() => {
         this.#viewportTimer = null;
         this.#emitViewport();
-      }, 250);
+      }, wait);
     };
     map.on("move", emitSoon);
-    map.on("moveend", () => this.#emitViewport());
+    map.on("moveend", emitSoon);
 
     // Drawing: press at the centre, drag out the radius, release to create.
     const onPointerDown = (e: PointerEvent) => {
@@ -674,11 +736,19 @@ export class MapController {
       });
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && this.#drawing) {
+      if (!this.#drawing) return;
+      if (e.key === "Escape") {
         this.#draft = null;
         this.#zones?.setDraft(null);
         this.events.emit("draft", null);
         this.events.emit("drawCancel", undefined);
+      } else if (e.key === "Enter" && !this.#draft && !e.repeat && !hasModifier(e)) {
+        // Enter belongs to the map only while nothing else holds the keyboard: a focused button
+        // or field keeps its own meaning for it.
+        const target = e.target;
+        if (target !== canvas && target !== document.body && target !== null) return;
+        e.preventDefault();
+        this.drawAtCentre();
       }
     };
     canvas.addEventListener("pointerdown", onPointerDown);
@@ -831,6 +901,8 @@ export class MapController {
    */
   #bindHandle(element: HTMLElement, zoneId: string, kind: "center" | "radius"): void {
     let pointerId: number | null = null;
+    /** A nudge from the keyboard is under way (it ends when the arrow key is released). */
+    let nudging = false;
     const finish = (commit: boolean) => {
       if (pointerId === null) return;
       if (element.hasPointerCapture(pointerId)) element.releasePointerCapture(pointerId);
@@ -838,6 +910,10 @@ export class MapController {
       this.#gestureEndedAt = performance.now();
       element.classList.remove("zone-handle--dragging");
       if (this.#interactive) this.map?.dragPan.enable();
+      end(commit);
+    };
+    /** Close a gesture, pointer or keyboard: save the new geometry, or put the handles back. */
+    const end = (commit: boolean) => {
       const editing = this.#editing;
       this.#editing = null;
       this.#zones?.setPreview(null);
@@ -855,10 +931,58 @@ export class MapController {
       );
       this.#placeHandles(editing);
     };
+    const endNudge = () => {
+      if (!nudging) return;
+      nudging = false;
+      end(true);
+    };
+    // The keyboard path mirrors a drag, as MapLibre's own draggable markers do: every arrow key
+    // press moves the handle a pixel (ten with Shift) and previews the zone, and releasing the
+    // key (or leaving the handle) saves it — one save however long the key is held.
+    element.addEventListener("keydown", (e) => {
+      const map = this.map;
+      const zone = this.#zoneById.get(zoneId);
+      const handles = this.#handles;
+      const step = nudgeStep(e, kind);
+      if (!step || !map || !zone || !handles || pointerId !== null || hasModifier(e)) return;
+      // Another gesture (a drag of either handle) owns the zone's shape until it ends.
+      if (this.#editing && !nudging) return;
+      e.preventDefault();
+      // The handle sits inside the map's canvas container: the map would pan on these keys too.
+      e.stopPropagation();
+      const editing = this.#editing ?? toGeometry(zone);
+      const [dx, dy] = step;
+      if (kind === "center") {
+        const at = map.project([this.#nearCamera(editing.lon), editing.lat]);
+        const moved = map.unproject([at.x + dx, at.y + dy]);
+        this.#editing = { ...editing, lat: moved.lat, lon: normalizeLon(moved.lng) };
+        const center = { lat: this.#editing.lat, lon: this.#editing.lon };
+        this.events.emit("zoneEdit", { id: zoneId, center, done: false });
+      } else {
+        // Right and up grow the zone, left and down shrink it, by as many metres as pixels (a
+        // metre at least: radii are whole metres, and street zoom has several pixels to one).
+        const metersPerPixel =
+          (METERS_PER_PIXEL_Z0 * Math.cos((editing.lat * Math.PI) / 180)) / 2 ** map.getZoom();
+        const pixels = dx !== 0 ? dx : -dy;
+        const change = Math.sign(pixels) * Math.max(1, Math.abs(pixels) * metersPerPixel);
+        const radiusM = Math.round(clampRadius(editing.radiusM + change));
+        this.#editing = { ...editing, radiusM };
+        this.events.emit("zoneEdit", { id: zoneId, radiusM, done: false });
+      }
+      nudging = true;
+      this.#setHovered(null);
+      this.#zones?.setPreview(this.#editing);
+      this.#placeHandles(this.#editing);
+    });
+    element.addEventListener("keyup", (e) => {
+      if (nudgeStep(e, kind)) endNudge();
+    });
+    element.addEventListener("blur", endNudge);
     element.addEventListener("pointerdown", (e) => {
       if (pointerId !== null || (e.pointerType === "mouse" && e.button !== 0)) return;
       const zone = this.#zoneById.get(zoneId);
       if (!zone) return;
+      endNudge();
       e.preventDefault();
       e.stopPropagation();
       pointerId = e.pointerId;
@@ -912,6 +1036,9 @@ export class MapController {
     for (const marker of [handles.center, handles.radius]) {
       marker.getElement().style.setProperty("--handle-color", zone.color);
     }
+    const radius = handles.radius.getElement();
+    radius.setAttribute("aria-valuenow", String(Math.round(zone.radiusM)));
+    radius.setAttribute("aria-valuetext", formatDistance(zone.radiusM));
   }
 
   #clearHandles(): void {
@@ -932,6 +1059,10 @@ export class MapController {
   }
 }
 
+function sameInsets(a: Partial<Insets>, b: Insets): boolean {
+  return a.top === b.top && a.right === b.right && a.bottom === b.bottom && a.left === b.left;
+}
+
 function toGeometry(zone: Zone): ZoneGeometry {
   return {
     id: zone.id,
@@ -944,12 +1075,44 @@ function toGeometry(zone: Zone): ZoneGeometry {
   };
 }
 
+function hasModifier(e: KeyboardEvent): boolean {
+  return e.altKey || e.ctrlKey || e.metaKey;
+}
+
+/**
+ * The screen offset, in pixels, a key moves a handle by, or `null` for other keys. The radius
+ * handle is a slider as well: Page Up and Page Down take the larger step.
+ */
+function nudgeStep(e: KeyboardEvent, kind: "center" | "radius"): [number, number] | null {
+  const direction = ARROWS[e.key];
+  const size = e.shiftKey ? NUDGE_LARGE_PX : NUDGE_PX;
+  if (direction) return [direction[0] * size, direction[1] * size];
+  if (kind === "radius" && e.key === "PageUp") return [NUDGE_LARGE_PX, 0];
+  if (kind === "radius" && e.key === "PageDown") return [-NUDGE_LARGE_PX, 0];
+  return null;
+}
+
+/**
+ * A zone handle: dragged with a pointer, or focused (Tab) and nudged with the arrow keys. The
+ * radius handle is announced as a slider, the centre one as a button that moves the zone.
+ */
 function handleElement(kind: "center" | "radius", color: string): HTMLElement {
   const element = document.createElement("div");
   element.className = `zone-handle zone-handle--${kind}`;
   element.style.setProperty("--handle-color", color);
-  element.setAttribute("aria-hidden", "true");
-  element.title = kind === "center" ? "Drag to move the zone" : "Drag to resize the zone";
+  element.tabIndex = 0;
+  if (kind === "center") {
+    element.setAttribute("role", "button");
+    element.setAttribute("aria-label", "Zone centre");
+    element.title = "Drag, or use the arrow keys, to move the zone";
+  } else {
+    element.setAttribute("role", "slider");
+    element.setAttribute("aria-label", "Zone radius");
+    element.setAttribute("aria-valuemin", String(RADIUS_MIN_M));
+    element.setAttribute("aria-valuemax", String(RADIUS_MAX_M));
+    element.title = "Drag, or use the arrow keys, to resize the zone";
+  }
+  element.setAttribute("aria-keyshortcuts", "ArrowUp ArrowDown ArrowLeft ArrowRight");
   return element;
 }
 

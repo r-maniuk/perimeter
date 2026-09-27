@@ -11,6 +11,8 @@ import {
   formatMs,
   formatRate,
   formatSpeed,
+  parseCoordinatePair,
+  parseDegrees,
   parseDistance,
 } from "./format";
 
@@ -88,4 +90,52 @@ describe("parseDistance", () => {
   it.each(["", "abc", "-5", "1.2.3 km", "5 mi"])("rejects %j", (input) => {
     expect(parseDistance(input)).toBeNull();
   });
+});
+
+describe("typed coordinates", () => {
+  it.each([
+    ["52.3731", "lat", 52.3731],
+    ["52,3731", "lat", 52.3731],
+    [" -33.8688 ", "lat", -33.8688],
+    ["52.3731° N", "lat", 52.3731],
+    ["33.8688 s", "lat", -33.8688],
+    ["4.8926E", "lon", 4.8926],
+    ["74.006° W", "lon", -74.006],
+    ["+180", "lon", 180],
+    ["-90", "lat", -90],
+  ] as const)("reads %j as a %s of %d", (input, axis, value) => {
+    expect(parseDegrees(input, axis)).toBeCloseTo(value, 9);
+  });
+
+  it.each([
+    ["", "lat"],
+    ["north", "lat"],
+    ["90.5", "lat"],
+    ["-181", "lon"],
+    ["4.9 N", "lon"],
+    ["52.3 E", "lat"],
+    ["-4.9 W", "lon"],
+    ["52.3731, 4.8926", "lat"],
+  ] as const)("refuses %j as a %s", (input, axis) => {
+    expect(parseDegrees(input, axis)).toBeNull();
+  });
+
+  it.each([
+    ["52.3731, 4.8926", { lat: 52.3731, lon: 4.8926 }],
+    ["52.3731 4.8926", { lat: 52.3731, lon: 4.8926 }],
+    ["52.373100;-4.892600", { lat: 52.3731, lon: -4.8926 }],
+    ["52.37310° N  4.89260° E", { lat: 52.3731, lon: 4.8926 }],
+    ["40.7128 N, 74.0060 W", { lat: 40.7128, lon: -74.006 }],
+  ])("reads the pair %j", (input, pair) => {
+    const parsed = parseCoordinatePair(input);
+    expect(parsed?.lat).toBeCloseTo(pair.lat, 9);
+    expect(parsed?.lon).toBeCloseTo(pair.lon, 9);
+  });
+
+  it.each(["52.3731", "52,3731, 4,8926", "95, 4", "52.3 E, 4.8 N", "1, 2, 3"])(
+    "refuses the pair %j",
+    (input) => {
+      expect(parseCoordinatePair(input)).toBeNull();
+    },
+  );
 });

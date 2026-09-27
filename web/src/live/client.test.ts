@@ -130,7 +130,12 @@ function alertEvent(seq: number, prev: number, ts = new Date(NOW + 1000).toISOSt
   };
 }
 
-function setup(store = new MemoryStore(), random = () => 0.5, autoPong = true) {
+function setup(
+  store = new MemoryStore(),
+  random = () => 0.5,
+  autoPong = true,
+  userId: string | null = null,
+) {
   const sockets: FakeSocket[] = [];
   const env = new FakeEnvironment();
   const events: LiveEvent[] = [];
@@ -139,6 +144,7 @@ function setup(store = new MemoryStore(), random = () => 0.5, autoPong = true) {
     seqStore: store,
     environment: env,
     random,
+    userId,
     createSocket: (url) => {
       const socket = new FakeSocket(url);
       socket.autoPong = autoPong;
@@ -220,6 +226,7 @@ describe("connecting", () => {
     t.open();
     t.client.setViewport({ bbox: [724.79, 52.33, 724.99, 52.41], zoom: 12.3 });
     t.client.setViewport({ bbox: [-600, -80, 300, 80], zoom: 0.4 });
+    vi.advanceTimersByTime(250);
     const sent = t.last().sentOfType("viewport") as { bbox: number[] }[];
     expect(sent[0]?.bbox[0]).toBeCloseTo(4.79, 9);
     expect(sent[0]?.bbox[2]).toBeCloseTo(4.99, 9);
@@ -237,6 +244,67 @@ describe("connecting", () => {
     expect(t.last().sentOfType("ops")).toHaveLength(1);
   });
 
+  it("sends a viewport only when it covers other tiles than the last one sent", () => {
+    const t = setup();
+    t.client.start();
+    t.open();
+    t.client.setViewport({ bbox: [4.79, 52.33, 4.99, 52.41], zoom: 12 });
+    vi.advanceTimersByTime(1_000);
+    // A few metres of pan and a slight zoom stay on the same leaf tiles: nothing to tell.
+    t.client.setViewport({ bbox: [4.7901, 52.3301, 4.9901, 52.4101], zoom: 12.01 });
+    vi.advanceTimersByTime(1_000);
+    expect(t.last().sentOfType("viewport")).toHaveLength(1);
+    t.client.setViewport({ bbox: [4.89, 52.33, 5.09, 52.41], zoom: 12 });
+    expect(t.last().sentOfType("viewport")).toEqual([
+      expect.objectContaining({ bbox: [4.79, 52.33, 4.99, 52.41] }),
+      expect.objectContaining({ bbox: [4.89, 52.33, 5.09, 52.41] }),
+    ]);
+  });
+
+  it("keeps a camera that moves every frame under four viewport messages a second", () => {
+    const t = setup();
+    t.client.start();
+    t.open();
+    const socket = t.last();
+    const sentAt: number[] = [];
+    const send = socket.send.bind(socket);
+    socket.send = (data: string) => {
+      if (data.includes('"viewport"')) sentAt.push(Date.now());
+      send(data);
+    };
+    // A camera gliding across tiles for ten seconds, reporting a viewport on every frame.
+    const at = (frame: number): [number, number, number, number] => {
+      const west = 4.85 + frame * 0.005;
+      return [west, 52.36, west + 0.02, 52.37];
+    };
+    let frame = 0;
+    for (; frame < 600; frame++) {
+      t.client.setViewport({ bbox: at(frame), zoom: 15 });
+      vi.advanceTimersByTime(1000 / 60);
+    }
+    expect(sentAt.length).toBeGreaterThan(30);
+    for (const [i, time] of sentAt.entries()) {
+      const inLastSecond = sentAt.filter((other) => other > time - 1_000 && other <= time);
+      expect(inLastSecond.length).toBeLessThanOrEqual(4);
+      if (i > 0) expect(time - (sentAt[i - 1] ?? 0)).toBeGreaterThanOrEqual(250);
+    }
+    // Once the camera rests, the server holds exactly where it stopped.
+    vi.advanceTimersByTime(250);
+    const last = socket.sentOfType("viewport").at(-1) as { bbox: number[] };
+    expect(last.bbox).toEqual(at(frame - 1));
+  });
+
+  it("measures tiles at the zoom the server announces", () => {
+    const t = setup();
+    t.client.start();
+    t.open({ ...hello(), tile_zoom: 16 });
+    t.client.setViewport({ bbox: [4.9, 52.37, 4.91, 52.375], zoom: 16 });
+    vi.advanceTimersByTime(1_000);
+    // ~150 m east: the same tile at zoom 12, another one at zoom 16.
+    t.client.setViewport({ bbox: [4.9022, 52.37, 4.9122, 52.375], zoom: 16 });
+    expect(t.last().sentOfType("viewport")).toHaveLength(2);
+  });
+
   it("forwards binary bundles untouched", () => {
     const t = setup();
     t.client.start();
@@ -244,6 +312,30 @@ describe("connecting", () => {
     const buffer = new ArrayBuffer(8);
     t.last().receive(buffer);
     expect(t.ofType("positions")[0]?.data).toBe(buffer);
+  });
+
+  it("refuses a socket that speaks for another account, keeping this user's resume point", () => {
+    const ada = hello().user.id;
+    const t = setup(new MemoryStore(30), () => 1, true, "u-grace");
+    t.client.start();
+    t.open(hello("replay", 30));
+    expect(t.ofType("accountChanged")).toEqual([
+      { type: "accountChanged", user: { id: ada, username: "ada" } },
+    ]);
+    expect(t.ofType("hello")).toHaveLength(0);
+    expect(t.events.some((e) => e.type === "status" && e.status.state === "open")).toBe(false);
+    expect(t.store.value).toBe(30);
+    expect(t.sockets[0]?.closedWith?.code).toBe(4903);
+    // Anything the refused socket still delivers is ignored.
+    t.sockets[0]?.receive(alertEvent(31, 30));
+    expect(t.ofType("event")).toHaveLength(0);
+    // It tries again after the usual back-off, still resuming where this user left off.
+    expect(t.client.status).toMatchObject({ state: "waiting", lastCode: 4903 });
+    vi.advanceTimersByTime(500);
+    expect(t.sockets).toHaveLength(2);
+    expect(t.last().url).toBe("ws://test/v1/live?resume_after=30");
+    t.open({ ...hello("replay", 30), user: { id: "u-grace", username: "grace" } });
+    expect(t.client.status.state).toBe("open");
   });
 
   it("replaces a socket that never says hello", () => {
@@ -500,6 +592,61 @@ describe("reconnecting", () => {
     expect(t.sockets).toHaveLength(2);
   });
 
+  it("checks the socket the moment the tab is shown again, and replaces a dead one quickly", () => {
+    const t = setup(new MemoryStore(), () => 0, false);
+    t.client.start();
+    t.open();
+    const socket = t.last();
+    // The first ping of the connection was answered; then the laptop sleeps with the tab hidden.
+    socket.receive({ type: "pong", t: Date.now(), server_time: Date.now() });
+    t.env.setHidden(true);
+    vi.advanceTimersByTime(4_000);
+    const pings = socket.sentOfType("ping").length;
+    t.env.setHidden(false);
+    expect(socket.sentOfType("ping")).toHaveLength(pings + 1);
+    vi.advanceTimersByTime(4_999);
+    expect(t.client.status.state).toBe("open");
+    vi.advanceTimersByTime(1);
+    expect(socket.closedWith?.code).toBe(4901);
+    expect(t.client.status.state).toBe("waiting");
+  });
+
+  it("checks the socket when the network comes back", () => {
+    const t = setup(new MemoryStore(), () => 0, false);
+    t.client.start();
+    t.open();
+    const socket = t.last();
+    socket.receive({ type: "pong", t: Date.now(), server_time: Date.now() });
+    vi.advanceTimersByTime(3_000);
+    t.env.setOnline(true);
+    expect(socket.sentOfType("ping")).toHaveLength(2);
+    vi.advanceTimersByTime(5_000);
+    expect(socket.closedWith?.code).toBe(4901);
+  });
+
+  it("keeps a socket that answers the check", () => {
+    const t = setup();
+    t.client.start();
+    t.open();
+    t.env.setHidden(true);
+    t.env.setHidden(false);
+    t.env.setOnline(true);
+    vi.advanceTimersByTime(60_000);
+    expect(t.client.status.state).toBe("open");
+    expect(t.sockets).toHaveLength(1);
+  });
+
+  it("never lets a check postpone a ping that is already overdue sooner", () => {
+    const t = setup(new MemoryStore(), () => 0, false);
+    t.client.start();
+    t.open();
+    // The first ping is due within 10 s; 8 s in, a check must not push that out to 13 s.
+    vi.advanceTimersByTime(8_000);
+    t.env.setHidden(false);
+    vi.advanceTimersByTime(2_000);
+    expect(t.last().closedWith?.code).toBe(4901);
+  });
+
   it("waits for connectivity instead of burning attempts offline", () => {
     const t = setup();
     t.client.start();
@@ -527,6 +674,35 @@ describe("reconnecting", () => {
     expect(t.last().url).toBe("ws://test/v1/live?resume_after=30");
   });
 
+  it("releases the socket of a tab that opened in the background, like one hidden later", () => {
+    const t = setup(new MemoryStore(12));
+    t.env.isHidden = true;
+    t.client.start();
+    t.open(hello("replay", 12));
+    vi.advanceTimersByTime(119_999);
+    expect(t.client.status.state).toBe("open");
+    vi.advanceTimersByTime(1);
+    expect(t.client.status.state).toBe("paused");
+    expect(t.sockets[0]?.closedWith?.code).toBe(1000);
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(t.sockets).toHaveLength(1);
+    t.env.setHidden(false);
+    expect(t.sockets).toHaveLength(2);
+    expect(t.last().url).toBe("ws://test/v1/live?resume_after=12");
+  });
+
+  it("keeps the socket of a background tab that is shown within the grace period", () => {
+    const t = setup();
+    t.env.isHidden = true;
+    t.client.start();
+    t.open();
+    vi.advanceTimersByTime(60_000);
+    t.env.setHidden(false);
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(t.client.status.state).toBe("open");
+    expect(t.sockets).toHaveLength(1);
+  });
+
   it("stops cleanly", () => {
     const t = setup();
     t.client.start();
@@ -536,6 +712,35 @@ describe("reconnecting", () => {
     expect(t.sockets[0]?.closedWith?.code).toBe(1000);
     vi.advanceTimersByTime(120_000);
     expect(t.sockets).toHaveLength(1);
+  });
+
+  it("leaves no timer behind when stopped, whatever was pending", () => {
+    const t = setup(new MemoryStore(), () => 0.5, false);
+    t.client.start();
+    t.open();
+    // A pending pong deadline, the heartbeat, the stable-connection timer, a hidden-tab grace
+    // timer and a viewport waiting for its turn.
+    t.client.setViewport({ bbox: [4.79, 52.33, 4.99, 52.41], zoom: 12 });
+    t.client.setViewport({ bbox: [5.79, 52.33, 5.99, 52.41], zoom: 12 });
+    t.env.setHidden(true);
+    expect(vi.getTimerCount()).toBeGreaterThanOrEqual(5);
+    t.client.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("holds a steady set of timers through a long session", () => {
+    const t = setup();
+    t.client.start();
+    t.open();
+    vi.advanceTimersByTime(10_000);
+    const settled = vi.getTimerCount();
+    for (let beat = 0; beat < 200; beat++) {
+      vi.advanceTimersByTime(15_000);
+      t.client.setViewport({ bbox: [4 + beat * 0.2, 52.33, 4.2 + beat * 0.2, 52.41], zoom: 12 });
+    }
+    vi.advanceTimersByTime(1_000);
+    expect(t.last().sentOfType("ping").length).toBeGreaterThan(200);
+    expect(vi.getTimerCount()).toBe(settled);
   });
 });
 

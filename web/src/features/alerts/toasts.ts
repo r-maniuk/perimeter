@@ -39,7 +39,12 @@ export function addAlert(toasts: readonly Toast[], alert: Alert, now: number): T
     const merged: Toast = {
       ...latest,
       updatedAt: now,
-      expiresAt: Math.min(latest.createdAt + MAX_LIFETIME_MS, now + LIFETIME_MS),
+      // A merge only ever gives the toast more time: while the pointer rests on it, its expiry is
+      // held far out, and an alert joining it must not cut that short.
+      expiresAt: Math.max(
+        latest.expiresAt,
+        Math.min(latest.createdAt + MAX_LIFETIME_MS, now + LIFETIME_MS),
+      ),
       count: latest.count + 1,
       alerts: [...latest.alerts, alert].slice(-KEEP_ALERTS),
       kinds: { ...latest.kinds, [alert.kind]: latest.kinds[alert.kind] + 1 },

@@ -7,16 +7,26 @@ import { applyPatch, isDraft, readZones, ZONES_KEY } from "./model";
 
 /**
  * A fresh list from the server, with this tab's unsaved work kept on top: zones still being
- * created and edits still in flight would otherwise blink out when a refetch lands.
+ * created and edits still in flight would otherwise blink out when a refetch lands. Events that
+ * overtook the list win: a zone changed again or deleted meanwhile is not set back by it.
  */
 async function fetchZones(client: QueryClient, signal: AbortSignal): Promise<Zone[]> {
   const server = await listZones(signal);
   const patcher = getRuntime()?.patcher;
-  const merged = server.map((zone) => {
+  const cached = new Map(readZones(client).map((zone) => [zone.id, zone]));
+  const merged: Zone[] = [];
+  for (const zone of server) {
+    if (patcher && !patcher.isCurrent(zone)) {
+      // The count is still the list's: it is the freshest one.
+      const newer = cached.get(zone.id);
+      if (newer) merged.push({ ...newer, occupancy: zone.occupancy ?? newer.occupancy });
+      continue;
+    }
+    patcher?.saw(zone);
     const overlay = patcher?.overlay(zone.id);
-    return overlay ? applyPatch(zone, overlay) : zone;
-  });
-  const drafts = readZones(client).filter((z) => isDraft(z.id));
+    merged.push(overlay ? applyPatch(zone, overlay) : zone);
+  }
+  const drafts = [...cached.values()].filter((z) => isDraft(z.id));
   return [...drafts, ...merged];
 }
 
