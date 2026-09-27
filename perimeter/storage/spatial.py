@@ -3,7 +3,10 @@
 * :func:`match_zones` — which active zones contain each report of a batch. One statement per
   batch; each report probes the GiST index on the zones' envelopes, and only candidates whose box
   contains the point pay for the exact ``ST_DWithin`` on ``geography``.
-* :func:`devices_in_bbox` — latest positions inside a viewport (GiST on ``devices.position``).
+* :func:`devices_in_bbox` — latest positions inside a viewport. A map viewport is a lon/lat
+  rectangle, so the test is planar (GiST on ``position::geometry``): on ``geography`` the same
+  rectangle would have great-circle edges that bow towards the pole and miss points near its
+  equatorward side.
 * :func:`devices_near` — devices within a radius of a point (constant radius, so ``ST_DWithin``
   itself is indexable from the devices' side).
 """
@@ -42,7 +45,7 @@ _DEVICES_IN_BBOX = text(
            ST_X(position::geometry) AS lon,
            recorded_at, speed_mps, heading_deg
     FROM devices
-    WHERE position && ST_MakeEnvelope(:west, :south, :east, :north, 4326)::geography
+    WHERE position::geometry && ST_MakeEnvelope(:west, :south, :east, :north, 4326)
       AND recorded_at > now() - make_interval(secs => :stale_s)
     ORDER BY device_id
     LIMIT :limit
@@ -99,18 +102,27 @@ async def devices_in_bbox(
     stale_s: float,
     limit: int = 50_000,
 ) -> list[DevicePosition]:
-    result = await conn.execute(
-        _DEVICES_IN_BBOX,
-        {
-            "west": west,
-            "south": south,
-            "east": east,
-            "north": north,
-            "stale_s": stale_s,
-            "limit": limit,
-        },
-    )
-    return [DevicePosition(*row) for row in result]
+    """Fresh latest positions inside the rectangle, edges included.
+
+    ``west > east`` means the rectangle crosses the antimeridian; its two halves are searched
+    separately and merged.
+    """
+    halves = [(west, east)] if west <= east else [(west, 180.0), (-180.0, east)]
+    found: dict[str, DevicePosition] = {}
+    for low, high in halves:
+        result = await conn.execute(
+            _DEVICES_IN_BBOX,
+            {
+                "west": low,
+                "south": south,
+                "east": high,
+                "north": north,
+                "stale_s": stale_s,
+                "limit": limit,
+            },
+        )
+        found.update((row.device_id, DevicePosition(*row)) for row in result)
+    return [found[device] for device in sorted(found)][:limit]
 
 
 async def devices_near(

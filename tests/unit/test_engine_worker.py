@@ -555,3 +555,56 @@ def test_transient_errors_are_told_apart_from_defects(
     make: Callable[[], BaseException], transient: bool
 ) -> None:
     assert is_transient(make()) is transient
+
+
+async def test_a_drained_partition_lingers_so_batches_grow() -> None:
+    wire = Wire()
+    partial = [wire.message(record(f"veh-{i}")) for i in range(3)]
+    later = [wire.message(record(f"veh-{i}")) for i in range(3, 5)]
+    subscription = Subscription(partial, later)
+    processor = Processor()
+
+    async def subscribe() -> Subscription:
+        return subscription
+
+    subject = PartitionWorker(
+        0,
+        subscribe=subscribe,
+        in_flight=nothing_in_flight,
+        processor=processor,
+        lease=lease(),
+        batch_max=100,
+        fetch_wait_s=0.05,
+        linger_s=0.2,
+    )
+    await run_until_drained(subject, subscription)
+    assert [len(records) for _, _, records in processor.calls] == [3, 2]
+    first, second = subscription.fetches[:2]
+    assert second - first >= 0.2  # waited for more reports after a partial batch
+
+
+async def test_a_full_batch_is_followed_by_an_immediate_fetch() -> None:
+    wire = Wire()
+    full = [wire.message(record(f"veh-{i}")) for i in range(10)]
+    subscription = Subscription(full, [wire.message(record("veh-x"))])
+    processor = Processor()
+
+    async def subscribe() -> Subscription:
+        return subscription
+
+    subject = PartitionWorker(
+        0,
+        subscribe=subscribe,
+        in_flight=nothing_in_flight,
+        processor=processor,
+        lease=lease(),
+        batch_max=10,
+        fetch_wait_s=0.05,
+        linger_s=5.0,
+    )
+    task = asyncio.create_task(subject.run())
+    await eventually(lambda: len(subscription.fetches) >= 2, within=2.0)
+    first, second = subscription.fetches[:2]
+    assert second - first < 1.0  # a backlog is consumed without lingering
+    subject.stop()  # interrupts the linger that follows the partial second batch
+    assert await asyncio.wait_for(task, 2.0) is WorkerExit.STOPPED

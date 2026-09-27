@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from datetime import UTC, datetime
 
-import pytest
-
-from perimeter.api.live.snapshot import SnapshotService, max_bulge_deg, query_boxes
+from perimeter.api.live.snapshot import SnapshotService
 from perimeter.domain import tiles
 from perimeter.domain.reports import datetime_to_ms
 from perimeter.storage.spatial import DevicePosition
@@ -14,42 +11,6 @@ from perimeter.wire.frames import FrameKind, decode_tile
 
 AMSTERDAM = (4.9041, 52.3676)
 PREFIX = tiles.quadkey_for(*AMSTERDAM, 12)
-
-
-def brute_force_bulge(width: float) -> float:
-    k = 1 / math.cos(math.radians(width / 2))
-
-    def bulge(phi: float) -> float:
-        return math.degrees(math.atan(k * math.tan(math.radians(phi)))) - phi
-
-    return max(bulge(step / 100) for step in range(9_000))
-
-
-@pytest.mark.parametrize("width", [0.087890625, 1.40625, 11.25, 45.0, 90.0])
-def test_the_bulge_bound_is_the_maximum_over_all_latitudes(width: float) -> None:
-    assert max_bulge_deg(width) == pytest.approx(brute_force_bulge(width), abs=1e-6)
-    assert max_bulge_deg(width) >= brute_force_bulge(width) - 1e-12
-
-
-def test_query_boxes_pad_only_the_equatorward_edge() -> None:
-    north = tiles.tile_bounds(tiles.tile_of_quadkey(PREFIX))
-    [box] = query_boxes(north)
-    assert (box.west, box.east, box.north) == (north.west, north.east, north.north)
-    assert north.south - 1e-5 < box.south < north.south
-    south = tiles.BBox(north.west, -north.north, north.east, -north.south)
-    [box] = query_boxes(south)
-    assert (box.south, box.west, box.east) == (south.south, south.west, south.east)
-    assert south.north < box.north < south.north + 1e-5
-    equator = tiles.BBox(87.1875, -2.81, 92.8125, 2.81)
-    assert query_boxes(equator) == [equator]
-
-
-def test_query_boxes_slice_tiles_wider_than_ninety_degrees() -> None:
-    world = query_boxes(tiles.tile_bounds(tiles.Tile(0, 0, 0)))
-    assert [(b.west, b.east) for b in world] == [(-180, -90), (-90, 0), (0, 90), (90, 180)]
-    north_west = query_boxes(tiles.tile_bounds(tiles.Tile(0, 0, 1)))
-    assert [(b.west, b.east) for b in north_west] == [(-180, -90), (-90, 0)]
-    assert north_west[0].south == pytest.approx(-max_bulge_deg(90) - 1e-7)
 
 
 def position(device: str, lon: float, lat: float) -> DevicePosition:

@@ -145,6 +145,7 @@ class EngineSettings(_Group):
 
     batch_max: int = Field(default=1_000, ge=1, le=10_000)
     fetch_wait_s: float = Field(default=1.0, gt=0)
+    linger_ms: int = Field(default=25, ge=0, le=1_000)
     lease_ttl_s: float = Field(default=6.0, ge=1)
     metrics_port: int = 9102
     instance_id: str | None = None

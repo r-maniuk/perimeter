@@ -9,12 +9,19 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 log = structlog.get_logger(__name__)
 
 PROBLEM_TYPE_BASE = "https://perimeter.dev/problems/"
 MEDIA_TYPE = "application/problem+json"
+
+# SQLSTATE classes meaning "the database cannot serve this right now" rather than "the request is
+# wrong": 08 connection exception, 40 transaction rollback (deadlock victim, serialization),
+# 53 insufficient resources, 57 operator intervention (includes statement_timeout).
+_UNAVAILABLE_SQLSTATE_CLASSES = frozenset({"08", "40", "53", "57"})
 
 
 class ProblemError(Exception):
@@ -125,7 +132,30 @@ def install(app: FastAPI) -> None:
         )
         return problem_response(500, "internal", "something went wrong on our side")
 
+    async def on_database(request: Request, exc: Exception) -> JSONResponse:
+        """Pool exhaustion and database outages are load conditions (503), not bugs (500)."""
+        if not database_unavailable(exc):
+            return await on_unexpected(request, exc)
+        log.warning("api.database_unavailable", path=request.url.path, error=str(exc)[:200])
+        return problem_response(
+            503,
+            "database_unavailable",
+            "the database is busy or unreachable; retry shortly",
+            headers={"Retry-After": "1"},
+        )
+
     app.add_exception_handler(ProblemError, on_problem)
     app.add_exception_handler(RequestValidationError, on_validation)
     app.add_exception_handler(StarletteHTTPException, on_http)
+    app.add_exception_handler(PoolTimeoutError, on_database)
+    app.add_exception_handler(DBAPIError, on_database)
     app.add_exception_handler(Exception, on_unexpected)
+
+
+def database_unavailable(exc: BaseException) -> bool:
+    if isinstance(exc, PoolTimeoutError):
+        return True
+    if not isinstance(exc, DBAPIError):
+        return False
+    sqlstate = getattr(exc.orig, "sqlstate", None) or ""
+    return exc.connection_invalidated or sqlstate[:2] in _UNAVAILABLE_SQLSTATE_CLASSES

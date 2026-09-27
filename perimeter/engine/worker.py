@@ -229,6 +229,7 @@ class PartitionWorker:
         lease: LeaseHandle,
         batch_max: int,
         fetch_wait_s: float,
+        linger_s: float = 0.0,
         clock: Clock = SYSTEM_CLOCK,
         backoff: Backoff | None = None,
     ) -> None:
@@ -239,6 +240,7 @@ class PartitionWorker:
         self._lease = lease
         self._batch_max = batch_max
         self._fetch_wait_s = fetch_wait_s
+        self._linger_s = linger_s
         self._clock = clock
         self._backoff = backoff or Backoff()
         self._stopping = asyncio.Event()
@@ -308,10 +310,16 @@ class PartitionWorker:
         return None
 
     async def _consume(self, sub: PullSubscription) -> WorkerExit:
+        full = True
         while not self._stopping.is_set():
             if not self._lease.valid(self._clock.monotonic()):
                 await self._sleep(LEASE_POLL_S)
                 continue
+            if not full and self._linger_s:
+                # The last fetch drained the partition: let reports gather for a moment, so one
+                # transaction carries many of them. Under a backlog batches are full and nobody
+                # waits; at idle the next fetch simply blocks until the first report arrives.
+                await self._sleep(self._linger_s)
             try:
                 msgs = await sub.fetch(self._batch_max, timeout=self._fetch_wait_s)
             except TimeoutError:  # nothing to do this time
@@ -321,6 +329,7 @@ class PartitionWorker:
                 self._log.warning("engine.fetch_failed", error=repr(exc), retry_in_s=delay)
                 await self._sleep(delay)
                 continue
+            full = len(msgs) >= self._batch_max
             outcome = await self._handle(msgs)
             if outcome is _Outcome.FENCED:
                 return WorkerExit.FENCED

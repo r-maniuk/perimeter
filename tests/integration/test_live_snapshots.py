@@ -1,16 +1,16 @@
-"""Snapshot frames against real PostGIS: exact tiles, the whole world, conservative query boxes."""
+"""Snapshot frames against real PostGIS: exact tiles, the whole world, tiles of every size."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import bindparam, text
-from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from perimeter.api.live.snapshot import SnapshotService, query_boxes
+from perimeter.api.live.snapshot import SnapshotService
 from perimeter.domain import tiles
+from perimeter.storage.spatial import devices_in_bbox
 from perimeter.wire.frames import FrameKind, decode_tile
 
 AMSTERDAM = (4.9041, 52.3676)
@@ -80,48 +80,27 @@ async def test_the_whole_world_and_its_quarters_find_devices_everywhere(db: Asyn
         assert await ids_in(service, quarter) == expected
 
 
-_MISSES = text(
-    """
-    SELECT count(*)
-    FROM (SELECT CAST(:w AS float8) AS w, CAST(:s AS float8) AS s,
-                 CAST(:e AS float8) AS e, CAST(:n AS float8) AS n) AS box,
-         generate_series(0, 200) AS gx, generate_series(0, 50) AS gy
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM unnest(CAST(:ws AS float8[]), CAST(:ss AS float8[]),
-                    CAST(:es AS float8[]), CAST(:ns AS float8[])) AS b(w, s, e, n)
-        WHERE ST_SetSRID(ST_MakePoint(box.w + (box.e - box.w) * gx / 200.0,
-                                      box.s + (box.n - box.s) * gy / 50.0), 4326)::geography
-              && ST_MakeEnvelope(b.w, b.s, b.e, b.n, 4326)::geography
-    )
-    """
-).bindparams(
-    bindparam("ws", type_=ARRAY(DOUBLE_PRECISION)),
-    bindparam("ss", type_=ARRAY(DOUBLE_PRECISION)),
-    bindparam("es", type_=ARRAY(DOUBLE_PRECISION)),
-    bindparam("ns", type_=ARRAY(DOUBLE_PRECISION)),
-)
-
-
-async def misses(db: AsyncEngine, box: tiles.BBox, cover: list[tiles.BBox]) -> int:
-    """Points of a 201 x 51 grid over ``box`` that no geography envelope of ``cover`` finds."""
-    async with db.connect() as conn:
-        found: int = (
-            await conn.execute(
-                _MISSES,
-                {
-                    "w": box.west,
-                    "s": box.south,
-                    "e": box.east,
-                    "n": box.north,
-                    "ws": [b.west for b in cover],
-                    "ss": [b.south for b in cover],
-                    "es": [b.east for b in cover],
-                    "ns": [b.north for b in cover],
-                },
-            )
-        ).scalar_one()
-    return found
+async def put_grid(db: AsyncEngine, box: tiles.BBox, columns: int, rows: int) -> set[str]:
+    """Devices on a grid over ``box`` (edges included); returns their ids."""
+    ids = []
+    async with db.begin() as conn:
+        for i in range(columns + 1):
+            for j in range(rows + 1):
+                lon = box.west + (box.east - box.west) * i / columns
+                lat = box.south + (box.north - box.south) * j / rows
+                device_id = f"g-{i}-{j}"
+                ids.append(device_id)
+                await conn.execute(
+                    text(
+                        """
+                        INSERT INTO devices (device_id, position, recorded_at, received_at)
+                        VALUES (:d, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography,
+                                now(), now())
+                        """
+                    ),
+                    {"d": device_id, "lon": lon, "lat": lat},
+                )
+    return set(ids)
 
 
 @pytest.mark.parametrize(
@@ -134,14 +113,58 @@ async def misses(db: AsyncEngine, box: tiles.BBox, cover: list[tiles.BBox]) -> i
         tiles.BBox(-180.0, 0.0, 180.0, 85.0511287798066),  # wider than a hemisphere
     ],
 )
-async def test_padded_query_boxes_miss_nothing_where_the_plain_envelope_does(
+async def test_viewport_queries_find_every_device_of_wide_and_edge_straddling_boxes(
     db: AsyncEngine, box: tiles.BBox
 ) -> None:
-    assert await misses(db, box, [box]) > 0  # the probe is sharp enough to see the problem
-    assert await misses(db, box, query_boxes(box)) == 0
+    # Boxes whose parallels a great-circle test would bow away from: the planar test must not.
+    expected = await put_grid(db, box, columns=40, rows=10)
+    async with db.connect() as conn:
+        found = await devices_in_bbox(
+            conn, west=box.west, south=box.south, east=box.east, north=box.north, stale_s=600
+        )
+    assert {row.device_id for row in found} == expected
 
 
-async def test_padded_query_boxes_cover_real_tiles_at_every_zoom(db: AsyncEngine) -> None:
+async def test_tiles_of_every_zoom_return_exactly_their_devices(db: AsyncEngine) -> None:
+    await put_grid(db, tiles.BBox(3.0, 51.0, 7.0, 54.0), columns=40, rows=30)
+    service = snapshots(db)
     for zoom in range(13):
-        box = tiles.tile_bounds(tiles.tile_for(*AMSTERDAM, zoom))
-        assert await misses(db, box, query_boxes(box)) == 0, f"zoom {zoom}"
+        tile = tiles.tile_for(*AMSTERDAM, zoom)
+        prefix = tiles.quadkey(tile)
+        async with db.connect() as conn:
+            everything = await devices_in_bbox(
+                conn, west=-180, south=-85.06, east=180, north=85.06, stale_s=600
+            )
+        expected = {d.device_id for d in everything if tiles.tile_for(d.lon, d.lat, zoom) == tile}
+        assert await ids_in(service, prefix) == expected, f"zoom {zoom}"
+
+
+async def test_antimeridian_viewports_are_searched_on_both_sides(db: AsyncEngine) -> None:
+    await put_device(db, "east-of-line", 179.9, 10.0)
+    await put_device(db, "west-of-line", -179.9, 10.0)
+    await put_device(db, "far-away", 0.0, 10.0)
+    async with db.connect() as conn:
+        found = await devices_in_bbox(
+            conn, west=179.0, south=5.0, east=-179.0, north=15.0, stale_s=600
+        )
+    assert [row.device_id for row in found] == ["east-of-line", "west-of-line"]
+
+
+async def test_viewport_queries_use_the_planar_index(db: AsyncEngine) -> None:
+    await put_grid(db, tiles.BBox(4.0, 52.0, 5.0, 53.0), columns=60, rows=60)
+    async with db.begin() as conn:
+        await conn.execute(text("ANALYZE devices"))
+        plan: str = (
+            (
+                await conn.execute(
+                    text(
+                        "EXPLAIN SELECT device_id FROM devices "
+                        "WHERE position::geometry && ST_MakeEnvelope(4.5, 52.5, 4.51, 52.51, 4326)"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+            .__str__()
+        )
+    assert "devices_lonlat_gix" in plan

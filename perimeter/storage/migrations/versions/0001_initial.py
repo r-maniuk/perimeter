@@ -5,6 +5,7 @@ Revises:
 Create Date: 2026-09-26
 """
 
+import re
 from collections.abc import Sequence
 
 from alembic import op
@@ -103,7 +104,10 @@ CREATE TABLE devices (
     updated_at   timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT devices_device_id_check CHECK (device_id ~ '^[A-Za-z0-9_-]{1,64}$')
 ) WITH (fillfactor = 70);
+-- Distance questions (constant radius) use the geography index; viewport questions are lon/lat
+-- rectangles and use the planar one, where a box edge is a parallel, not a great circle.
 CREATE INDEX devices_position_gix ON devices USING gist (position);
+CREATE INDEX devices_lonlat_gix ON devices USING gist ((position::geometry));
 CREATE INDEX devices_recorded_at_brin ON devices USING brin (recorded_at);
 
 CREATE TABLE zone_presence (
@@ -156,8 +160,8 @@ def upgrade() -> None:
     op.execute(ENVELOPE_FUNCTION)
     op.execute(ENVELOPE_COMMENT)
     # asyncpg runs each statement as a prepared statement, which admits one command at a time.
-    # The schema contains no function bodies, so splitting on ";" is exact here.
-    for statement in SCHEMA.split(";"):
+    # Statements end with ";" at the end of a line (the schema has no function bodies).
+    for statement in re.split(r";[ \t]*\n", SCHEMA):
         if statement.strip():
             op.execute(statement)
 

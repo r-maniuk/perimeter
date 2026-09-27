@@ -218,6 +218,7 @@ class EngineService:
             lease=lease,
             batch_max=self.settings.engine.batch_max,
             fetch_wait_s=self.settings.engine.fetch_wait_s,
+            linger_s=self.settings.engine.linger_ms / 1000,
         )
 
     async def _lease_bucket(self, nc: NatsClient) -> tuple[float, KeyValue, LeaseBucket]:
