@@ -361,7 +361,7 @@ class LiveHub:
             async with asyncio.timeout(max(0.0, left_s)):
                 await session.conn.wait_closing()
         except TimeoutError:
-            session.close(CloseCode.SIGNED_OUT, "session expired: sign in again")
+            session.close(CloseCode.SESSION_EXPIRED, "session expired")
 
     async def _opening(self, session: LiveSession) -> tuple[int | None, ClientMessage | None]:
         """The resume point, and a first message that was not a resume (handled later)."""

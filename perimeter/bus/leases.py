@@ -103,7 +103,7 @@ class LeaseBucket:
         """
         try:
             await self._kv.delete(lease.key, last=lease.revision)
-        except KeyValueError, BadRequestError:  # the key moved on: not ours to delete
+        except (KeyValueError, BadRequestError):  # the key moved on: not ours to delete
             return
 
     async def holder(self, key: str) -> str | None:

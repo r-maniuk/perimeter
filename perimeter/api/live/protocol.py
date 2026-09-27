@@ -31,6 +31,7 @@ class CloseCode(IntEnum):
     INTERNAL_ERROR = 1011  # including a socket that did not accept a message in time
     TRY_AGAIN_LATER = 1013  # a dependency (broker) is unavailable right now
     SIGNED_OUT = 4001
+    SESSION_EXPIRED = 4002  # the token that opened the socket expired: sign in again
     FORBIDDEN = 4003
     EVENTS_OVERFLOW = 4008  # the client fell behind its events: reconnect with resume_after
     TOO_MANY_SESSIONS = 4009

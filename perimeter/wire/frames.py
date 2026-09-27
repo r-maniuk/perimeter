@@ -1,8 +1,9 @@
 """Binary position frames.
 
 Live positions are the only high-volume stream a browser receives, so they travel as compact
-binary frames instead of JSON: about 26 bytes per device instead of ~110, encoded once in the
-engine and forwarded byte-for-byte by every API replica to every interested socket.
+binary frames instead of JSON: 26 bytes per device (with a 9-character id) instead of 100-120 as
+compact JSON with the same fields, encoded once in the engine and forwarded byte-for-byte by every
+API replica to every interested socket.
 
 Tile frame layout (little-endian, 4-byte aligned arrays)::
 

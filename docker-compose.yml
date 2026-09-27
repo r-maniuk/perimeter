@@ -28,7 +28,8 @@ x-logging: &logging
 # limits on CPU, memory and number of processes. The limits leave several times the headroom of
 # what was measured with 10,000 devices reporting every 3 s (3,300 reports/s, docs/benchmarks.md):
 # engine 97 MiB and a quarter of a core each, db 409 MiB and half a core, nats 148 MiB, api about
-# 100 MiB, edge 18 MiB. No service may use more than 2 CPUs, so the stack starts on a 2-vCPU VM.
+# 100 MiB, edge 18 MiB. No CPU limit is above 2, so the stack starts on a 2-vCPU VM; the database
+# has none (see below).
 x-hardened: &hardened
   read_only: true
   cap_drop: [ALL]
@@ -150,7 +151,10 @@ services:
     restart: unless-stopped
     deploy:
       resources:
-        limits: {cpus: "2", memory: 2G, pids: 256}
+        # No CPU limit: throughput is bound by the database, and any fixed number either leaves a
+        # big machine idle or keeps the stack from starting on a small one (Docker refuses a limit
+        # above the machine's CPUs). Memory and processes stay bounded.
+        limits: {memory: 2G, pids: 256}
 
   nats:
     <<: *hardened
@@ -184,7 +188,7 @@ services:
     restart: unless-stopped
     deploy:
       resources:
-        limits: {cpus: "1", memory: 1G, pids: 128}
+        limits: {cpus: "2", memory: 1G, pids: 128}
 
   init:
     <<: *app

@@ -538,6 +538,7 @@ describe("reconnecting", () => {
 
   it.each([
     [4001, "signedOut"],
+    [4002, "signedOut"],
     [4003, "blocked"],
     [4009, "blocked"],
   ] as const)("stays closed after close code %i (%s)", (code, state) => {
@@ -556,8 +557,14 @@ describe("reconnecting", () => {
     signedOut.open();
     signedOut.last().drop(CloseCode.SignedOut);
     vi.advanceTimersByTime(60_000);
-    expect(signedOut.client.status.state).toBe("signedOut");
+    expect(signedOut.client.status).toEqual({ state: "signedOut", expired: false });
     expect(signedOut.sockets).toHaveLength(1);
+
+    const expired = setup();
+    expired.client.start();
+    expired.open();
+    expired.last().drop(CloseCode.SessionExpired, "session expired");
+    expect(expired.client.status).toEqual({ state: "signedOut", expired: true });
 
     const capped = setup();
     capped.client.start();

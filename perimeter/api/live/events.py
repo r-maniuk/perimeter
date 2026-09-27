@@ -373,7 +373,7 @@ class UserFeed:
         try:
             seq = int(headers["Nats-Sequence"])
             prev = int(headers["Nats-Last-Sequence"])
-        except KeyError, ValueError:
+        except (KeyError, ValueError):
             log.warning("live.event_without_sequence", subject=msg.subject)
             return
         async with self._lock:

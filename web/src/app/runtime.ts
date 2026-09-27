@@ -202,7 +202,13 @@ export class Runtime {
       case "status":
         useLive.getState().setStatus(event.status);
         if (event.status.state === "signedOut") {
-          useSession.getState().signedOut("This session was signed out from another device.");
+          useSession
+            .getState()
+            .signedOut(
+              event.status.expired
+                ? "Your session has expired. Sign in again."
+                : "This session was signed out from another device.",
+            );
         } else if (event.status.state === "blocked" && event.status.code === 4003) {
           void this.#checkIdentity();
         }

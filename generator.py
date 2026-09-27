@@ -47,6 +47,16 @@ Observe
     ``--observe USER`` signs in, optionally creates demo zones, opens the live channel with a
     viewport over the simulated area, decodes the binary position frames and measures end-to-end
     latency (device clock to live socket), and counts alert events and their latency.
+
+Reading guide, in the order a report travels
+    ``Profile``, ``Device``, ``Mobility``   how a device moves and what it reports
+    ``Fleet``                              the heap that decides who reports next
+    ``BatchQueue``, ``Drain``              the bounded buffer between the clock and the network
+    ``HttpTransport``, ``WsTransport``     the two ways reports leave, with their backpressure
+    ``Observer``                           sign-in, demo zones and the live channel's latency
+    ``Stats``, ``Histogram``, ``Latency``  the books and the percentiles
+    ``Config``, ``Option``                 every setting, its flag and its ``GENERATOR_*`` variable
+    ``LoadRun``                            the run itself: start-up, the clock, the report, the end
 """
 
 from __future__ import annotations

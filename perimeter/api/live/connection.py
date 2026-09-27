@@ -260,7 +260,7 @@ class LiveConnection:
         try:
             async with asyncio.timeout(self._close_timeout_s):
                 await self._websocket.close(self._close_code, self._close_reason)
-        except TimeoutError, OSError, RuntimeError, WebSocketDisconnect:
+        except (TimeoutError, OSError, RuntimeError, WebSocketDisconnect):
             log.debug("live.close_frame_not_sent", code=self._close_code)
 
     async def _guard(self, work: Callable[[], Awaitable[None]], role: str) -> None:
@@ -338,7 +338,7 @@ class LiveConnection:
         except TimeoutError:
             self.close(CloseCode.INTERNAL_ERROR, "send timed out")
             return False
-        except OSError, RuntimeError, WebSocketDisconnect:
+        except (OSError, RuntimeError, WebSocketDisconnect):
             self.mark_peer_closed()
             return False
         metrics.SEND_SECONDS.observe(time.perf_counter() - started)

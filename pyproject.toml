@@ -3,7 +3,6 @@ name = "perimeter"
 version = "1.0.0"
 description = "Real-time device tracking and circular geofence alerting on FastAPI, PostGIS and NATS JetStream"
 readme = "README.md"
-license = "MIT"
 requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.20.0",
@@ -73,7 +72,9 @@ module-root = ""
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+# The runtime is 3.14; lint and format as 3.13 so that code keeps forms every reader knows, such
+# as parenthesised multi-exception clauses (PEP 758 drops the parentheses).
+target-version = "py313"
 extend-exclude = ["web", "perimeter/storage/migrations/versions"]
 
 [tool.ruff.lint]
@@ -122,7 +123,6 @@ asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 markers = [
     "integration: needs PostGIS and NATS (started with testcontainers or TEST_DATABASE_URL / TEST_NATS_URL)",
-    "e2e: needs the full compose stack",
 ]
 filterwarnings = ["error", "ignore::DeprecationWarning:testcontainers.*"]
 

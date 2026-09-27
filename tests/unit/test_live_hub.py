@@ -136,9 +136,9 @@ async def test_a_socket_is_closed_when_its_token_expires() -> None:
     hub = hub_with(OpsBoard(FakeNats()))  # type: ignore[arg-type]
     session, websocket = open_session(hub, expires_at=int(time.time()) + 1)
     await asyncio.wait_for(hub._until_closed_or_expired(session), 3)
-    assert session.conn.close_code == CloseCode.SIGNED_OUT
+    assert session.conn.close_code == CloseCode.SESSION_EXPIRED
     await hub._finish(session)
-    assert websocket.closed_with == CloseCode.SIGNED_OUT
+    assert websocket.closed_with == CloseCode.SESSION_EXPIRED
 
 
 async def test_the_sweep_closes_a_socket_whose_revocation_notice_was_lost() -> None:

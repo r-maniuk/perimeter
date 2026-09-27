@@ -124,17 +124,13 @@ jobs:
       - name: Start the stack
         run: docker compose up --detach --no-build --wait --wait-timeout 180
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-
-      - name: Install the smoke test's dependencies
-        run: uv sync --frozen
-
+      # Both run from the application image inside the stack's network: the host needs Docker
+      # (and python3 for the drill), nothing else.
       - name: Smoke test through the edge
         run: make smoke
+
+      - name: Failure drill (an engine killed under load; nothing may be lost or doubled)
+        run: make drill KILL=engine ARGS="--devices 3000 --duration 60 --at 25 --down 10"
 
       - name: No permission violations on the broker
         run: make audit-broker

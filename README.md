@@ -211,7 +211,7 @@ reserved for transitions, so a device parked inside a zone does not page its own
 ### 5. WebSocket architecture: encode once, filter at the broker, never wait on a socket
 
 - **Positions are binary.** A tile frame holds ids and fixed-point columns: 26 bytes per device,
-  against about 110 as compact JSON with the same fields. The engine encodes it once; API replicas
+  against 100–120 as compact JSON with the same fields. The engine encodes it once; API replicas
   forward the bytes to every interested socket without decoding them, and browsers read the columns
   straight into WebGL buffers.
 - **The broker does the filtering.** Frames are published per map tile on `pos.<d1>.<d2>…<d12>`,
@@ -235,7 +235,7 @@ reserved for transitions, so a device parked inside a zone does not page its own
   to the other.
 - **Cluster-wide:** a KV bucket lists every live session of a user on every replica (the Sessions
   panel); signing one out revokes its token everywhere and closes its socket with 4001. A socket
-  also closes when its token expires.
+  also closes, with 4002, when its token expires.
 - **Durable events:** alerts and zone changes are written to a transactional outbox with the
   change, relayed to the `EVENTS` stream (right after the commit, plus a sweeper for crashes in
   between) and de-duplicated by id. Each user's events form one sequence chain: every event carries
@@ -341,8 +341,9 @@ curl -s "localhost:8080/v1/alerts?limit=5" -H "authorization: Bearer $TOKEN"   #
 resume mode, tile zoom), then binary position bundles for the declared viewport, `event` frames
 `{seq, prev, event}` (alerts and zone changes), `pulse`, `sessions`, `resync`, `ops`, `pong`.
 Client to server: `viewport` (bounding box and zoom — positions flow once one is sent), `resume`
-(or `?resume_after=` on connect), `ping`, `ops`. Close codes: 4001 signed out or expired, 4003
-forbidden, 4008 fell behind (resume), 4009 too many sessions, 1001/1011/1012/1013 reconnect.
+(or `?resume_after=` on connect), `ping`, `ops`. Close codes: 4001 signed out, 4002 session
+expired, 4003 forbidden, 4008 fell behind (resume), 4009 too many sessions, 1001/1011/1012/1013
+reconnect.
 
 ## Load generator
 
@@ -386,8 +387,9 @@ cd web && npm ci && npm test
 and NATS started by testcontainers (or services named by `TEST_DATABASE_URL` / `TEST_NATS_URL`).
 Highlights, detailed in [docs/design.md](docs/design.md#6-tests-worth-knowing-about):
 
-- **Spatial correctness**: Hypothesis with GeographicLib as the oracle, at every latitude and across
-  the antimeridian; indexed matching equal to the naive join; `EXPLAIN` asserts the index plans.
+- **Spatial correctness**: Hypothesis with GeographicLib as the oracle, up to ±84° and across the
+  antimeridian, and every circle, polar ones included, inside its envelope; indexed matching equal
+  to the naive join; `EXPLAIN` asserts the index plans.
 - **The state machine**: any split of a track into batches gives the same alerts; replays are
   no-ops; enter and exit alternate; dwell fires once per stay.
 - **Failure paths on real infrastructure**: fencing, takeover, a recreated lease bucket, track
@@ -396,8 +398,9 @@ Highlights, detailed in [docs/design.md](docs/design.md#6-tests-worth-knowing-ab
   matrix** on a secured server.
 
 CI (`.github/workflows/ci.yml`) runs lint, types and the full suite with a coverage floor of 90 %,
-the web gates, and a stack job that builds the images, starts the stack and runs `make smoke` and
-`make audit-broker`.
+the web gates, and a stack job that builds the images, starts the stack, runs `make smoke`, kills
+an engine under load (`make drill`: nothing may be lost or doubled) and checks the broker's log
+for refusals.
 
 ## Limits and next steps
 

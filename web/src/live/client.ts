@@ -4,7 +4,8 @@
  *
  * Responsibilities kept here, independent of React and testable with a fake socket:
  * - connection lifecycle with exponential back-off and jitter, honouring the close codes
- *   (4001 signed out, 4003 forbidden, 4008 resume now, 4009 too many sessions, 1013 overloaded);
+ *   (4001 signed out, 4002 session expired, 4003 forbidden, 4008 resume now, 4009 too many
+ *   sessions, 1013 overloaded);
  * - exactly-once events: `seq`/`prev` sequencing, `last_seq` persisted per tab, `resume_after` on
  *   every reconnect, a client-side gap check that reconnects to heal;
  * - one account: a socket whose hello speaks for another user (the browser signed in as someone
@@ -38,6 +39,7 @@ export const CloseCode = {
   Internal: 1011,
   Overloaded: 1013,
   SignedOut: 4001,
+  SessionExpired: 4002,
   Forbidden: 4003,
   EventOverflow: 4008,
   TooManySessions: 4009,
@@ -89,7 +91,7 @@ export type LiveStatus =
   | { state: "offline" }
   | { state: "paused" }
   | { state: "blocked"; code: number; reason: string }
-  | { state: "signedOut" }
+  | { state: "signedOut"; expired: boolean }
   | { state: "stopped" };
 
 export type LiveEvent =
@@ -396,7 +398,8 @@ export class LiveClient {
     this.#lastCode = code;
     switch (code) {
       case CloseCode.SignedOut:
-        this.#setStatus({ state: "signedOut" });
+      case CloseCode.SessionExpired:
+        this.#setStatus({ state: "signedOut", expired: code === CloseCode.SessionExpired });
         return;
       case CloseCode.Forbidden:
         this.#setStatus({ state: "blocked", code, reason: reason || "forbidden" });
