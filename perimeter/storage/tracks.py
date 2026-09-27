@@ -2,29 +2,34 @@
 
 The engine inserts the reports of each batch in the batch's own transaction (one set-based
 statement, :data:`perimeter.engine.sql.INSERT_TRACKS`). The table is range-partitioned by event
-time in 10-minute slots, and :func:`maintain` keeps the window rolling through the migration's
+time in 10-minute slots, and :func:`roll` keeps the window rolling through the migration's
 ``perimeter_maintain_tracks`` function: expired slots are dropped whole, which costs the same
 however many reports they hold, and new slots are attached ahead of time. Reports no slot covers
-land in a default partition; the next round purges the expired ones and moves the rest into the
-slot it creates for them, so maintenance that could not run for a while catches up by itself. A
-device's trail is then one index range scan on ``(device_id, recorded_at)`` in the few newest
-partitions.
+land in a default partition; maintenance purges the expired ones and moves the rest into their
+slot, in steps of bounded size that each commit on their own, so maintenance that could not run
+for a while (a long backup holds the locks it needs) catches up by itself, however large the
+backlog. A device's trail is then one index range scan on ``(device_id, recorded_at)`` in the
+few newest partitions.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from perimeter.storage.zones import real
 
 _MAINTAIN = text(
-    "SELECT created, dropped, moved, purged, failed"
-    " FROM perimeter_maintain_tracks(make_interval(mins => :retention_min))"
+    "SELECT created, dropped, moved, purged, failed, more"
+    " FROM perimeter_maintain_tracks(make_interval(mins => :retention_min), budget => :budget)"
 )
+
+#: Reports one step moves or purges at most: well under a second, far inside any statement timeout.
+STEP_ROWS = 20_000
 
 _RECENT = text(
     """
@@ -57,21 +62,56 @@ class TrackPoint:
 class Maintenance:
     created: int  # slots attached
     dropped: int  # expired slots dropped
-    moved: int  # reports moved out of the default partition into their new slot
+    moved: int  # reports moved out of the default partition into their slot
     purged: int  # expired reports removed from the default partition
     failed: int  # steps that could not get their lock in time; retried next round
+    more: bool = False  # work is left that the next step can do right away
+
+    def __add__(self, later: Maintenance) -> Maintenance:
+        return Maintenance(
+            created=self.created + later.created,
+            dropped=self.dropped + later.dropped,
+            moved=self.moved + later.moved,
+            purged=self.purged + later.purged,
+            failed=self.failed + later.failed,
+            more=later.more,
+        )
 
 
-async def maintain(conn: AsyncConnection, *, retention_min: int) -> Maintenance:
-    """Create the upcoming slots and drop the expired ones (a no-op most of the time)."""
-    row = (await conn.execute(_MAINTAIN, {"retention_min": retention_min})).one()
+async def maintain(
+    conn: AsyncConnection, *, retention_min: int, budget: int = STEP_ROWS
+) -> Maintenance:
+    """One bounded step: drop, purge, move or attach as much as ``budget`` rows allow.
+
+    A no-op most of the time. The step's work is kept only if the caller commits it; ``more``
+    says another step has work to do right away.
+    """
+    row = (await conn.execute(_MAINTAIN, {"retention_min": retention_min, "budget": budget})).one()
     return Maintenance(
         created=int(row.created),
         dropped=int(row.dropped),
         moved=int(row.moved),
         purged=int(row.purged),
         failed=int(row.failed),
+        more=bool(row.more),
     )
+
+
+async def roll(
+    db: AsyncEngine, *, retention_min: int, time_budget_s: float, budget: int = STEP_ROWS
+) -> Maintenance:
+    """Step until nothing is left or ``time_budget_s`` is spent, each step in its own transaction.
+
+    What a step did stays done even if a later one fails; the total says whether work was left.
+    """
+    deadline = time.monotonic() + time_budget_s
+    total = Maintenance(created=0, dropped=0, moved=0, purged=0, failed=0)
+    while True:
+        async with db.begin() as conn:
+            step = await maintain(conn, retention_min=retention_min, budget=budget)
+        total += step
+        if not step.more or time.monotonic() >= deadline:
+            return total
 
 
 async def recent(

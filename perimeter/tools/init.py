@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 from pathlib import Path
 
 import structlog
@@ -19,6 +20,7 @@ from perimeter.storage.engine import create_engine, database_url
 log = structlog.get_logger(__name__)
 
 MIGRATIONS = Path(__file__).resolve().parent.parent / "storage" / "migrations"
+INIT_TRACKS_BUDGET_S = 60.0
 
 
 def alembic_config(database: DatabaseSettings) -> Config:
@@ -43,9 +45,11 @@ async def run() -> None:
     await asyncio.to_thread(migrate, settings.database)
     db = create_engine(settings.database, application_name="perimeter-init", pool_size=1)
     try:
-        async with db.begin() as conn:
-            done = await tracks.maintain(conn, retention_min=settings.tracks.retention_min)
-        log.info("init.tracks_ready", created=done.created, dropped=done.dropped)
+        # The engines finish whatever does not fit in this minute (a backlog after an outage).
+        done = await tracks.roll(
+            db, retention_min=settings.tracks.retention_min, time_budget_s=INIT_TRACKS_BUDGET_S
+        )
+        log.info("init.tracks_ready", **asdict(done))
     finally:
         await db.dispose()
     nc = await connect(settings.nats, name="perimeter-init")

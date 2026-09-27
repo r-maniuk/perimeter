@@ -1,8 +1,9 @@
 """Liveness and readiness.
 
 ``/healthz`` answers as long as the event loop runs (container restart signal). ``/readyz`` checks
-what this replica needs to serve traffic — database, broker, a responsive loop — and is what the
-edge proxy and compose health checks use to route around a degraded replica.
+what this replica needs to serve traffic — database, broker, a responsive loop — for the compose
+health check and any orchestrator that routes by readiness. The edge proxy does not probe it: it
+takes a replica out of rotation only when connections to it fail (infra/caddy/Caddyfile).
 """
 
 from __future__ import annotations

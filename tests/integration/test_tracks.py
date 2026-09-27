@@ -40,8 +40,21 @@ async def count(conn: AsyncConnection, table: str = "device_tracks") -> int:
     return total
 
 
+async def settle(conn: AsyncConnection, *, retention_min: int) -> tracks.Maintenance:
+    """Step until the window is complete (a long one takes more than one step)."""
+    total = tracks.Maintenance(created=0, dropped=0, moved=0, purged=0, failed=0)
+    for _ in range(50):
+        total += await tracks.maintain(conn, retention_min=retention_min)
+        if not total.more:
+            return total
+    raise AssertionError("maintenance never settled")
+
+
 async def test_maintenance_creates_the_window_once(db: AsyncEngine) -> None:
     async with db.begin() as conn:
+        for name in await slots(conn):  # whatever earlier tests left: start from no window
+            if name != "device_tracks_default":
+                await conn.execute(text(f"DROP TABLE {name}"))
         first = await tracks.maintain(conn, retention_min=30)
         second = await tracks.maintain(conn, retention_min=30)
         names = await slots(conn)
@@ -55,7 +68,7 @@ async def test_maintenance_creates_the_window_once(db: AsyncEngine) -> None:
 async def test_expired_slots_are_dropped_whole_and_recent_ones_kept(db: AsyncEngine) -> None:
     now = datetime.now(UTC)
     async with db.begin() as conn:
-        await tracks.maintain(conn, retention_min=180)
+        await settle(conn, retention_min=180)
         await put(conn, "veh-1", now - timedelta(minutes=150))
         await put(conn, "veh-1", now - timedelta(minutes=5))
         before = len(await slots(conn))
@@ -78,9 +91,12 @@ async def test_reports_older_than_every_slot_are_cleared(db: AsyncEngine) -> Non
     assert rolled.purged == 1
 
 
+def slot_start(at: datetime) -> datetime:
+    return at.replace(minute=at.minute - at.minute % 10, second=0, microsecond=0)
+
+
 def slot_of(at: datetime) -> str:
-    start = at.replace(minute=at.minute - at.minute % 10, second=0, microsecond=0)
-    return f"device_tracks_{start:%Y%m%d%H%M}"
+    return f"device_tracks_{slot_start(at):%Y%m%d%H%M}"
 
 
 async def test_reports_that_arrived_while_maintenance_lagged_move_into_their_slot(
@@ -103,7 +119,7 @@ async def test_reports_that_arrived_while_maintenance_lagged_move_into_their_slo
 
 async def test_a_step_that_cannot_get_its_lock_waits_for_the_next_round(db: AsyncEngine) -> None:
     async with db.begin() as conn:
-        await tracks.maintain(conn, retention_min=60)
+        await settle(conn, retention_min=60)
     async with db.connect() as backup, backup.begin():
         # What pg_dump holds on every table it reads, for as long as it runs.
         await backup.execute(text("LOCK TABLE device_tracks IN ACCESS SHARE MODE"))
@@ -111,13 +127,14 @@ async def test_a_step_that_cannot_get_its_lock_waits_for_the_next_round(db: Asyn
         async with db.begin() as conn:
             blocked = await tracks.maintain(conn, retention_min=30)
         waited = time.monotonic() - started
-    assert blocked.dropped == 0
-    assert blocked.failed >= 3  # the expired slots, each given up after half a second
-    assert waited < 10
+    # The first expired slot gave up after half a second, and the rest of its phase with it: the
+    # same holder has them all.
+    assert (blocked.dropped, blocked.failed, blocked.more) == (0, 1, False)
+    assert waited < 2
     async with db.begin() as conn:
         caught_up = await tracks.maintain(conn, retention_min=30)
     assert caught_up.failed == 0
-    assert caught_up.dropped == blocked.failed
+    assert caught_up.dropped >= 3  # 60 minutes shrunk to 30
 
 
 async def test_recent_returns_the_newest_points_oldest_first(db: AsyncEngine) -> None:
@@ -140,7 +157,7 @@ async def test_recent_returns_the_newest_points_oldest_first(db: AsyncEngine) ->
 
 async def test_trail_reads_touch_only_recent_slots(db: AsyncEngine) -> None:
     async with db.begin() as conn:
-        await tracks.maintain(conn, retention_min=180)
+        await settle(conn, retention_min=180)
         plan = "\n".join(
             row[0]
             for row in await conn.execute(
@@ -151,3 +168,100 @@ async def test_trail_reads_touch_only_recent_slots(db: AsyncEngine) -> None:
             )
         )
     assert "Subplans Removed" in plan or plan.count("device_tracks_2") <= 4
+
+
+async def test_a_backlog_larger_than_a_step_moves_over_in_bounded_steps(db: AsyncEngine) -> None:
+    # Two slots missed while maintenance could not run: all their reports wait in the default
+    # partition, more than one step may move.
+    current = slot_start(datetime.now(UTC))
+    previous = current - timedelta(minutes=10)
+    async with db.begin() as conn:
+        await settle(conn, retention_min=30)
+        for start in (previous, current):
+            await conn.execute(text(f"DROP TABLE {slot_of(start)}"))
+            for second in range(60):
+                await put(conn, f"veh-{second}", start + timedelta(seconds=second))
+        steps = [await tracks.maintain(conn, retention_min=30, budget=25)]
+        # Moved into the slot's table, not attached yet: out of sight until it is.
+        assert await count(conn) == 95
+        while steps[-1].more:
+            assert len(steps) < 20
+            steps.append(await tracks.maintain(conn, retention_min=30, budget=25))
+        assert await count(conn, "device_tracks_default") == 0
+        assert await count(conn, slot_of(previous)) == 60
+        assert await count(conn, slot_of(current)) == 60
+        assert await count(conn) == 120
+    assert [step.moved for step in steps] == [25, 25, 10, 25, 25, 10]
+    assert sum(step.created for step in steps) == 2
+    assert all(step.failed == 0 for step in steps)
+
+
+async def test_roll_keeps_each_step_committed_and_finishes_the_backlog(db: AsyncEngine) -> None:
+    current = slot_start(datetime.now(UTC))
+    async with db.begin() as conn:
+        await settle(conn, retention_min=30)
+        await conn.execute(text(f"DROP TABLE {slot_of(current)}"))
+        for second in range(50):
+            await put(conn, "veh-3", current + timedelta(seconds=second))
+    # Out of time after the first step: what it did is committed, and it says work is left.
+    partial = await tracks.roll(db, retention_min=30, time_budget_s=0, budget=20)
+    assert (partial.moved, partial.more) == (20, True)
+    async with db.connect() as conn:
+        assert await count(conn, slot_of(current)) == 20
+    done = await tracks.roll(db, retention_min=30, time_budget_s=30, budget=20)
+    assert (done.created, done.moved, done.more) == (1, 30, False)
+    async with db.connect() as conn:
+        assert await count(conn, "device_tracks_default") == 0
+        assert await count(conn) == 50
+
+
+async def test_a_report_repeated_after_its_first_copy_moved_on_is_kept_once(
+    db: AsyncEngine,
+) -> None:
+    current = slot_start(datetime.now(UTC))
+    async with db.begin() as conn:
+        await settle(conn, retention_min=30)
+        await conn.execute(text(f"DROP TABLE {slot_of(current)}"))
+        for second in range(30):
+            await put(conn, "veh-4", current + timedelta(seconds=second))
+        first = await tracks.maintain(conn, retention_min=30, budget=20)
+        assert (first.moved, first.more) == (20, True)
+        # A retry of a report whose first copy already moved: the default partition takes it.
+        await put(conn, "veh-4", current)
+        rest = await tracks.maintain(conn, retention_min=30, budget=20)
+        assert await count(conn, "device_tracks_default") == 0
+        assert await count(conn) == 30
+    assert (rest.created, rest.moved, rest.failed, rest.more) == (1, 10, 0, False)
+
+
+async def test_a_slot_that_expires_before_it_is_attached_is_dropped(db: AsyncEngine) -> None:
+    older = slot_start(datetime.now(UTC)) - timedelta(minutes=20)
+    async with db.begin() as conn:
+        await settle(conn, retention_min=30)
+        await conn.execute(text(f"DROP TABLE {slot_of(older)}"))
+        for second in range(30):
+            await put(conn, "veh-5", older + timedelta(seconds=second))
+        started = await tracks.maintain(conn, retention_min=30, budget=20)
+        assert (started.moved, started.more) == (20, True)
+        # Retention shrinks past that slot before it could be attached.
+        shrunk = await settle(conn, retention_min=10)
+        exists: str | None = (
+            await conn.execute(text("SELECT to_regclass(:name)"), {"name": slot_of(older)})
+        ).scalar_one()
+        assert exists is None
+        assert await count(conn, "device_tracks_default") == 0
+        await settle(conn, retention_min=30)
+    assert shrunk.purged == 10  # the rest never left the default partition
+    assert shrunk.failed == 0
+
+
+async def test_a_long_window_is_attached_a_few_slots_per_step(db: AsyncEngine) -> None:
+    async with db.begin() as conn:
+        await settle(conn, retention_min=30)
+        first = await tracks.maintain(conn, retention_min=240)
+        rest = await settle(conn, retention_min=240)
+        attached = len(await slots(conn)) - 1
+        await settle(conn, retention_min=30)
+    assert (first.created, first.more) == (12, True)
+    assert not rest.more
+    assert 25 <= attached <= 27  # four hours back and twenty minutes ahead

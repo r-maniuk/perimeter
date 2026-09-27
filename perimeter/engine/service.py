@@ -61,6 +61,10 @@ POOL_HEADROOM = 2
 SHUTDOWN_GRACE_S = 10.0
 TASK_STOP_TIMEOUT_S = 5.0
 DATABASE_ATTEMPTS = 30
+# Track maintenance works in bounded steps: this long per round at most, and a round that left
+# work over (a backlog after an outage) is followed by the next after a short breather.
+TRACK_ROUND_S = 10.0
+TRACK_CATCH_UP_PAUSE_S = 1.0
 
 
 class StartupError(RuntimeError):
@@ -282,9 +286,11 @@ class EngineService:
         retention_min = self.settings.tracks.retention_min
         interval_s = self.settings.tracks.maintenance_s
         while not self._stop.is_set():
+            pause = interval_s
             try:
-                async with db.begin() as conn:
-                    done = await tracks.maintain(conn, retention_min=retention_min)
+                done = await tracks.roll(
+                    db, retention_min=retention_min, time_budget_s=TRACK_ROUND_S
+                )
             except Exception as exc:  # retried next round; inserts fall back to the default slot
                 TRACK_FAILURES.inc()
                 log.warning("engine.tracks_maintenance_failed", error=repr(exc))
@@ -294,12 +300,15 @@ class EngineService:
                 TRACK_DEFAULT_ROWS.labels("moved").inc(done.moved)
                 TRACK_DEFAULT_ROWS.labels("purged").inc(done.purged)
                 TRACK_FAILURES.inc(done.failed)
-                if done.failed:
+                if done.more:
+                    pause = TRACK_CATCH_UP_PAUSE_S
+                    log.warning("engine.tracks_catching_up", **asdict(done))
+                elif done.failed:
                     log.warning("engine.tracks_maintenance_incomplete", **asdict(done))
                 elif done.created or done.dropped or done.moved or done.purged:
                     log.info("engine.tracks_rolled", **asdict(done))
             with suppress(TimeoutError):
-                await asyncio.wait_for(self._stop.wait(), interval_s)
+                await asyncio.wait_for(self._stop.wait(), pause)
 
     async def _follow_changes(self, kv: KeyValue, coordinator: Coordinator) -> None:
         """Feed bucket changes to the coordinator; its periodic rounds remain the safety net."""

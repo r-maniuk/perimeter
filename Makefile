@@ -1,5 +1,6 @@
-# Developer workflow. Every target is a short docker compose, uv or npm command, so the stack works
-# just as well without make: `make help` lists the targets, `make -n <target>` prints the command.
+# Developer workflow. Every target is a short docker compose, uv or npm command (the drill a python3
+# script), so the stack works just as well without make: `make help` lists the targets, and
+# `make -n <target>` prints the command.
 # Running the stack, the load, the smoke test and the drill needs Docker only (and python3 for the
 # drill); the Python tests and linters need uv, the web ones npm.
 
@@ -49,7 +50,11 @@ drill: ## Kill a replica under load, then prove no loss or duplicates (KILL=engi
 	python3 scripts/drill.py --kill $(or $(KILL),engine) $(ARGS)
 
 audit-broker: ## Fail if the broker refused anything: any "Violation" in its log
-	@log="$$($(COMPOSE) logs --no-color nats)"; \
+	@set -euo pipefail; \
+	if [ -z "$$($(COMPOSE) ps --status running --quiet nats)" ]; then \
+		echo "the broker is not running: nothing to audit" >&2; exit 1; fi; \
+	log="$$($(COMPOSE) logs --no-color nats)"; \
+	if [ -z "$$log" ]; then echo "the broker log is empty: nothing to audit" >&2; exit 1; fi; \
 	if grep -F "Violation" <<<"$$log"; then exit 1; fi; \
 	echo "no permission or authorization violations in the broker log"
 

@@ -55,7 +55,7 @@ It runs as a planar test on a GiST index over `position::geometry`, decided exac
 ## 2. One owner per partition, and a fence for the one that has not noticed
 
 Reports of one device must be applied in order, so the telemetry stream is split into 16
-partitions by device (a subject transform in the broker, `partition(16)`), and exactly one engine
+partitions by device (a subject transform in the broker, `partition(16,1)`), and exactly one engine
 consumes each partition at a time.
 
 - **Leases** live in a KV bucket: created with compare-and-set, renewed by revision every third of
@@ -103,7 +103,9 @@ a test that fails without the fix pins it, and the drill loses nothing.
   last sequence it delivered and, when an event's "previous" is not that, reads the gap back from
   the stream (JetStream direct get) before delivering anything else.
 - **Resume.** A browser keeps the last sequence it received; after a reconnect, to any replica, it
-  sends `resume_after` and gets exactly the events it missed, then continues live.
+  sends `resume_after` and gets exactly the events it missed, then continues live. `EVENTS` keeps a
+  day of events and a replay stops at 5,000: past either, `hello` says `reset`, and the dashboard
+  reloads its zones and alerts over REST, which is cheaper for everybody.
 - **Tracing.** The trace context travels in the standard `traceparent` header from the ingest
   request into the engine batch that applies the report, from that transaction into the events it
   writes, and from those to the API replicas that deliver them — one trace per alert, from the
@@ -158,13 +160,18 @@ Found in code review:
    them (§4).
 8. **Track maintenance could stop for good.** PostgreSQL refuses to create a partition while the
    default partition holds rows of its range, and maintenance that could not run for 20 minutes
-   (a long backup holding locks) left exactly that. Slots are now built apart, filled with those
-   rows and attached; each step gives up after half a second instead of queueing inserts behind it.
+   (a long backup holding locks) left exactly that; moving them all in one statement would then
+   outlast the statement timeout on every round once the backlog was large, and roll back. Slots
+   are now built apart, filled and attached, in steps of at most 20,000 rows that each commit on
+   their own; while the default partition is large, steps only move its oldest rows (attaching
+   scans all of it under a lock that holds up inserts). A lock not granted within half a second
+   ends that phase until the next round. Measured: a 300,000-report backlog over three slots
+   takes 15 steps and 2.9 s, the longest step 0.35 s.
 9. **Deactivating a zone could race a batch that had just read it as active**, leaving presence
    behind: deactivation and deletion now take a lock that waits for such batches. Such a wait
    could in principle go on while batches keep reading the zone; measured under 10,000 reports/s,
-   deactivating the busiest demo zone takes 6–17 ms, and deactivating or deleting a zone that
-   every report falls in takes 30–135 ms and 550 ms (its 10,000 presence rows go with it).
+   deactivating the busiest demo zone takes 6–17 ms; deactivating a zone that every report falls
+   in takes 30–135 ms, and deleting it 550 ms (its 10,000 presence rows go with it).
 10. **A socket closed while its client was still talking** could set up subscriptions again during
     the teardown: messages of a session being torn down are ignored.
 11. **A retried report without a timestamp was stored twice** under two receive times, and could
@@ -181,12 +188,12 @@ Found in code review:
 - **Failure paths on real infrastructure** (PostGIS and NATS in containers): fencing rejects a
   stale owner; two engines split and hand over partitions; a crashed owner's unacknowledged
   messages are replayed first; a recreated lease bucket still yields newer tokens; track
-  maintenance catches up after falling behind and gives way to a backup's locks; zones are
-  deleted and deactivated mid-batch.
+  maintenance works off a backlog in bounded, separately committed steps and gives way to a
+  backup's locks; zones are deleted and deactivated mid-batch.
 - **The live channel with two real API servers** sharing one broker: one user's sessions on both
   receive each event once; a resume after a disconnect replays exactly the gap; gaps heal; slow
-  consumers are cut off without slowing anyone else; remote sign-out, token expiry and origin
-  rules close the right sockets.
+  consumers are cut off without slowing anyone else; remote sign-out and origin rules close the
+  right sockets (token expiry is covered by a unit test of the hub).
 - **The broker's permission matrix** on a secured server: each service's real work passes, and
   every forbidden action is refused and logged.
 - **The load generator** against scripted fake servers: throttling, shedding, retries, reconnects

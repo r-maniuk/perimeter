@@ -33,9 +33,10 @@ Transports
     ``http`` posts ``{"reports": [...]}`` batches, one keep-alive connection per lane. ``ws``
     streams the same batches over WebSockets with credit-based flow control: the server grants a
     number of reports (``ready``/``ack``/``credit`` messages add to the allowance), acknowledges
-    frames in order and withholds credit while it sheds load (``hold``). A frame never carries
-    more reports than the credit left; frames unacknowledged when a socket drops are sent again
-    after reconnecting (the server de-duplicates by device and timestamp).
+    frames in order and withholds credit while it sheds load (``hold``); an ``error`` answer
+    returns its frame's credit too. A frame never carries more reports than the credit left;
+    frames unacknowledged when a socket drops are sent again after reconnecting (the server
+    de-duplicates by device and timestamp within its 30 s window, and ignores a later copy).
 
 Backpressure
     A 503 or 429 pauses only the lane that received it, for ``Retry-After`` (plus jitter); other

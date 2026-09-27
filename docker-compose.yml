@@ -6,11 +6,13 @@
 # Order of start-up: secrets (one-shot) -> db, nats -> init (one-shot: migrations, broker topology)
 # -> api x2, engine x2 -> edge. Only the edge publishes a port. Secrets never appear in this file
 # or in any environment: the secrets job writes them to a volume, and each service mounts only its
-# own directory of it at /run/secrets. Tuning knobs go in an optional .env file (see .env.example).
+# own directory of it (at /run/secrets; the broker at /etc/nats/auth). Tuning knobs go in an
+# optional .env file (see .env.example).
 #
 # Networks
 #   public  the edge's published port (and, in the observability profile, the loopback-only UIs)
-#   edge    internal: edge -> api replicas; the load generator -> edge
+#   load    internal: the load generator -> edge (it cannot reach an api replica directly)
+#   edge    internal: edge -> api replicas
 #   core    internal: api, engine, init -> db, nats; metrics and traces
 # The application containers sit on internal networks only: they cannot reach the outside world,
 # and nothing outside can reach them except through the edge.
@@ -27,9 +29,9 @@ x-logging: &logging
 # an init process that forwards signals and reaps children, rotated logs; and per service below,
 # limits on CPU, memory and number of processes. The limits leave several times the headroom of
 # what was measured with 10,000 devices reporting every 3 s (3,300 reports/s, docs/benchmarks.md):
-# engine 97 MiB and a quarter of a core each, db 409 MiB and half a core, nats 148 MiB, api about
-# 100 MiB, edge 18 MiB. No CPU limit is above 2, so the stack starts on a 2-vCPU VM; the database
-# has none (see below).
+# engine 95 MiB and a quarter to under half a core each, db 387 MiB and half a core, nats 173 MiB,
+# api 100 MiB, edge 18 MiB. No CPU limit is above 2, so the stack starts on a 2-vCPU VM; the
+# database has none (see below).
 x-hardened: &hardened
   read_only: true
   cap_drop: [ALL]
@@ -39,10 +41,10 @@ x-hardened: &hardened
 
 x-app: &app
   <<: *hardened
+  # One image for every Python service, built once by the secrets job (the first to start) and
+  # never pulled: services that each built it would race to name the same new image.
   image: perimeter-app:${PERIMETER_TAG:-local}
-  build:
-    context: .
-    dockerfile: Dockerfile
+  pull_policy: never
   user: "10001:10001"
   tmpfs:
     - /tmp:size=64m,mode=1777
@@ -67,6 +69,10 @@ x-app-environment: &app-environment
 services:
   secrets:
     <<: *app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: missing
     command:
       ["python", "-m", "perimeter.tools.secrets", "/secrets", "--postgres-gid", "70", "--nats-gid", "10002"]
     # Group membership lets the job hand files to the database (70) and broker (10002) users
@@ -91,8 +97,9 @@ services:
       POSTGRES_PASSWORD_FILE: /run/secrets/superuser_password
       POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8 --locale-provider=builtin --builtin-locale=C.UTF-8
     # Sized for this workload inside a 2 GB container.
-    # - Connections: api 2 x 10 + engine 2 x 18 (every partition + 2) + init 2 = 58, plus headroom
-    #   for maintenance and a replica starting while its predecessor drains: 80 (+3 superuser).
+    # - Connections: api 2 x 10 + engine 2 x 18 (every partition + 2) + init 1 = 57, and 75 while
+    #   an engine replica starts before its predecessor has drained; 80, of which 3 are kept for
+    #   the superuser.
     # - Memory: shared_buffers a quarter of the limit, the rest left to the page cache.
     # - Small, hot tables rewritten constantly (latest positions, presence): vacuum early, often.
     # - Steady writes: fewer, smoother checkpoints; zstd-compressed full-page images in the WAL.
@@ -164,7 +171,7 @@ services:
     depends_on:
       secrets: {condition: service_completed_successfully}
     # The Go runtime collects harder as the heap nears this soft limit, well before the
-    # container's hard 1 GiB: a burst of block reads cannot get the broker OOM-killed.
+    # container's hard 1 GiB, so a burst of block reads is unlikely to get the broker OOM-killed.
     environment:
       GOMEMLIMIT: 800MiB
     volumes:
@@ -199,7 +206,6 @@ services:
     environment:
       <<: *app-environment
       DATABASE_USER: perimeter
-      DATABASE_POOL_SIZE: "2"
       NATS_USER: init
     volumes:
       - type: volume
@@ -296,7 +302,7 @@ services:
       - /data:size=16m,uid=10003,gid=10003,mode=0700
       - /config:size=1m,uid=10003,gid=10003,mode=0700
       - /tmp:size=16m,mode=1777
-    networks: [public, edge]
+    networks: [public, edge, load]
     ulimits:
       nofile: {soft: 65536, hard: 65536}
     healthcheck:
@@ -333,7 +339,7 @@ services:
         target: /run/secrets
         read_only: true
         volume: {subpath: generator}
-    networks: [edge]
+    networks: [load]
     stop_grace_period: 30s
     restart: "no"
     deploy:
@@ -396,6 +402,8 @@ configs:
 
 networks:
   public: {}
+  load:
+    internal: true
   edge:
     internal: true
   core:

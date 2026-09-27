@@ -1,23 +1,30 @@
 # Weekly update proposals for everything pinned in this repository: base images (by digest),
-# compose images, GitHub Actions (by commit), Python and web dependencies (lockfiles).
+# compose images, GitHub Actions (by commit), Python and web dependencies (lockfiles). A release
+# is proposed only once it is a week old, so a compromised one is usually pulled before then
+# (security updates are not held back).
 version: 2
 updates:
   - package-ecosystem: docker
     directories: ["/", "/infra/db", "/infra/nats", "/infra/edge"]
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
   - package-ecosystem: docker-compose
     directory: "/"
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
   - package-ecosystem: github-actions
     directory: "/"
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
   - package-ecosystem: uv
     directory: "/"
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
     groups:
       python: {patterns: ["*"]}
   - package-ecosystem: npm
     directories: ["/web", "/infra/edge/docs"]
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
     groups:
       web: {patterns: ["*"]}

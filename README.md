@@ -16,8 +16,8 @@ connection drops, a replica restarts or a process is killed.
 
 ## Run it
 
-Docker is all it takes: Docker Engine 26 or newer (secrets are mounted from volume subpaths) and
-Docker Compose 2.24 or newer, with at least 2 CPUs and 3 GB of memory for Docker. The stack is
+Docker is all it takes: Docker Engine 26 or newer and Docker Compose 2.26 or newer (secrets are
+mounted from volume subpaths), with at least 2 CPUs and 3 GB of memory for Docker. The stack is
 verified with Engine 28.4 and Compose 5.0. Python, Node, PostgreSQL and NATS all build inside it.
 
 ```bash
@@ -26,8 +26,9 @@ open http://localhost:8080
 ```
 
 From an empty Docker the first build takes about a minute and a half (base images and
-dependencies download once: 80 s here); later starts take about 15 s. The first start generates every credential into a Docker volume, so there is nothing to
-configure; `.env.example` documents the optional knobs.
+dependencies download once: 80 s here); later starts take about 15 s. The first start generates
+every credential into a Docker volume, so there is nothing to configure; `.env.example` documents
+the optional knobs.
 
 | | |
 |---|---|
@@ -39,9 +40,9 @@ configure; `.env.example` documents the optional knobs.
 | Traces and metrics | `make observe` → Jaeger on :16686, Prometheus on :9090 |
 | Stop / delete everything | `make down` / `make destroy` |
 
-Every target is a short `docker compose` command (`make -n <target>` prints it), so nothing needs
-`make`. Only development needs more: the Python tests and linters run with
-[uv](https://docs.astral.sh/uv/), the web ones with Node 22.12 or newer.
+Every target is a short `docker compose` command, the drill a `python3` script (`make -n <target>`
+prints it), so nothing needs `make`. Only development needs more: the Python tests and linters
+run with [uv](https://docs.astral.sh/uv/), the web ones with Node 22.12 or newer.
 
 ## See it work
 
@@ -61,7 +62,7 @@ Every target is a short `docker compose` command (`make -n <target>` prints it),
    throughput, backlog and event-loop lag of every process as they happen.
 
 <p>
-<img src="docs/screenshots/zone-editor.png" width="49%" alt="Editing a zone: radius handles, dwell time and notifications">
+<img src="docs/screenshots/zone-editor.png" width="49%" alt="Editing a zone: occupants, radius handle, centre and colour">
 <img src="docs/screenshots/sessions.png" width="49%" alt="The Sessions panel: live sessions of one user on both API replicas">
 </p>
 
@@ -73,7 +74,7 @@ Every target is a short `docker compose` command (`make -n <target>` prints it),
 | Ingestion endpoint (HTTP/WS) with `device_id`, `latitude`, `longitude`, `timestamp` | `POST /v1/telemetry`, `WS /v1/telemetry/stream` | The brief's field names; one report, an array or `{"reports": [...]}`; JSON or MessagePack. The timestamp is required: with the device id it makes a retry idempotent |
 | Geozone CRUD: circles (centre, radius in metres), isolated per user | `/v1/geozones` | `center: {lat, lon}`, `radius_m` (10 m – 100 km); another user's zone answers `404`, never `403` |
 | Live map over a WebSocket, alerts when a device is within the user's active zones | `WS /v1/live` | Positions stream for the viewport the client declares (binary tile frames); alerts arrive as events |
-| "Notify whenever a device enters or reports a location within" a zone | [§4](#4-alerts-exactly-the-transitions) | Every in-zone report is pushed live as a zone *pulse*; durable alerts are the transitions (enter, exit, dwell), so a parked device does not page its owner every 3 s |
+| Notify "whenever a device enters or reports a location within" a zone | [§4](#4-alerts-exactly-the-transitions) | Every in-zone report is pushed live as a zone *pulse*; durable alerts are the transitions (enter, exit, dwell), so a parked device does not page its owner every 3 s |
 | Several sessions per user | [§6](#6-websocket-state-management-many-sessions-per-user) | Every session of a user, on any replica, receives every event exactly once |
 | Mocked authentication | `POST /v1/session`, `POST /v1/token` | A username signs in (the account is created on first use) |
 | `generator.py`: async, 10,000 devices, drifting coordinates | [`generator.py`](generator.py) | asyncio + aiohttp; realistic trips; open loop; measures device-to-browser latency |
@@ -112,8 +113,8 @@ flowchart LR
 2. An **API replica** checks the device token and admission control before reading the body,
    validates each report in C (msgspec), publishes each to JetStream with a de-duplication id, and
    answers `202` only once all of them are stored.
-3. **TELEMETRY** partitions reports by device (a `partition(16)` mapping in the broker), so each
-   device's reports stay in order.
+3. **TELEMETRY** partitions reports by device (a `partition(16,1)` subject mapping in the broker,
+   on the device id), so each device's reports stay in order.
 4. The **engine** that holds the partition's lease applies a batch in one transaction — fencing
    token, one indexed PostGIS match for the whole batch, the state machine, set-based writes and
    outbox events — and only then acknowledges it.
@@ -161,8 +162,9 @@ missed devices near its equatorward edge, which a property test found.
 
 - **Acknowledged means stored.** `POST /v1/telemetry` validates each report on its own and answers
   `202 {"accepted": n, "duplicates": d, "rejected": [{index, code, detail}]}` only after JetStream
-  has stored every accepted report. A retried report (same device and timestamp) is stored once and
-  counted in `duplicates`.
+  has stored every accepted report. A report retried within the de-duplication window
+  (`TELEMETRY_DEDUP_WINDOW_S`, 30 s) is stored once and counted in `duplicates`; a later retry
+  changes nothing either, because the engine treats it as a late report.
 - **Admission control** watches the engines' backlog. Above `INGEST_ADMISSION_HIGH` reports every
   replica sheds ingest with `503` and a `Retry-After` computed from the measured drain rate, before
   reading the body; it resumes below `INGEST_ADMISSION_LOW`. A backlog it cannot measure counts as
@@ -232,7 +234,8 @@ reserved for transitions, so a device parked inside a zone does not page its own
   Every event carries the user's previous sequence, so a replica notices a gap and fills it from
   the stream before delivering anything else.
 - **Resume:** a browser remembers the last sequence it received; after a reconnect, to any replica,
-  it sends `resume_after` and gets exactly the events it missed, then continues live.
+  it sends `resume_after` and gets exactly the events it missed, then continues live (up to 5,000
+  events, kept 24 h; beyond that `hello` says `reset` and the dashboard reloads over REST).
 
 ### 7. Connection pools that fail fast instead of piling up
 
@@ -241,16 +244,17 @@ exhaustion becomes a `503 database_unavailable` with `Retry-After` within that t
 of coroutines holding requests open. Statement and idle-in-transaction timeouts on the server back
 that up. Request handlers and batch transactions release their connection before any broker I/O.
 The budget is explicit: 2 API × 10 + 2 engines × 18 (a connection per partition an engine may own,
-plus two) + init = 58 of `max_connections = 80`. Snapshot queries may use at most a quarter of the
-API pool.
+plus two) + init 1 = 57 of `max_connections = 80` (three of those are the superuser's), 75 while a
+new engine replica starts before the old one has drained. Snapshot queries may use at most a
+quarter of the API pool.
 
 ### 8. The event loop stays free
 
-Validation and serialisation run in C (msgspec, pydantic-core), distance maths in PostGIS, binary
-frames are packed with `array`/`struct`, and queues, waits and sends are bounded. Each process
-measures its own event-loop lag and exports it (`perimeter_event_loop_lag_seconds`, and the
-dashboard's Pipeline panel), so "nothing blocks the loop" is measured: p99 about 3 ms at the
-brief's load.
+Validation and serialisation run in compiled code (msgspec in C, pydantic-core in Rust), distance
+maths in PostGIS, binary frames are packed with `array`/`struct`, and queues, waits and sends are
+bounded. Each process measures its own event-loop lag and exports it
+(`perimeter_event_loop_lag_seconds`, and the dashboard's Pipeline panel), so "nothing blocks the
+loop" is measured: p99 about 3 ms at the brief's load.
 
 ### 9. Secure by default
 
@@ -262,8 +266,9 @@ brief's load.
   the API cannot touch the engine's consumers (`make audit-broker` fails on any refusal).
 - **Containers:** non-root users, read-only root file systems, no capabilities,
   `no-new-privileges`, resource limits, `internal` networks for the database and broker. Only the
-  edge publishes a port, on 127.0.0.1 (the `make observe` UIs as well). Base images are pinned by
-  digest, and Dependabot proposes updates.
+  edge publishes a port, on 127.0.0.1 (the `make observe` UIs as well), and the load generator
+  reaches the stack only through it. Base images are pinned by digest, and Dependabot proposes
+  updates once a release is a week old.
 - **HTTP:** a strict Content-Security-Policy (the API reference page is served by the edge, with
   scripts from its own origin only), `nosniff`, `frame-ancestors 'none'`, `Referrer-Policy`,
   `Permissions-Policy`.
@@ -292,7 +297,7 @@ load going through the edge like real devices. Methods, commands and full tables
 | 10,000 devices, a report every second | 9,400 reports/s, nothing lost; `202` p99 22 ms; position p99 214 ms; alert p99 144 ms |
 | 10,000 devices, one HTTP request per report | 3,165 requests/s, all accepted; `202` p99 150 ms |
 | 10,000 devices over 32 WebSockets (credit) | 380,229 accepted, 0 errors; ack p99 16 ms |
-| 30,000 devices, a report every second | **28,000 reports/s** accepted and applied, none shed or lost |
+| 30,000 devices, a report every second | **28,000 reports/s** accepted and applied, none dropped or lost; admission control never shed |
 | 60,000 devices, a report every second (overload) | 32,000 reports/s applied; ingest sheds with `503` + `Retry-After` above a 150k backlog; 0 accepted reports lost; the rest of the API answers throughout |
 | **200 dashboards** watching the whole fleet | 666,000 positions/s delivered (3,330 per viewer); p50 140 ms, p99 195 ms |
 | **Engine killed** (SIGKILL) under load | 0 reports lost, 0 duplicate or missing alerts (1,290 / 1,290 received live); orphaned partitions owned again after 7 s |
@@ -340,8 +345,16 @@ resume mode, tile zoom), then binary position bundles for the declared viewport,
 `{seq, prev, event}` (alerts and zone changes), `pulse`, `sessions`, `resync`, `ops`, `pong`.
 Client to server: `viewport` (bounding box and zoom — positions flow once one is sent), `resume`
 (or `?resume_after=` on connect), `ping`, `ops`. Close codes: 4001 signed out, 4002 session
-expired, 4003 forbidden, 4008 fell behind (resume), 4009 too many sessions, 1001/1011/1012/1013
-reconnect.
+expired, 4003 forbidden, 4008 fell behind (resume), 4009 too many sessions, 1008 a message outside
+the protocol (or more than 20 a second), 1001/1011/1012/1013 reconnect.
+
+**Ingest stream** (`/v1/telemetry/stream`, the device token as a bearer header or `X-Ingest-Token`;
+a wrong one gets HTTP `401` before the upgrade). The server opens with `ready {credit}`; the client
+sends `{"type": "reports", "seq": k, "reports": [...]}` as JSON text or MessagePack binary, one
+credit per report. Frames are answered in order with `ack {seq, accepted, duplicates, rejected,
+credit}` or `error {seq, code, detail, credit}`; while shedding the server sends `hold
+{retry_after}`, then `credit {credit}` once it has drained. Sending beyond the credit closes the
+socket with 1008.
 
 ## Load generator
 
@@ -390,7 +403,7 @@ Highlights, detailed in [docs/design.md](docs/design.md#6-tests-worth-knowing-ab
   antimeridian; every circle, polar ones included, inside its envelope); indexed matching equal to
   the naive join; `EXPLAIN` asserts the index plans.
 - **The state machine:** any split of a track into batches gives the same alerts; replays are
-  no-ops; enter and exit alternate; dwell fires once per stay.
+  no-ops; enter and exit alternate; dwell fires at most once per stay.
 - **Failure paths on real infrastructure:** fencing, takeover, a recreated lease bucket, track
   maintenance behind a backup's locks, zones deleted mid-batch; the live channel with two real API
   servers on one broker; the broker's permission matrix on a secured server.
@@ -419,5 +432,6 @@ for refusals.
   round; a shorter `ENGINE_LEASE_TTL_S` trades broker writes for faster takeover.
 - **Report-driven alerts:** a device that goes silent inside a zone stays inside until it reports
   again; a staleness timeout could close such stays.
-- **Plain HTTP on localhost:** Caddy terminates TLS by itself for a real hostname; set
-  `SECURE_COOKIES=true` behind TLS.
+- **Plain HTTP on localhost:** the edge serves HTTP on :8080 and expects TLS to be terminated in
+  front of it (a load balancer, or Caddy itself once it has a hostname and `auto_https` is back
+  on); set `SECURE_COOKIES=true` behind TLS.

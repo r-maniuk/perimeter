@@ -61,14 +61,21 @@ COMMENT ON FUNCTION perimeter_envelope(geography, double precision) IS
 
 # Device tracks live in 10-minute range partitions; this function keeps the window rolling: it
 # drops the slots that ended before the retention window (a DROP, not millions of DELETEs) and
-# attaches the slots from `retention` ago to `ahead` from now, moving in any rows the default
-# partition took while a slot was missing. It runs as the schema owner (SECURITY DEFINER), so the
-# services can keep the partitions current without any DDL rights of their own.
+# attaches the slots from `retention` ago to `ahead` from now. Reports no slot covered (while
+# maintenance could not run, during a long backup say) wait in the default partition: purged once
+# expired, otherwise moved into their slot. Each call is one bounded step that the caller commits
+# before asking for the next (`more` says one is due), so a backlog of any size is worked off
+# within any statement timeout, and a failed step loses its own work only. It runs as the schema
+# owner (SECURITY DEFINER), so the services keep the partitions current without DDL rights.
 TRACKS_FUNCTION = r"""
 CREATE FUNCTION perimeter_maintain_tracks(
-    retention interval, ahead interval DEFAULT interval '20 minutes'
+    retention interval,
+    ahead interval DEFAULT interval '20 minutes',
+    budget integer DEFAULT 20000
 )
-RETURNS TABLE (created integer, dropped integer, moved bigint, purged bigint, failed integer)
+RETURNS TABLE (
+    created integer, dropped integer, moved bigint, purged bigint, failed integer, more boolean
+)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public
@@ -78,73 +85,129 @@ SET timezone = 'UTC'
 SET lock_timeout = '500ms'
 AS $$
 DECLARE
-    slot     CONSTANT interval := interval '10 minutes';
-    origin   CONSTANT timestamptz := timestamptz '2000-01-01 00:00:00+00';
-    first_at CONSTANT timestamptz := date_bin(slot, now() - retention, origin);
-    last_at  CONSTANT timestamptz := date_bin(slot, now() + ahead, origin);
-    at       timestamptz;
-    name     text;
-    n        bigint;
-    part     record;
+    slot      CONSTANT interval := interval '10 minutes';
+    origin    CONSTANT timestamptz := timestamptz '2000-01-01 00:00:00+00';
+    first_at  CONSTANT timestamptz := date_bin(slot, now() - retention, origin);
+    last_at   CONSTANT timestamptz := date_bin(slot, now() + ahead, origin);
+    -- Slots attached per step: each is quick, but the first round over a day's window has 146.
+    per_step  CONSTANT integer := 12;
+    left_rows bigint := budget;
+    at        timestamptz;
+    name      text;
+    n         bigint;
+    part      record;
 BEGIN
     created := 0;
     dropped := 0;
     moved := 0;
     purged := 0;
     failed := 0;
-    -- One maintainer at a time: whoever does not get the lock has nothing to do this round.
+    more := false;
+    -- One maintainer at a time: whoever does not get the lock has nothing to do this step.
     IF NOT pg_try_advisory_xact_lock(hashtext('perimeter_maintain_tracks')) THEN
         RETURN NEXT;
         RETURN;
     END IF;
 
-    -- Expired slots go whole. Every step below is its own subtransaction, so one that cannot get
-    -- its lock is retried next round without holding up the others.
+    -- Expired slots go whole, attached or still being filled. Each step below is its own
+    -- subtransaction; the first one that cannot get its lock ends its phase until the next round
+    -- (whoever holds that lock most likely holds the others too), without undoing the rest.
     FOR part IN
         SELECT c.relname
-        FROM pg_inherits AS i
-        JOIN pg_class AS c ON c.oid = i.inhrelid
-        WHERE i.inhparent = 'public.device_tracks'::regclass
+        FROM pg_class AS c
+        WHERE c.relnamespace = 'public'::regnamespace
+          AND c.relkind = 'r'
           AND c.relname ~ '^device_tracks_[0-9]{12}$'
           AND to_timestamp(substr(c.relname, 15), 'YYYYMMDDHH24MI') + slot <= now() - retention
+        ORDER BY c.relname
     LOOP
         BEGIN
             EXECUTE format('DROP TABLE public.%I', part.relname);
             dropped := dropped + 1;
         EXCEPTION WHEN lock_not_available THEN
             failed := failed + 1;
+            EXIT;
         END;
     END LOOP;
 
-    -- The default partition holds only reports no slot covered: those past retention, purged
-    -- here, and those that arrived while maintenance could not run, moved into their slot below.
+    -- The default partition holds only reports no slot covered; the expired ones go first.
     BEGIN
-        DELETE FROM public.device_tracks_default WHERE recorded_at < first_at;
+        DELETE FROM public.device_tracks_default
+        WHERE ctid = ANY (ARRAY(
+            SELECT ctid FROM public.device_tracks_default
+            WHERE recorded_at < first_at
+            LIMIT left_rows
+        ));
         GET DIAGNOSTICS n = ROW_COUNT;
         purged := n;
+        left_rows := left_rows - n;
     EXCEPTION WHEN lock_not_available THEN
         failed := failed + 1;
     END;
+    IF left_rows <= 0 THEN
+        more := true;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- Attaching a slot scans the whole default partition, under a lock that holds up every
+    -- insert routed there. So while it is large, a step moves a bounded batch of its oldest rows
+    -- into their slot's table instead, built but not attached yet (rows are out of sight there
+    -- until it is), and slots are attached once it is small.
+    SELECT count(*) INTO n FROM (SELECT FROM public.device_tracks_default LIMIT left_rows + 1) AS s;
+    IF n > left_rows THEN
+        SELECT date_bin(slot, recorded_at, origin) INTO at
+        FROM public.device_tracks_default
+        ORDER BY recorded_at
+        LIMIT 1;
+        name := 'device_tracks_' || to_char(at, 'YYYYMMDDHH24MI');
+        BEGIN
+            EXECUTE format(
+                'CREATE TABLE IF NOT EXISTS public.%I (LIKE public.device_tracks INCLUDING ALL, '
+                'CONSTRAINT %I CHECK (recorded_at >= %L AND recorded_at < %L))',
+                name, name || '_range', at, at + slot
+            );
+            -- A report retried after its first copy moved on is a duplicate there: drop it.
+            EXECUTE format(
+                'WITH taken AS (DELETE FROM public.device_tracks_default WHERE ctid = ANY (ARRAY('
+                'SELECT ctid FROM public.device_tracks_default '
+                'WHERE recorded_at >= %L AND recorded_at < %L LIMIT %s)) RETURNING *) '
+                'INSERT INTO public.%I SELECT * FROM taken ON CONFLICT DO NOTHING',
+                at, at + slot, left_rows, name
+            );
+            GET DIAGNOSTICS n = ROW_COUNT;
+            moved := moved + n;
+            more := true;
+        EXCEPTION WHEN lock_not_available THEN
+            failed := failed + 1;
+        END;
+        RETURN NEXT;
+        RETURN;
+    END IF;
 
     at := first_at;
     WHILE at <= last_at LOOP
         name := 'device_tracks_' || to_char(at, 'YYYYMMDDHH24MI');
-        IF to_regclass('public.' || name) IS NULL THEN
+        IF NOT EXISTS (SELECT FROM pg_inherits WHERE inhrelid = to_regclass('public.' || name)) THEN
+            IF created = per_step THEN
+                more := true;
+                EXIT;
+            END IF;
             BEGIN
                 -- Built apart and attached: ATTACH locks the parent only against schema changes,
                 -- so reports keep flowing (CREATE ... PARTITION OF would stop them). A slot can
-                -- only be attached once the default partition holds none of its rows, so those
-                -- move in first, with the default locked against new ones meanwhile.
+                -- only be attached once the default partition holds none of its rows, so the
+                -- last of them move in first, with the default locked against new ones meanwhile.
                 LOCK TABLE public.device_tracks_default IN ACCESS EXCLUSIVE MODE;
                 EXECUTE format(
-                    'CREATE TABLE public.%I (LIKE public.device_tracks INCLUDING ALL, '
+                    'CREATE TABLE IF NOT EXISTS public.%I (LIKE public.device_tracks INCLUDING ALL, '
                     'CONSTRAINT %I CHECK (recorded_at >= %L AND recorded_at < %L))',
                     name, name || '_range', at, at + slot
                 );
                 EXECUTE format(
                     'WITH taken AS (DELETE FROM public.device_tracks_default '
                     'WHERE recorded_at >= %L AND recorded_at < %L RETURNING *) '
-                    'INSERT INTO public.%I SELECT * FROM taken',
+                    'INSERT INTO public.%I SELECT * FROM taken ON CONFLICT DO NOTHING',
                     at, at + slot, name
                 );
                 GET DIAGNOSTICS n = ROW_COUNT;
@@ -159,6 +222,7 @@ BEGIN
                 moved := moved + n;
             EXCEPTION WHEN lock_not_available THEN
                 failed := failed + 1;
+                EXIT;
             END;
         END IF;
         at := at + slot;
@@ -171,9 +235,10 @@ $$
 TRACKS_GRANTS = r"""
 DO $$
 BEGIN
-    REVOKE ALL ON FUNCTION perimeter_maintain_tracks(interval, interval) FROM PUBLIC;
+    REVOKE ALL ON FUNCTION perimeter_maintain_tracks(interval, interval, integer) FROM PUBLIC;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'perimeter_app') THEN
-        GRANT EXECUTE ON FUNCTION perimeter_maintain_tracks(interval, interval) TO perimeter_app;
+        GRANT EXECUTE ON FUNCTION perimeter_maintain_tracks(interval, interval, integer)
+            TO perimeter_app;
     END IF;
 END
 $$
@@ -275,6 +340,8 @@ CREATE TABLE device_tracks (
     CONSTRAINT device_tracks_pkey PRIMARY KEY (device_id, recorded_at)
 ) PARTITION BY RANGE (recorded_at);
 CREATE TABLE device_tracks_default PARTITION OF device_tracks DEFAULT;
+-- Maintenance reads the default partition by time (see TRACKS_FUNCTION); slots need no such index.
+CREATE INDEX device_tracks_default_recorded_at ON device_tracks_default (recorded_at);
 
 CREATE TABLE partition_epochs (
     partition   smallint PRIMARY KEY,
@@ -301,7 +368,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP FUNCTION IF EXISTS perimeter_maintain_tracks(interval, interval)")
+    op.execute("DROP FUNCTION IF EXISTS perimeter_maintain_tracks(interval, interval, integer)")
     op.execute(
         "DROP TABLE IF EXISTS partition_epochs, device_tracks, outbox, alerts, zone_presence, "
         "devices, geozones, users CASCADE"

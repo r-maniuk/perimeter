@@ -61,8 +61,7 @@
 		-Server
 		-Via
 	}
-	# Only meaningful when this server itself terminates TLS.
-	@tls protocol https
+	# Only meaningful when this server itself terminates TLS (@tls is defined by the site).
 	header @tls Strict-Transport-Security "max-age=63072000; includeSubDomains"
 }
 
@@ -79,6 +78,7 @@
 		}
 	}
 
+	@tls protocol https
 	import common_headers
 	encode zstd gzip
 	request_body {
@@ -133,14 +133,23 @@
 		}
 	}
 
-	# No replica reachable (or all shedding): answer API clients in the API's own error format,
-	# with a hint to retry, instead of an empty 502.
-	handle_errors 502 503 504 {
-		@api_error path /v1/* /openapi.json /healthz /readyz
-		handle @api_error {
+	# Errors raised by the edge itself (no replica reachable, a file that is not there) leave the
+	# routes above, so they get the security headers here. API clients get the API's own error
+	# format with a hint to retry, instead of an empty 502; the rest, the status and its name.
+	handle_errors {
+		import common_headers
+		header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		@api_unavailable {
+			path /v1/* /openapi.json /healthz /readyz
+			expression `{err.status_code} in [502, 503, 504]`
+		}
+		handle @api_unavailable {
 			header Content-Type application/problem+json
 			header Retry-After 2
 			respond `{"type":"/problems/unavailable","title":"Service Unavailable","status":503,"detail":"no API replica is reachable right now","code":"unavailable"}` 503
+		}
+		handle {
+			respond "{err.status_code} {err.status_text}" {err.status_code}
 		}
 	}
 }

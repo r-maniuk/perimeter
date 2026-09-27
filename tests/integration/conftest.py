@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import AsyncIterator, Iterator
 from contextlib import suppress
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -34,14 +36,19 @@ from perimeter.config import (
 from perimeter.storage.engine import create_engine
 from perimeter.tools.init import migrate
 
-# The same pinned images as the stack (infra/db, infra/nats).
-POSTGIS_IMAGE = (
-    "imresamu/postgis:18-3.6.1-alpine3.23"
-    "@sha256:3c51493252f45d654ef07bf68ae22c9cec52a196edd0eaaa67ba06b654e56a01"
-)
-NATS_IMAGE = (
-    "nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4"
-)
+
+def pinned_base_image(dockerfile: str) -> str:
+    """The digest-pinned base image of one of the stack's Dockerfiles: tests run on exactly what
+    the stack runs, and an update of that pin reaches them without anyone copying it here."""
+    source = (Path(__file__).resolve().parents[2] / dockerfile).read_text()
+    found = re.search(r"^FROM\s+(\S+@sha256:[0-9a-f]{64})", source, re.MULTILINE)
+    if found is None:
+        raise RuntimeError(f"{dockerfile} names no digest-pinned base image")
+    return found.group(1)
+
+
+POSTGIS_IMAGE = pinned_base_image("infra/db/Dockerfile")
+NATS_IMAGE = pinned_base_image("infra/nats/Dockerfile")
 
 TABLES = "users, geozones, devices, device_tracks, zone_presence, alerts, outbox, partition_epochs"
 

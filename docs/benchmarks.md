@@ -112,7 +112,7 @@ sockets.
 
 | | |
 |---|---|
-| Reports | 2,489,149 offered and **2,489,149 accepted** (27,657/s); none shed or lost |
+| Reports | 2,489,149 offered and **2,489,149 accepted** (27,657/s); none dropped or lost, and admission control never shed (one batch was throttled once and resent) |
 | Engine | 28,007 reports/s applied, 80 reports per transaction (p99 882) |
 | Backlog | peaked at 37,041, below the shedding watermark (150,000) |
 | Ingest acknowledgement | p50 11 ms · p99 299 ms |
@@ -133,7 +133,8 @@ About 55,000 reports/s offered, to watch backpressure rather than infer it:
 | Everything else stays up | `GET /v1/me` through the edge, every 0.5 s during the run: 220 of 220 answered `200` |
 | CPU | db 172 % · nats 148 % of its 2 CPUs · engines 46–80 % |
 
-Backlog over time (Prometheus, every 4 s; `admitting` is 0 while shedding):
+Backlog over time (Prometheus, every 4 s; `admitting` is 0 while shedding; the gauges are scraped
+separately, so a shed that starts and ends between two samples shows only in the next one):
 
 ```
 21:42:23  backlog  57,257  admitting 1   applied/s 46,116
@@ -143,6 +144,11 @@ Backlog over time (Prometheus, every 4 s; `admitting` is 0 while shedding):
 21:42:39  backlog  55,349  admitting 1   applied/s 35,853
 21:42:43  backlog 137,394  admitting 1   applied/s 38,192
 21:42:47  backlog  52,634  admitting 0   applied/s 39,592
+21:42:51  backlog 135,849  admitting 1   applied/s 35,753
+21:42:55  backlog 135,849  admitting 1   applied/s 49,673
+21:42:59  backlog  41,852  admitting 1   applied/s 39,661
+21:43:03  backlog 114,738  admitting 1   applied/s 48,638
+21:43:07  backlog 114,192  admitting 0   applied/s 40,034
 …
 21:43:35  backlog 151,730  admitting 0   applied/s 26,465
 21:43:43  backlog  41,305  admitting 1   applied/s 22,262
@@ -156,8 +162,8 @@ busiest components, with the generator using much of the rest of the VM.
 
 `make drill` runs the generator (10,000 devices, a report every 3 s, 90 s, an observer with 20
 zones), SIGKILLs one replica 35 s in, starts it again 15 s later, lets the pipeline drain and audits
-the result. Both pass every check (the engine drill ran on a fresh clone, as `make drill` right
-after `make up`):
+the result. Both pass every check (the engine drill ran on a fresh clone, after `make up`,
+`make smoke` and a one-minute load):
 
 | Check | engine killed | api killed |
 |---|---|---|
@@ -168,5 +174,6 @@ after `make up`):
 | Alerts received live by the observer vs stored | 1,290 / 1,290 | 1,348 / 1,348 |
 | Recovery | orphaned partitions owned again **7.0 s** after the kill (lease TTL 6 s + one round) | sockets on the killed replica reconnect to the other one and resume by sequence; the observer missed nothing |
 
-During the engine drill, devices on the orphaned partitions paused for those seven seconds;
-nothing they reported was lost.
+During the engine drill, the reports of devices on the orphaned partitions waited in the stream
+for those seven seconds: ingest went on, their positions and alerts came late, and nothing was
+lost.
