@@ -126,7 +126,9 @@ def buckets(topo: Topology) -> list[KeyValueConfig]:
             description="Live sessions of every user across api replicas",
             history=1,
             ttl=topo.sessions_ttl_s,
-            storage=StorageType.MEMORY,
+            # On disk although entries live seconds: a broker restart must not take the
+            # registry away from replicas that cannot (and may not) recreate it.
+            storage=StorageType.FILE,
         ),
         KeyValueConfig(
             bucket=subjects.KV_REVOKED,

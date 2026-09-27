@@ -127,6 +127,15 @@ class TelemetrySettings(_Group):
     dedup_window_s: int = Field(default=30, ge=1)
 
 
+class TrackSettings(_Group):
+    """Device tracks: every applied report, kept in time partitions for a while."""
+
+    model_config = SettingsConfigDict(env_prefix="TRACK_")
+
+    retention_min: int = Field(default=30, ge=10, le=24 * 60)
+    maintenance_s: float = Field(default=60.0, ge=5.0)
+
+
 class IngestSettings(_Group):
     model_config = SettingsConfigDict(env_prefix="INGEST_")
 
@@ -186,6 +195,7 @@ class Settings:
         "observability",
         "security",
         "telemetry",
+        "tracks",
     )
 
     def __init__(
@@ -195,6 +205,7 @@ class Settings:
         nats: NatsSettings,
         security: SecuritySettings,
         telemetry: TelemetrySettings,
+        tracks: TrackSettings,
         ingest: IngestSettings,
         engine: EngineSettings,
         live: LiveSettings,
@@ -204,6 +215,7 @@ class Settings:
         self.nats = nats
         self.security = security
         self.telemetry = telemetry
+        self.tracks = tracks
         self.ingest = ingest
         self.engine = engine
         self.live = live
@@ -221,6 +233,7 @@ def load_settings(**overrides: Any) -> Settings:
         "nats": NatsSettings,
         "security": SecuritySettings,
         "telemetry": TelemetrySettings,
+        "tracks": TrackSettings,
         "ingest": IngestSettings,
         "engine": EngineSettings,
         "live": LiveSettings,

@@ -159,6 +159,10 @@ services:
     user: "10002:10002"
     depends_on:
       secrets: {condition: service_completed_successfully}
+    # The Go runtime collects harder as the heap nears this soft limit, well before the
+    # container's hard 1 GiB: a burst of block reads cannot get the broker OOM-killed.
+    environment:
+      GOMEMLIMIT: 800MiB
     volumes:
       - natsdata:/data
       - type: volume

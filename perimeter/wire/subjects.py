@@ -41,10 +41,6 @@ def telemetry_partition(partition: int) -> str:
     return f"tlm.{partition}.*"
 
 
-def telemetry_of_device(device_id: str) -> str:
-    return f"tlm.*.{device_id}"
-
-
 def partition_of(stored_subject: str) -> int:
     """Partition number of a stored telemetry subject ``tlm.<p>.<device>``."""
     _, partition, _ = stored_subject.split(".", 2)

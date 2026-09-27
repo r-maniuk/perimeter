@@ -248,13 +248,49 @@ class SessionRegistry:
         ttl_s = (await self._kv.status()).ttl or DEFAULT_TTL_S
         self._mirror = SessionMirror(ttl_s=ttl_s, clock=self._clock)
         self._refresh_s = min(REFRESH_MAX_S, ttl_s / 3)
-        self._watch = await self._kv.watchall()
+        await self._watch_bucket()
+
+    async def _watch_bucket(self) -> None:
+        self._watch = await self.kv.watchall()
         ready = asyncio.Event()
         self._follower = asyncio.create_task(self._follow(self._watch, ready), name="live-sessions")
         try:
             await asyncio.wait_for(ready.wait(), WATCH_READY_S)
         except TimeoutError:
             log.warning("live.sessions_initial_sync_slow")
+
+    async def _stop_watching(self) -> None:
+        if self._follower is not None:
+            self._follower.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._follower
+            self._follower = None
+        if self._watch is not None:
+            with suppress(NatsError):
+                await self._watch.stop()  # type: ignore[no-untyped-call]
+            self._watch = None
+
+    async def _follow_a_recreated_bucket(self) -> None:
+        """Start over when the bucket was recreated (its revisions went back below ours).
+
+        A watch resumes after the last revision it applied; on a new bucket that would skip every
+        entry up to that number and leave this replica blind to the other replicas' sessions.
+        """
+        try:
+            info = await self._js.stream_info(f"KV_{subjects.KV_SESSIONS}")
+        except NatsError as exc:
+            log.warning("live.sessions_bucket_unreadable", error=repr(exc))
+            return
+        if info.state.last_seq >= self._mirror.watermark:
+            return
+        log.warning(
+            "live.sessions_bucket_recreated",
+            watermark=self._mirror.watermark,
+            last_revision=info.state.last_seq,
+        )
+        await self._stop_watching()
+        self._mirror.watermark = 0
+        await self._watch_bucket()
 
     def on_change(self, listener: Callable[[str], None]) -> None:
         """Call ``listener(user_id)`` whenever a user's set of sessions changes."""
@@ -355,16 +391,11 @@ class SessionRegistry:
                 self._changed(uid)
             if loop.time() >= next_refresh:
                 next_refresh = loop.time() + self._refresh_s
+                await self._follow_a_recreated_bucket()
                 await self._refresh()
 
     async def close(self) -> None:
-        if self._follower is not None:
-            self._follower.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._follower
-        if self._watch is not None:
-            with suppress(NatsError):
-                await self._watch.stop()  # type: ignore[no-untyped-call]
+        await self._stop_watching()
         for _, waiter in self._waiters:  # the mirror stops here: nobody catches up any more
             if not waiter.done():
                 waiter.set_exception(TimeoutError("the session registry is closing"))

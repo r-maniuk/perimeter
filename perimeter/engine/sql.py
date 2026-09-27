@@ -150,6 +150,28 @@ DELETE_PRESENCE = text(
     """
 ).bindparams(bindparam("device_ids", type_=_TEXTS), bindparam("zone_ids", type_=_UUIDS))
 
+# Every applied report of the batch (not only each device's newest), for trails. The primary key
+# makes a replay harmless even if a report were ever applied twice.
+INSERT_TRACKS = text(
+    """
+    INSERT INTO device_tracks (device_id, recorded_at, position, speed_mps, heading_deg)
+    SELECT r.device_id, to_timestamp(r.recorded_ms / 1000.0),
+           ST_SetSRID(ST_MakePoint(r.lon, r.lat), 4326)::geography, r.speed, r.heading
+    FROM unnest(CAST(:device_ids AS text[]), CAST(:recorded AS bigint[]),
+                CAST(:lons AS float8[]), CAST(:lats AS float8[]),
+                CAST(:speeds AS real[]), CAST(:headings AS real[]))
+         AS r(device_id, recorded_ms, lon, lat, speed, heading)
+    ON CONFLICT DO NOTHING
+    """
+).bindparams(
+    bindparam("device_ids", type_=_TEXTS),
+    bindparam("recorded", type_=_BIGINTS),
+    bindparam("lons", type_=_FLOATS),
+    bindparam("lats", type_=_FLOATS),
+    bindparam("speeds", type_=_REALS),
+    bindparam("headings", type_=_REALS),
+)
+
 # Redelivery never reaches this statement with an already raised alert (late reports produce
 # none), so the conflict clause is a last line of defence, not the de-duplication mechanism.
 INSERT_ALERTS = text(
@@ -253,6 +275,22 @@ async def upsert_devices(conn: AsyncConnection, records: Sequence[TelemetryRecor
         },
     )
     return set(result.scalars())
+
+
+async def insert_tracks(conn: AsyncConnection, records: Sequence[TelemetryRecord]) -> None:
+    if not records:
+        return
+    await conn.execute(
+        INSERT_TRACKS,
+        {
+            "device_ids": [r.device_id for r in records],
+            "recorded": [r.recorded_at_ms for r in records],
+            "lons": [r.lon for r in records],
+            "lats": [r.lat for r in records],
+            "speeds": [r.speed for r in records],
+            "headings": [r.heading for r in records],
+        },
+    )
 
 
 async def upsert_presence(conn: AsyncConnection, stays: Sequence[tuple[str, Stay]]) -> None:

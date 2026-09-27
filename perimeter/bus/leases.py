@@ -21,8 +21,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import NamedTuple
 
-from nats.js.errors import BadRequestError, KeyValueError, KeyWrongLastSequenceError, NoKeysError
+from nats.js.errors import (
+    BadRequestError,
+    KeyNotFoundError,
+    KeyValueError,
+    KeyWrongLastSequenceError,
+    NoKeysError,
+)
 from nats.js.kv import KeyValue
+
+_CREATE_ATTEMPTS = 3
 
 
 class LeaseLost(Exception):  # noqa: N818 - a state, not a failure of the caller
@@ -59,11 +67,19 @@ class LeaseBucket:
         self._generation = generation
 
     async def acquire(self, key: str, owner: str) -> Lease | None:
-        try:
-            revision = await self._kv.create(key, owner.encode())
-        except KeyWrongLastSequenceError:
-            return None
-        return Lease(key, owner, revision, self._generation)
+        # ``KeyValue.create`` answers "taken" with a second round trip that reads the key back (to
+        # tell a live key from a delete marker). When the holder's entry expires between the two,
+        # that read finds nothing and raises KeyNotFoundError: the key has just become free, so
+        # create it again. A new holder in the meantime answers "taken" like any other.
+        for _ in range(_CREATE_ATTEMPTS):
+            try:
+                revision = await self._kv.create(key, owner.encode())
+            except KeyWrongLastSequenceError:
+                return None
+            except KeyNotFoundError:
+                continue
+            return Lease(key, owner, revision, self._generation)
+        return None
 
     async def renew(self, lease: Lease) -> Lease:
         try:

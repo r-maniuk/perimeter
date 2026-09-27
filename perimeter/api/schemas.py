@@ -343,7 +343,7 @@ class TrailProperties(BaseModel):
     timestamps: list[datetime] = Field(description="Device time of each coordinate, in order")
     speeds: list[float | None]
     complete: bool = Field(
-        description="false when the point cap or the read deadline shortened the trail"
+        description="false when the point cap or the retention window shortened the trail"
     )
 
 

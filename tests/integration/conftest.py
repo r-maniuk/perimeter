@@ -36,7 +36,7 @@ from perimeter.tools.init import migrate
 POSTGIS_IMAGE = "imresamu/postgis:18-3.6.1-alpine3.23"
 NATS_IMAGE = "nats:2.15.0-alpine"
 
-TABLES = "users, geozones, devices, zone_presence, alerts, outbox, partition_epochs"
+TABLES = "users, geozones, devices, device_tracks, zone_presence, alerts, outbox, partition_epochs"
 
 
 def _database_from_url(url: str) -> DatabaseSettings:

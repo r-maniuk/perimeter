@@ -95,6 +95,18 @@ class Device(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class DeviceTrack(Base):
+    """One applied report; the table is range-partitioned by ``recorded_at`` (10-minute slots)."""
+
+    __tablename__ = "device_tracks"
+
+    device_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    position: Mapped[WKBElement] = mapped_column(POINT)
+    speed_mps: Mapped[float | None] = mapped_column(REAL)
+    heading_deg: Mapped[float | None] = mapped_column(REAL)
+
+
 class ZonePresence(Base):
     __tablename__ = "zone_presence"
 

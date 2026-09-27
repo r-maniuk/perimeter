@@ -185,7 +185,7 @@ async def test_the_api_can_do_everything_it_needs(
     stored = await js.get_msg(subjects.EVENTS_STREAM, seq=info.state.first_seq)
     assert stored.subject == subjects.events("u1")
 
-    # resume replay, gap healing and device trail: batched direct gets
+    # resume replay and gap healing: batched direct gets
     replayed = await _direct_batch(
         nc,
         subjects.EVENTS_STREAM,
@@ -194,12 +194,6 @@ async def test_the_api_can_do_everything_it_needs(
     assert replayed == [subjects.events("u1")]
     last = await js.get_last_msg(subjects.EVENTS_STREAM, subjects.events("u1"), direct=True)
     assert last.subject == subjects.events("u1")
-    trail = await _direct_batch(
-        nc,
-        subjects.TELEMETRY_STREAM,
-        {"seq": 1, "next_by_subj": subjects.telemetry_of_device("dev-1"), "batch": 16},
-    )
-    assert [subjects.device_of(subject) for subject in trail] == ["dev-1"]
 
     # ... or ephemeral ordered consumers
     replay = await js.subscribe(
@@ -211,13 +205,6 @@ async def test_the_api_can_do_everything_it_needs(
     )
     assert (await replay.next_msg(timeout=2)).subject == subjects.events("u1")
     await replay.unsubscribe()
-    ordered_trail = await js.subscribe(
-        subjects.telemetry_of_device("dev-1"),
-        stream=subjects.TELEMETRY_STREAM,
-        ordered_consumer=True,
-    )
-    assert subjects.device_of((await ordered_trail.next_msg(timeout=2)).subject) == "dev-1"
-    await ordered_trail.unsubscribe()
 
     # sessions registry and remote sign-out
     sessions = await js.key_value(subjects.KV_SESSIONS)

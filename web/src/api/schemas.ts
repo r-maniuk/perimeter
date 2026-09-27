@@ -117,7 +117,9 @@ export const TrailSchema = v.looseObject({
   geometry: v.nullable(v.union([LineGeometry, PointGeometry])),
   properties: v.looseObject({
     timestamps: v.array(Timestamp),
-    /** False when the point cap or the read deadline shortened the trail. */
+    /** Start of the window searched: the requested one, cut to how long tracks are kept. */
+    since: Timestamp,
+    /** False when the point cap or the retention window shortened the trail. */
     complete: v.boolean(),
   }),
 });

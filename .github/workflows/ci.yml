@@ -54,7 +54,7 @@ jobs:
         run: >-
           uv run pytest
           --hypothesis-profile=ci
-          --cov=perimeter --cov-report=term --cov-report=xml --cov-fail-under=85
+          --cov=perimeter --cov-report=term --cov-report=xml --cov-fail-under=90
 
       - name: Keep the coverage report
         if: always()

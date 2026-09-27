@@ -10,7 +10,8 @@ Inside the transaction, in this order:
    still yields both ``enter`` and ``exit``);
 4. the devices' current presence, and the rules of every zone involved, locked against deletion;
 5. the presence state machine (:mod:`perimeter.domain.presence`), in pure Python;
-6. set-based writes: newest positions, presence changes, alerts and their outbox events.
+6. set-based writes: newest positions, the track of every applied report, presence changes,
+   alerts and their outbox events.
 
 After the commit the new events are relayed to JetStream straight away (the outbox sweeper covers
 a crash in between), moved devices go to the tile publisher and occupancy to the pulse publisher.
@@ -225,6 +226,9 @@ async def _evaluate(
 async def _write(conn: AsyncConnection, outcome: BatchOutcome) -> _Written:
     latest = outcome.latest()
     moved = await sql.upsert_devices(conn, latest)
+    await sql.insert_tracks(
+        conn, [r for device in outcome.devices.values() for r in device.accepted]
+    )
     await sql.delete_presence(conn, outcome.deletes())
     await sql.upsert_presence(conn, outcome.upserts())
     candidates = [(new_id(), transition) for transition in outcome.alerts()]

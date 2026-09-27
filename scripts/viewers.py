@@ -8,6 +8,11 @@ delivered per second, and the device-to-socket latency seen by every viewer (pos
 to arrival, averaged per frame), which grows if any replica falls behind on its sockets.
 
     uv run python scripts/viewers.py --viewers 200 --duration 60
+
+or inside the stack's network, next to the edge (the application image has everything it needs)::
+
+    docker compose --profile load run --rm --no-deps -v "$PWD/scripts:/scripts:ro" \
+        --entrypoint python generator /scripts/viewers.py --url http://edge:8080
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ import time
 from array import array
 from dataclasses import dataclass, field
 
-import httpx
+import aiohttp
 from websockets.asyncio.client import connect
 
 from perimeter.wire.frames import FrameKind, decode_bundle
@@ -41,12 +46,14 @@ class Tally:
 
 
 async def sign_in(base: str) -> str:
-    async with httpx.AsyncClient(base_url=base, timeout=10) as http:
-        response = await http.post(
-            "/v1/session", json={"username": f"viewer-{secrets.token_hex(4)}"}
-        )
-        response.raise_for_status()
-        token: str = response.json()["token"]
+    async with (
+        aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http,
+        http.post(
+            f"{base}/v1/session", json={"username": f"viewer-{secrets.token_hex(4)}"}
+        ) as reply,
+    ):
+        reply.raise_for_status()
+        token: str = (await reply.json())["token"]
         return token
 
 

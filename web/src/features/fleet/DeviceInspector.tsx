@@ -1,14 +1,16 @@
 import { useQuery } from "@tanstack/react-query";
 import { Check, Copy, Crosshair, LocateFixed, Navigation2, Route } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
-import { deviceTrail, getDevice, TrailUnavailableError } from "@/api/endpoints";
+import { deviceTrail, getDevice } from "@/api/endpoints";
 import { describeError, isApiError } from "@/api/http";
 import { PanelFrame } from "@/features/shell/PanelFrame";
 import { useZones } from "@/features/zones/useZones";
 import {
   compassPoint,
   formatAge,
+  formatClockShort,
   formatCoordinate,
+  formatCount,
   formatDistance,
   formatSpeed,
 } from "@/lib/format";
@@ -22,7 +24,7 @@ import { Kbd } from "@/ui/Kbd";
 import { SectionLabel } from "@/ui/SectionLabel";
 import { useFleetDevice, useServerNow } from "./useFleet";
 
-const TRAIL_WINDOWS = [5, 15, 60] as const;
+const TRAIL_WINDOWS = [5, 15, 30] as const; // tracks are kept 30 minutes (TRACK_RETENTION_MIN)
 const STALE_S = 60;
 
 export function DeviceInspector({ id, onClose }: { id: string; onClose: () => void }) {
@@ -65,12 +67,7 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
     queryKey: ["trail", id, minutes],
     queryFn: ({ signal }) => deviceTrail(id, minutes, signal),
     staleTime: 15_000,
-    // A trail cut off by the server's read deadline means the broker is busy: asking again right
-    // away only adds to its load, so that one waits for the user's "Try again".
-    retry: (failures, error) =>
-      !(error instanceof TrailUnavailableError) &&
-      failures < 3 &&
-      !(isApiError(error) && error.status < 500),
+    retry: (failures, error) => failures < 3 && !(isApiError(error) && error.status < 500),
   });
 
   useEffect(() => {
@@ -214,7 +211,7 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
                     : "text-muted hover:text-ink",
                 )}
               >
-                {w === 60 ? "1 h" : `${w} min`}
+                {`${w} min`}
               </button>
             ))}
           </div>
@@ -231,17 +228,17 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
             <span className="text-muted">Loading the last {minutes} minutes…</span>
           ) : trail.isError ? (
             <span className="flex items-center justify-between gap-3">
-              <span className="text-muted">
-                {trail.error instanceof TrailUnavailableError
-                  ? "The trail couldn't be read in time."
-                  : describeError(trail.error)}
-              </span>
+              <span className="text-muted">{describeError(trail.error)}</span>
               <Button size="sm" onClick={() => void trail.refetch()}>
                 Try again
               </Button>
             </span>
           ) : trail.data.coordinates.length < 2 ? (
-            <span className="text-muted">No movement in the last {minutes} minutes.</span>
+            <span className="text-muted">
+              {trail.data.complete
+                ? `No movement in the last ${minutes} minutes.`
+                : `No movement since ${formatClockShort(trail.data.since)}.`}
+            </span>
           ) : (
             <>
               <span className="block font-medium text-ink">
@@ -249,8 +246,8 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
               </span>
               <span className="text-muted">
                 {trail.data.complete
-                  ? `${trail.data.coordinates.length} reports in the last ${minutes} min`
-                  : `latest ${trail.data.coordinates.length} reports (trail shortened)`}
+                  ? `${formatCount(trail.data.coordinates.length)} reports in the last ${minutes} min`
+                  : `${formatCount(trail.data.coordinates.length)} reports since ${formatClockShort(trail.data.times[0] ?? trail.data.since)}`}
               </span>
             </>
           )}

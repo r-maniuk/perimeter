@@ -125,6 +125,7 @@ def with_live(settings: Settings, **overrides: Any) -> Settings:
         nats=settings.nats,
         security=settings.security,
         telemetry=settings.telemetry,
+        tracks=settings.tracks,
         ingest=settings.ingest,
         engine=settings.engine,
         live=live,

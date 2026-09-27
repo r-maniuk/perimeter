@@ -143,8 +143,12 @@ def alert_checks(username: str) -> dict[str, int]:
     }
 
 
-def takeover_seconds(service: str, killed_at: datetime) -> float | None:
-    """Seconds from the kill until the last partition was acquired by a surviving engine."""
+def takeover_seconds(service: str, killed_at: datetime, restarted_at: datetime) -> float | None:
+    """Seconds from the kill until the survivors had taken over the last orphaned partition.
+
+    Acquisitions after the restart are the partitions moving back to the restarted engine, not
+    the takeover, so they do not count.
+    """
     if service != "engine":
         return None
     logs = compose(
@@ -156,7 +160,8 @@ def takeover_seconds(service: str, killed_at: datetime) -> float | None:
         if '"engine.partition_acquired"' in line
         and (match := re.search(r'"timestamp":"([^"]+)"', line))
     ]
-    return max((s - killed_at).total_seconds() for s in stamps) if stamps else None
+    taken = [s for s in stamps if s < restarted_at]
+    return max((s - killed_at).total_seconds() for s in taken) if taken else None
 
 
 def main() -> int:
@@ -195,6 +200,7 @@ def main() -> int:
         command += [flag, value]
     generator = subprocess.Popen(command, cwd=ROOT)  # noqa: S603
     killed_at: datetime | None = None
+    restarted_at: datetime | None = None
     victim = ""
     if args.kill != "none":
         time.sleep(args.at)
@@ -203,6 +209,7 @@ def main() -> int:
         docker("kill", victim)
         print(f"drill: killed {args.kill} container {victim[:12]} at {killed_at:%H:%M:%S}")
         time.sleep(args.down)
+        restarted_at = datetime.now(UTC)
         docker("start", victim)
         print(f"drill: started it again after {args.down:g} s")
     generator.wait()
@@ -211,7 +218,9 @@ def main() -> int:
     accepted = int(summary["reports"]["accepted"])
     observed = sum(summary.get("observe", {}).get("alerts", {}).values())
     checks = alert_checks(username)
-    takeover = takeover_seconds(args.kill, killed_at) if killed_at else None
+    takeover = (
+        takeover_seconds(args.kill, killed_at, restarted_at) if killed_at and restarted_at else None
+    )
 
     results = [
         ("accepted reports stored once", after.last_seq - before.last_seq == accepted,
@@ -231,7 +240,7 @@ def main() -> int:
     for name, ok, detail in results:
         print(f"  {'PASS' if ok else 'FAIL'}  {name:<34} {detail}")
     if takeover is not None:
-        print(f"        takeover: last partition re-acquired {takeover:.1f} s after the kill")
+        print(f"        takeover: orphaned partitions owned again {takeover:.1f} s after the kill")
     print(f"        summary: {summary_file}")
     return 0 if all(ok for _, ok, _ in results) else 1
 

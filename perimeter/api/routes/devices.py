@@ -28,16 +28,14 @@ from perimeter.api.schemas import (
     PointGeometry,
     Trail,
 )
-from perimeter.bus.trail import read_trail
 from perimeter.domain.clock import SYSTEM_CLOCK
 from perimeter.domain.reports import DEVICE_ID_PATTERN, ms_to_datetime
-from perimeter.storage import devices
+from perimeter.storage import devices, tracks
 from perimeter.storage.devices import BBox
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
 TRAIL_MAX_POINTS = 5_000
-TRAIL_TIMEOUT_S = 2.0
 COORDINATE_DECIMALS = 7
 
 DeviceIdPath = Annotated[str, Path(max_length=64, pattern=DEVICE_ID_PATTERN)]
@@ -202,27 +200,26 @@ async def get_device(device_id: DeviceIdPath, principal: CurrentUser, state: Sta
     "/{device_id}/trail",
     response_model=Trail,
     responses=_NOT_FOUND,
-    summary="Recent track of one device from the telemetry log (GeoJSON Feature)",
+    summary="Recent track of one device (GeoJSON Feature)",
 )
 async def device_trail(
     device_id: DeviceIdPath,
     _: CurrentUser,
     state: State,
-    minutes: Annotated[int, Query(ge=1, le=120, description="How far back to go")] = 15,
+    minutes: Annotated[
+        int, Query(ge=1, le=24 * 60, description="How far back to go (tracks are kept 30 min)")
+    ] = 15,
 ) -> Response:
+    retention_min = state.settings.tracks.retention_min
+    since_ms = SYSTEM_CLOCK.now_ms() - min(minutes, retention_min) * 60_000
     async with state.db.connect() as conn:
         if await devices.get(conn, device_id) is None:
             raise not_found("device")
-    now_ms = SYSTEM_CLOCK.now_ms()
-    trail = await read_trail(
-        state.nc,
-        device_id,
-        since_ms=now_ms - minutes * 60_000,
-        now_ms=now_ms,
-        max_points=TRAIL_MAX_POINTS,
-        timeout_s=TRAIL_TIMEOUT_S,
-    )
-    coordinates = [_coordinates(p.lon, p.lat) for p in trail.points]
+        points, within_cap = await tracks.recent(
+            conn, device_id, since=ms_to_datetime(since_ms), limit=TRAIL_MAX_POINTS
+        )
+    complete = within_cap and minutes <= retention_min
+    coordinates = [_coordinates(p.lon, p.lat) for p in points]
     geometry: _LineString | _Point | None = None
     if len(coordinates) >= 2:
         geometry = _LineString(coordinates=coordinates)
@@ -234,10 +231,10 @@ async def device_trail(
             geometry=geometry,
             properties=_TrailProperties(
                 device_id=device_id,
-                since=ms_to_datetime(trail.since_ms),
-                timestamps=[ms_to_datetime(p.recorded_at_ms) for p in trail.points],
-                speeds=[p.speed for p in trail.points],
-                complete=trail.complete,
+                since=ms_to_datetime(since_ms),
+                timestamps=[ms_to_datetime(p.recorded_at_ms) for p in points],
+                speeds=[p.speed_mps for p in points],
+                complete=complete,
             ),
         )
     )

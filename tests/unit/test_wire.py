@@ -34,7 +34,6 @@ def test_subjects() -> None:
     assert subjects.partitions_from_transform("tlm.>") is None
     assert subjects.partition_of("tlm.7.veh-1") == 7
     assert subjects.device_of("tlm.7.veh-1") == "veh-1"
-    assert subjects.telemetry_of_device("veh-1") == "tlm.*.veh-1"
     assert subjects.events(UUID(int=1)) == f"evt.{UUID(int=1)}"
     assert subjects.live_events("u") == "live.evt.u"
     assert subjects.engine_consumer(3) == "engine-p3"

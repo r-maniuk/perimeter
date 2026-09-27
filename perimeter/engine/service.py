@@ -42,6 +42,7 @@ from perimeter.engine.worker import Backoff, LeaseHandle, PartitionWorker, unack
 from perimeter.ops import tracing
 from perimeter.ops.heartbeat import Heartbeat, instance_id
 from perimeter.ops.looplag import LoopLagMonitor
+from perimeter.storage import tracks
 from perimeter.storage.engine import create_engine
 from perimeter.wire import subjects
 
@@ -148,6 +149,7 @@ class EngineService:
         self._spawn("tiles", tiles.run(self._stop_tiles))
         self._spawn("rounds", self._coordinator.run(self._stop_rounds))
         self._spawn("changes", self._follow_changes(kv, self._coordinator))
+        self._spawn("tracks", self._maintain_tracks())
         self._started = True
         log.info(
             "engine.started",
@@ -261,6 +263,23 @@ class EngineService:
                 delay = min(delay * 2, 5.0)
             else:
                 return
+
+    async def _maintain_tracks(self) -> None:
+        """Roll the track partitions forward; every engine tries, one does it (advisory lock)."""
+        assert self._db is not None
+        db = self._db
+        retention_min = self.settings.tracks.retention_min
+        interval_s = self.settings.tracks.maintenance_s
+        while not self._stop.is_set():
+            try:
+                async with db.begin() as conn:
+                    done = await tracks.maintain(conn, retention_min=retention_min)
+                if done.created or done.dropped:
+                    log.info("engine.tracks_rolled", created=done.created, dropped=done.dropped)
+            except Exception as exc:  # retried next round; inserts fall back to the default slot
+                log.warning("engine.tracks_maintenance_failed", error=repr(exc))
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), interval_s)
 
     async def _follow_changes(self, kv: KeyValue, coordinator: Coordinator) -> None:
         """Feed bucket changes to the coordinator; its periodic rounds remain the safety net."""

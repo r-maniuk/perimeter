@@ -6,7 +6,6 @@ import {
   listSessions,
   listZones,
   revokeSession,
-  TrailUnavailableError,
   updateZone,
   zoneOccupants,
 } from "./endpoints";
@@ -123,7 +122,7 @@ describe("REST contract", () => {
       geometry: { type: "Point", coordinates: [4.3, 52.3] },
       properties: {
         device_id: "p",
-        since: "x",
+        since: "2026-09-26T19:00:00Z",
         timestamps: ["2026-09-26T19:00:01Z"],
         speeds: [null],
         complete: true,
@@ -135,27 +134,41 @@ describe("REST contract", () => {
       type: "Feature",
       id: "n",
       geometry: null,
-      properties: { device_id: "n", since: "x", timestamps: [], speeds: [], complete: true },
+      properties: {
+        device_id: "n",
+        since: "2026-09-26T19:00:00Z",
+        timestamps: [],
+        speeds: [],
+        complete: true,
+      },
     });
-    expect(await deviceTrail("n", 5)).toEqual({ coordinates: [], times: [], complete: true });
+    expect(await deviceTrail("n", 5)).toEqual({
+      coordinates: [],
+      times: [],
+      since: Date.parse("2026-09-26T19:00:00Z"),
+      complete: true,
+    });
   });
 
-  it("tells a trail the server gave up on from a device that did not move", async () => {
+  it("keeps where a window longer than tracks are kept was cut", async () => {
     respond({
       type: "Feature",
       id: "veh-1",
       geometry: null,
-      properties: { device_id: "veh-1", since: "x", timestamps: [], speeds: [], complete: false },
+      properties: {
+        device_id: "veh-1",
+        since: "2026-09-26T18:30:00Z",
+        timestamps: [],
+        speeds: [],
+        complete: false,
+      },
     });
-    await expect(deviceTrail("veh-1", 60)).rejects.toBeInstanceOf(TrailUnavailableError);
-
-    respond({
-      type: "Feature",
-      id: "veh-1",
-      geometry: null,
-      properties: { device_id: "veh-1", since: "x", timestamps: [], speeds: [], complete: true },
+    await expect(deviceTrail("veh-1", 60)).resolves.toEqual({
+      coordinates: [],
+      times: [],
+      since: Date.parse("2026-09-26T18:30:00Z"),
+      complete: false,
     });
-    await expect(deviceTrail("veh-1", 60)).resolves.toMatchObject({ coordinates: [] });
   });
 
   it("refuses a trail whose timestamps do not line up with its coordinates", async () => {
@@ -163,7 +176,13 @@ describe("REST contract", () => {
       type: "Feature",
       id: "veh-1",
       geometry: { type: "Point", coordinates: [4.3, 52.3] },
-      properties: { device_id: "veh-1", since: "x", timestamps: [], speeds: [], complete: true },
+      properties: {
+        device_id: "veh-1",
+        since: "2026-09-26T19:00:00Z",
+        timestamps: [],
+        speeds: [],
+        complete: true,
+      },
     });
     await expect(deviceTrail("veh-1", 5)).rejects.toBeInstanceOf(ContractError);
   });

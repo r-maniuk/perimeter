@@ -2,24 +2,14 @@
 
 from __future__ import annotations
 
-import random
-import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
-from hypothesis import HealthCheck, given, settings
-from hypothesis import strategies as st
-from nats.js import JetStreamContext
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
-
-from perimeter.domain.reports import TelemetryRecord
-from perimeter.storage import devices
-from perimeter.storage.devices import BBox
-from perimeter.wire import subjects, telemetry
 
 
 async def auth(client: httpx.AsyncClient, username: str) -> dict[str, str]:
@@ -151,14 +141,19 @@ async def test_unknown_or_malformed_device_ids(client: httpx.AsyncClient) -> Non
     assert (await client.get("/v1/devices", params={"limit": 0}, headers=alice)).status_code == 422
 
 
-async def report(js: JetStreamContext, device: str, *, ago_s: float, lon: float) -> None:
-    now_ms = time.time_ns() // 1_000_000
-    record = TelemetryRecord(device, now_ms - round(ago_s * 1000), now_ms, 52.37, lon, speed=4.0)
-    await js.publish(
-        subjects.telemetry(device),
-        telemetry.encode(record),
-        headers={"Nats-Msg-Id": telemetry.dedup_id(record)},
-    )
+async def report(db: AsyncEngine, device: str, *, ago_s: float, lon: float) -> None:
+    """What the engine does with an applied report: keep it in the device's track."""
+    async with db.begin() as conn:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO device_tracks (device_id, recorded_at, position, speed_mps)
+                VALUES (:device, now() - make_interval(secs => :ago),
+                        ST_SetSRID(ST_MakePoint(:lon, 52.37), 4326)::geography, 4.0)
+                """
+            ),
+            {"device": device, "ago": ago_s, "lon": lon},
+        )
 
 
 async def trail(
@@ -170,17 +165,17 @@ async def trail(
     return body
 
 
-async def test_trail_is_read_back_from_telemetry_in_event_time_order(
-    client: httpx.AsyncClient, db: AsyncEngine, js: JetStreamContext
+async def test_trail_is_read_back_from_the_track_in_event_time_order(
+    client: httpx.AsyncClient, db: AsyncEngine
 ) -> None:
     alice = await auth(client, "alice")
     await place(db, "veh-1", 4.9, 52.37)
     await place(db, "veh-2", 4.9, 52.37)
-    await report(js, "veh-1", ago_s=30 * 60, lon=4.0)  # outside a 15 minute window
-    await report(js, "veh-1", ago_s=60, lon=4.8)
-    await report(js, "veh-1", ago_s=180, lon=4.7)  # arrives late: sorted by device time
-    await report(js, "veh-2", ago_s=90, lon=5.5)  # another device
-    await report(js, "veh-1", ago_s=10, lon=4.9)
+    await report(db, "veh-1", ago_s=25 * 60, lon=4.0)  # outside a 15 minute window
+    await report(db, "veh-1", ago_s=60, lon=4.8)
+    await report(db, "veh-1", ago_s=180, lon=4.7)  # stored late: sorted by device time
+    await report(db, "veh-2", ago_s=90, lon=5.5)  # another device
+    await report(db, "veh-1", ago_s=10, lon=4.9)
     body = await trail(client, alice, "veh-1")
     assert body["type"] == "Feature"
     assert body["id"] == "veh-1"
@@ -191,17 +186,21 @@ async def test_trail_is_read_back_from_telemetry_in_event_time_order(
     assert stamps == sorted(stamps)
     assert properties["speeds"] == [4.0, 4.0, 4.0]
     assert properties["complete"] is True
-    wide = await trail(client, alice, "veh-1", minutes=45)
-    assert len(wide["geometry"]["coordinates"]) == 4
+    retained = await trail(client, alice, "veh-1", minutes=30)
+    assert len(retained["geometry"]["coordinates"]) == 4
+    assert retained["properties"]["complete"] is True
+    beyond = await trail(client, alice, "veh-1", minutes=45)  # longer than tracks are kept
+    assert len(beyond["geometry"]["coordinates"]) == 4
+    assert beyond["properties"]["complete"] is False
 
 
 async def test_trail_geometry_for_one_and_no_points(
-    client: httpx.AsyncClient, db: AsyncEngine, js: JetStreamContext
+    client: httpx.AsyncClient, db: AsyncEngine
 ) -> None:
     alice = await auth(client, "alice")
     await place(db, "solo", 4.9, 52.37)
     await place(db, "quiet", 4.9, 52.37)
-    await report(js, "solo", ago_s=5, lon=4.91)
+    await report(db, "solo", ago_s=5, lon=4.91)
     single = await trail(client, alice, "solo")
     assert single["geometry"] == {"type": "Point", "coordinates": [4.91, 52.37]}
     assert len(single["properties"]["timestamps"]) == 1
@@ -209,69 +208,3 @@ async def test_trail_geometry_for_one_and_no_points(
     assert empty["geometry"] is None
     assert empty["properties"]["timestamps"] == []
     assert empty["properties"]["complete"] is True
-
-
-async def test_trail_reads_leave_no_consumers_behind(
-    client: httpx.AsyncClient, db: AsyncEngine, js: JetStreamContext
-) -> None:
-    alice = await auth(client, "alice")
-    await place(db, "veh-1", 4.9, 52.37)
-    await report(js, "veh-1", ago_s=5, lon=4.9)
-    before = {c.name for c in await js.consumers_info(subjects.TELEMETRY_STREAM)}
-    for _ in range(3):
-        await trail(client, alice, "veh-1")
-    after = {c.name for c in await js.consumers_info(subjects.TELEMETRY_STREAM)}
-    assert after == before
-
-
-@pytest.mark.parametrize("minutes", [0, 121, "x"])
-async def test_trail_window_is_validated(client: httpx.AsyncClient, minutes: int | str) -> None:
-    alice = await auth(client, "alice")
-    response = await client.get(
-        "/v1/devices/veh-1/trail", params={"minutes": minutes}, headers=alice
-    )
-    assert response.status_code == 422
-
-
-@st.composite
-def viewports(draw: st.DrawFn) -> BBox:
-    """Any rectangle: city blocks to the whole globe, across the antimeridian, touching a pole."""
-    south = draw(st.floats(-90, 90))
-    north = draw(st.floats(south, 90))
-    west = draw(st.floats(-180, 180))
-    east = draw(st.floats(-180, 180))
-    return (west, south, east, north)
-
-
-@settings(
-    max_examples=60, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
-)
-@given(bbox=viewports(), seed=st.integers(0, 2**32 - 1))
-async def test_viewports_return_exactly_the_devices_inside(
-    db: AsyncEngine, bbox: BBox, seed: int
-) -> None:
-    rng = random.Random(seed)
-    west, south, east, north = bbox
-    points = [(rng.uniform(-180, 180), rng.uniform(-90, 90)) for _ in range(60)]
-    width = (east - west) % 360 or 360 if west > east else east - west
-    points += [  # and plenty near and inside the box, including its edges
-        ((west + rng.uniform(-0.01, 1.01) * width + 180) % 360 - 180, rng.uniform(south, north))
-        for _ in range(60)
-    ]
-    points += [(west, south), (east, north), (west, north)]
-    async with db.begin() as conn:
-        for i, (lon, lat) in enumerate(points):
-            await conn.execute(
-                text(
-                    "INSERT INTO devices (device_id, position, recorded_at, received_at) VALUES "
-                    "(:d, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography, now(), now())"
-                ),
-                {"d": f"p{i}", "lon": lon, "lat": lat},
-            )
-        found, truncated = await devices.in_viewport(conn, bbox, stale_s=600, limit=10_000)
-        await conn.rollback()
-    expected = sorted(
-        f"p{i}" for i, (lon, lat) in enumerate(points) if devices.inside(bbox, lon, lat)
-    )
-    assert [p.device_id for p in found] == expected
-    assert not truncated

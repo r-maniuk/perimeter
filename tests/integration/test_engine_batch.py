@@ -463,3 +463,22 @@ async def test_an_alert_whose_publish_failed_is_swept_to_the_owner_exactly_once(
     await asyncio.sleep(0.05)
     assert len(received) == 1
     assert json.loads(received[0].data)["data"]["kind"] == "enter"
+
+
+async def test_every_applied_report_is_kept_in_the_track_and_late_ones_are_not(
+    processor: BatchProcessor, db: AsyncEngine
+) -> None:
+    await processor.apply(PARTITION, TOKEN, [report(T0), report(T0 + 1_000), report(T0 + 2_000)])
+    await processor.apply(PARTITION, TOKEN, [report(T0 + 500), report(T0 + 2_000)])  # late, replay
+    async with db.connect() as conn:
+        stored: list[int] = list(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT (extract(epoch FROM recorded_at) * 1000)::bigint "
+                        "FROM device_tracks WHERE device_id = 'veh-1' ORDER BY recorded_at"
+                    )
+                )
+            ).scalars()
+        )
+    assert stored == [T0, T0 + 1_000, T0 + 2_000]

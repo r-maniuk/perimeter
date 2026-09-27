@@ -201,19 +201,10 @@ export interface Trail {
   coordinates: [number, number][];
   /** Device time of each coordinate, epoch milliseconds. */
   times: number[];
-  /** False when the server capped the trail (too many points, or a read deadline). */
+  /** Where the server started looking, epoch milliseconds: never earlier than tracks are kept. */
+  since: number;
+  /** False when the server shortened the trail (too many points, or a window longer than tracks are kept). */
   complete: boolean;
-}
-
-/**
- * The server stopped reading a trail (its read deadline) before it had the two reports a line
- * needs. Unlike an empty but complete trail, this says nothing about the device: try again.
- */
-export class TrailUnavailableError extends Error {
-  override name = "TrailUnavailableError";
-  constructor(id: string) {
-    super(`The trail of ${id} could not be read in time.`);
-  }
 }
 
 export async function deviceTrail(
@@ -240,10 +231,10 @@ export async function deviceTrail(
       `trail of ${id}: ${stamps.length} timestamps for ${coordinates.length} coordinates`,
     );
   }
-  if (!data.properties.complete && coordinates.length < 2) throw new TrailUnavailableError(id);
   return {
     coordinates,
     times: stamps.map((t) => Date.parse(t)),
+    since: Date.parse(data.properties.since),
     complete: data.properties.complete,
   };
 }

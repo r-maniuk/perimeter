@@ -5,16 +5,22 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import jwt
+import msgspec
 import pytest
+from nats.aio.client import Client as NatsClient
+from nats.js import JetStreamContext
 from sqlalchemy.ext.asyncio import AsyncEngine
 from websockets.exceptions import ConnectionClosed
 
+from perimeter.api.live.sessions import SessionRecord, SessionRegistry
 from perimeter.bus import topology
 from perimeter.config import Settings
+from perimeter.wire import subjects
 from tests.integration.conftest import TEST_ORIGIN
 from tests.integration.live_support import (
     LiveClient,
@@ -25,6 +31,7 @@ from tests.integration.live_support import (
     sign_in,
     with_live,
 )
+from tests.support import eventually
 
 
 @pytest.fixture
@@ -253,3 +260,40 @@ async def test_sockets_without_valid_credentials_are_refused_with_4003(
     # A command-line client that also kept the cookie: its explicit token decides.
     async with live_client(replica.ws(token), cookie=token) as tool:
         assert (await tool.expect("hello"))["user"]["username"] == "alice"
+
+
+async def test_a_recreated_bucket_is_followed_from_its_first_revision(
+    nc: NatsClient, js: JetStreamContext, provisioned: topology.Topology
+) -> None:
+    def record(uid: str, sid: str) -> bytes:
+        return msgspec.json.encode(
+            SessionRecord(
+                sid=sid,
+                uid=uid,
+                replica="elsewhere",
+                connected_at=datetime.now(UTC),
+                agent=None,
+                label="Firefox · Linux",
+                ip=None,
+                jti=f"jti-{sid}",
+            )
+        )
+
+    registry = SessionRegistry(js, nc, instance="replica-a", max_per_user=16)
+    await registry.start()
+    try:
+        kv = await js.key_value(subjects.KV_SESSIONS)
+        for index in range(5):
+            await kv.put(f"u1.s{index}", record("u1", f"s{index}"))
+        await eventually(lambda: len(registry.sessions_of("u1")) == 5)
+
+        # The bucket is lost and recreated: its revisions start again from 1, below the mirror's.
+        await js.delete_key_value(subjects.KV_SESSIONS)
+        await topology.ensure(js, provisioned)
+        kv = await js.key_value(subjects.KV_SESSIONS)
+        await kv.put("u2.s9", record("u2", "s9"))
+
+        await registry._follow_a_recreated_bucket()
+        await eventually(lambda: [s.sid for s in registry.sessions_of("u2")] == ["s9"])
+    finally:
+        await registry.close()

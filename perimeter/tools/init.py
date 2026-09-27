@@ -13,7 +13,8 @@ from perimeter.bus import topology
 from perimeter.bus.connection import connect
 from perimeter.config import DatabaseSettings, load_settings
 from perimeter.ops.logging import configure_logging
-from perimeter.storage.engine import database_url
+from perimeter.storage import tracks
+from perimeter.storage.engine import create_engine, database_url
 
 log = structlog.get_logger(__name__)
 
@@ -40,6 +41,13 @@ async def run() -> None:
     )
     log.info("init.migrating", host=settings.database.host, database=settings.database.name)
     await asyncio.to_thread(migrate, settings.database)
+    db = create_engine(settings.database, application_name="perimeter-init", pool_size=1)
+    try:
+        async with db.begin() as conn:
+            done = await tracks.maintain(conn, retention_min=settings.tracks.retention_min)
+        log.info("init.tracks_ready", created=done.created, dropped=done.dropped)
+    finally:
+        await db.dispose()
     nc = await connect(settings.nats, name="perimeter-init")
     try:
         await topology.ensure(nc.jetstream(), topology.Topology.from_settings(settings))

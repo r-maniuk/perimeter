@@ -10,6 +10,8 @@ from nats.aio.client import Client as NatsClient
 from nats.aio.msg import Msg
 from nats.js import JetStreamContext
 from nats.js.api import KeyValueConfig
+from nats.js.errors import NotFoundError
+from nats.js.kv import KeyValue
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -121,6 +123,36 @@ async def test_an_abandoned_lease_expires_and_the_token_keeps_growing(js: JetStr
     assert taken[0] > first.token
     with pytest.raises(LeaseLost):
         await bucket.renew(first)
+
+
+async def test_a_lease_that_expires_while_it_is_being_acquired_is_taken(
+    js: JetStreamContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The client's create answers "taken" with a second round trip that reads the key back; hold
+    # that read until the holder's entry has expired, which is the window a busy engine can hit.
+    kv = await js.create_key_value(KeyValueConfig(bucket="lease-race", ttl=1.0, history=1))
+    bucket = LeaseBucket(kv, generation=1)
+    first = await bucket.acquire("p.4", "engine-a")
+    assert first is not None
+    read_back = kv._get
+
+    async def expired() -> bool:
+        try:
+            await js.get_last_msg("KV_lease-race", "$KV.lease-race.p.4")
+        except NotFoundError:
+            return True
+        return False
+
+    async def read_back_once_expired(key: str, revision: int | None = None) -> KeyValue.Entry:
+        await eventually(expired, within=5.0, interval=0.05)
+        return await read_back(key, revision)
+
+    monkeypatch.setattr(kv, "_get", read_back_once_expired)
+    second = await bucket.acquire("p.4", "engine-b")
+    monkeypatch.undo()
+    assert second is not None
+    assert second.token > first.token
+    assert await bucket.holder("p.4") == "engine-b"
 
 
 async def test_releasing_a_lost_lease_does_not_touch_the_new_owner(js: JetStreamContext) -> None:

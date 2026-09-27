@@ -59,6 +59,75 @@ COMMENT ON FUNCTION perimeter_envelope(geography, double precision) IS
     'Conservative lon/lat box of a geodesic circle; GiST prefilter for zone matching.'
 """
 
+# Device tracks live in 10-minute range partitions; this function keeps the window rolling: it
+# creates the slots from `retention` ago to `ahead` from now and drops the slots that ended before
+# the retention window (a DROP, not millions of DELETEs). It runs as the schema owner (SECURITY
+# DEFINER), so the services can keep the partitions current without any DDL rights of their own.
+TRACKS_FUNCTION = r"""
+CREATE FUNCTION perimeter_maintain_tracks(
+    retention interval, ahead interval DEFAULT interval '20 minutes'
+)
+RETURNS TABLE (created integer, dropped integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+SET timezone = 'UTC'
+AS $$
+DECLARE
+    slot     CONSTANT interval := interval '10 minutes';
+    origin   CONSTANT timestamptz := timestamptz '2000-01-01 00:00:00+00';
+    start_at timestamptz := date_bin(slot, now() - retention, origin);
+    last_at  timestamptz := date_bin(slot, now() + ahead, origin);
+    part     record;
+BEGIN
+    created := 0;
+    dropped := 0;
+    -- One maintainer at a time: whoever does not get the lock has nothing to do this round.
+    IF NOT pg_try_advisory_xact_lock(hashtext('perimeter_maintain_tracks')) THEN
+        RETURN NEXT;
+        RETURN;
+    END IF;
+    WHILE start_at <= last_at LOOP
+        IF to_regclass('public.device_tracks_' || to_char(start_at, 'YYYYMMDDHH24MI')) IS NULL THEN
+            EXECUTE format(
+                'CREATE TABLE public.%I PARTITION OF public.device_tracks FOR VALUES FROM (%L) TO (%L)',
+                'device_tracks_' || to_char(start_at, 'YYYYMMDDHH24MI'), start_at, start_at + slot
+            );
+            created := created + 1;
+        END IF;
+        start_at := start_at + slot;
+    END LOOP;
+    FOR part IN
+        SELECT c.relname
+        FROM pg_inherits AS i
+        JOIN pg_class AS c ON c.oid = i.inhrelid
+        WHERE i.inhparent = 'public.device_tracks'::regclass
+          AND c.relname ~ '^device_tracks_[0-9]{12}$'
+          AND to_timestamp(substr(c.relname, 15), 'YYYYMMDDHH24MI') + slot <= now() - retention
+    LOOP
+        EXECUTE format('DROP TABLE public.%I', part.relname);
+        dropped := dropped + 1;
+    END LOOP;
+    -- Only reports older than every slot land in the default partition: they are past retention.
+    IF EXISTS (SELECT 1 FROM public.device_tracks_default) THEN
+        TRUNCATE public.device_tracks_default;
+    END IF;
+    RETURN NEXT;
+END
+$$
+"""
+
+TRACKS_GRANTS = r"""
+DO $$
+BEGIN
+    REVOKE ALL ON FUNCTION perimeter_maintain_tracks(interval, interval) FROM PUBLIC;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'perimeter_app') THEN
+        GRANT EXECUTE ON FUNCTION perimeter_maintain_tracks(interval, interval) TO perimeter_app;
+    END IF;
+END
+$$
+"""
+
 SCHEMA = r"""
 CREATE TABLE users (
     id          uuid PRIMARY KEY DEFAULT uuidv7(),
@@ -144,6 +213,17 @@ CREATE TABLE outbox (
 );
 CREATE INDEX outbox_created_at_idx ON outbox (created_at);
 
+-- Every applied report, for device trails; range-partitioned by event time (see TRACKS_FUNCTION).
+CREATE TABLE device_tracks (
+    device_id    text NOT NULL,
+    recorded_at  timestamptz NOT NULL,
+    position     geography(Point, 4326) NOT NULL,
+    speed_mps    real,
+    heading_deg  real,
+    CONSTRAINT device_tracks_pkey PRIMARY KEY (device_id, recorded_at)
+) PARTITION BY RANGE (recorded_at);
+CREATE TABLE device_tracks_default PARTITION OF device_tracks DEFAULT;
+
 CREATE TABLE partition_epochs (
     partition   smallint PRIMARY KEY,
     generation  bigint NOT NULL DEFAULT 0,
@@ -164,11 +244,14 @@ def upgrade() -> None:
     for statement in re.split(r";[ \t]*\n", SCHEMA):
         if statement.strip():
             op.execute(statement)
+    op.execute(TRACKS_FUNCTION)
+    op.execute(TRACKS_GRANTS)
 
 
 def downgrade() -> None:
+    op.execute("DROP FUNCTION IF EXISTS perimeter_maintain_tracks(interval, interval)")
     op.execute(
-        "DROP TABLE IF EXISTS partition_epochs, outbox, alerts, zone_presence, devices, "
-        "geozones, users CASCADE"
+        "DROP TABLE IF EXISTS partition_epochs, device_tracks, outbox, alerts, zone_presence, "
+        "devices, geozones, users CASCADE"
     )
     op.execute("DROP FUNCTION IF EXISTS perimeter_envelope(geography, double precision)")
