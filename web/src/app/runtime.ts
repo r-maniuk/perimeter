@@ -3,8 +3,8 @@
  * frames into cache updates, store changes and map effects. Created on sign-in, torn down on
  * sign-out; nothing here depends on React.
  */
-import type { QueryClient } from "@tanstack/react-query";
-import { alertFromRecord, currentUser, getZone, updateZone } from "@/api/endpoints";
+import type { QueryClient, QueryKey } from "@tanstack/react-query";
+import { alertFromRecord, getZone, updateZone } from "@/api/endpoints";
 import type { EventEnvelope, HelloFrame, OpsFrame, User, Zone } from "@/api/schemas";
 import { seriesOf } from "@/features/ops/model";
 import { notify } from "@/features/shell/notices";
@@ -26,6 +26,7 @@ import { useAlerts } from "@/state/alerts";
 import { useLive } from "@/state/live";
 import { useSession } from "@/state/session";
 import { useUi } from "@/state/ui";
+import { followBrowserSession, SIGNED_OUT } from "./sessionSync";
 
 export const SESSIONS_KEY = ["sessions"] as const;
 
@@ -66,7 +67,6 @@ export class Runtime {
   #occupantRefresh = new Map<string, { again: boolean; timer: ReturnType<typeof setTimeout> }>();
   #reporting = new Map<string, Map<string, number>>();
   #alerts = new RecentSet<string>(ALERT_MEMORY);
-  #stopped = false;
 
   constructor(user: User, client: QueryClient) {
     this.user = user;
@@ -125,11 +125,13 @@ export class Runtime {
   }
 
   stop(): void {
-    this.#stopped = true;
     for (const off of this.#unsubscribe.splice(0)) off();
     for (const timer of this.#timers.splice(0)) clearInterval(timer);
     for (const { timer } of this.#occupantRefresh.values()) clearTimeout(timer);
     this.#occupantRefresh.clear();
+    // A zone change the server put off must not go out once the session is over: it would be
+    // sent with whatever sign-in the browser holds by then.
+    this.patcher.stop();
     this.live.stop();
     mapController.onViewport = null;
     mapController.detachFleet();
@@ -202,19 +204,21 @@ export class Runtime {
       case "status":
         useLive.getState().setStatus(event.status);
         if (event.status.state === "signedOut") {
+          // A sign-out revokes the sign-in every tab of this browser shares: most often it was made
+          // in another tab here, not on another device, so the notice does not say where.
           useSession
             .getState()
             .signedOut(
-              event.status.expired
-                ? "Your session has expired. Sign in again."
-                : "This session was signed out from another device.",
+              event.status.expired ? "Your session has expired. Sign in again." : SIGNED_OUT,
             );
         } else if (event.status.state === "blocked" && event.status.code === 4003) {
-          void this.#checkIdentity();
+          void followBrowserSession();
         }
         break;
       case "accountChanged":
-        void this.#checkIdentity();
+        // Another tab signed this browser in as someone else: this tab follows that account
+        // instead of showing its data under the old name.
+        void followBrowserSession();
         break;
       case "resync":
         break;
@@ -241,9 +245,20 @@ export class Runtime {
       // What happened while the tab was away is replayed as events, but the occupancy counts
       // are re-read instead: the list may already include those arrivals and departures (after
       // a reload it was fetched just now), so counting them again would count them twice.
-      void this.#client.invalidateQueries({ queryKey: ZONES_KEY }, { cancelRefetch: false });
-      void this.#client.invalidateQueries({ queryKey: ["occupants"] }, { cancelRefetch: false });
+      this.#readAgain(ZONES_KEY);
+      this.#readAgain(["occupants"]);
     }
+  }
+
+  /**
+   * Read again, from now. A read already on its way is dropped rather than joined: the server
+   * may have made it before the last replayed arrival, which would then be neither counted nor
+   * listed. A refetch alone joins a first read that is still pending, whatever it is asked; the
+   * cancellation settles that read at once, so the invalidation that follows starts a new one.
+   */
+  #readAgain(queryKey: QueryKey): void {
+    void this.#client.cancelQueries({ queryKey });
+    void this.#client.invalidateQueries({ queryKey });
   }
 
   #onPositions(data: ArrayBuffer): void {
@@ -332,33 +347,6 @@ export class Runtime {
 
   #onOps(frame: OpsFrame): void {
     useLive.getState().pushOps(frame, seriesOf(frame));
-  }
-
-  /**
-   * Find out who this browser is signed in as now. The session may have ended, or another tab may
-   * have signed in as someone else (the session cookie is shared): this tab then follows that
-   * account instead of showing its data under the old name.
-   */
-  async #checkIdentity(): Promise<void> {
-    let user: User | null;
-    try {
-      user = await currentUser();
-    } catch {
-      // The network is down: the connection state already says so, and the next hello asks again.
-      return;
-    }
-    const session = useSession.getState();
-    if (this.#stopped) return;
-    if (!user) {
-      session.signedOut("Your session has ended. Sign in again.");
-    } else if (user.id !== this.user.id && session.user?.id !== user.id) {
-      session.signedIn(user);
-      notify({
-        tone: "info",
-        title: `Signed in as ${user.username}`,
-        body: "This browser switched accounts in another tab.",
-      });
-    }
   }
 
   /* ---------------------------------------------------------------- zones */

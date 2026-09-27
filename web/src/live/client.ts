@@ -5,7 +5,7 @@
  * Responsibilities kept here, independent of React and testable with a fake socket:
  * - connection lifecycle with exponential back-off and jitter, honouring the close codes
  *   (4001 signed out, 4002 session expired, 4003 forbidden, 4008 resume now, 4009 too many
- *   sessions, 1013 overloaded);
+ *   sessions, 1013 overloaded, 1008 a message of ours refused);
  * - exactly-once events: `seq`/`prev` sequencing, `last_seq` persisted per tab, `resume_after` on
  *   every reconnect, a client-side gap check that reconnects to heal;
  * - one account: a socket whose hello speaks for another user (the browser signed in as someone
@@ -36,6 +36,8 @@ import { EventSequencer } from "./sequencer";
 export const CloseCode = {
   Normal: 1000,
   GoingAway: 1001,
+  /** The server refused a message of this client's: it is not part of the protocol. */
+  PolicyViolation: 1008,
   Internal: 1011,
   Overloaded: 1013,
   SignedOut: 4001,
@@ -58,6 +60,9 @@ const IMMEDIATE_RESUME_SPACING_MS = 5_000;
 const VIEWPORT_SPACING_MS = 250;
 /** The server's `LIVE_TILE_ZOOM` default, until `hello.tile_zoom` says otherwise. */
 const DEFAULT_TILE_ZOOM = 12;
+/** The zoom range a viewport message may carry (the protocol's `MapZoom`). */
+const VIEWPORT_MIN_ZOOM = 0;
+const VIEWPORT_MAX_ZOOM = 30;
 
 type Timer = ReturnType<typeof setTimeout>;
 
@@ -313,7 +318,11 @@ export class LiveClient {
     const [west, south, east, north] = viewport.bbox;
     const box = foldBBox({ west, south, east, north });
     const bbox = [box.west, box.south, box.east, box.north];
-    socket.send(JSON.stringify({ type: "viewport", bbox, zoom: viewport.zoom }));
+    // A zoom outside the protocol's range gets the socket closed, and every new socket would send
+    // the same viewport again. The server streams by the tiles covering the box, not by the zoom,
+    // so clamping it changes nothing that is streamed.
+    const zoom = Math.min(VIEWPORT_MAX_ZOOM, Math.max(VIEWPORT_MIN_ZOOM, viewport.zoom));
+    socket.send(JSON.stringify({ type: "viewport", bbox, zoom }));
     this.#sentViewport = viewport;
     this.#sentViewportAt = Date.now();
   }
@@ -411,6 +420,15 @@ export class LiveClient {
         // The session fell behind on events: resume from the last one seen, right away.
         this.#resumeNow(code);
         return;
+      case CloseCode.PolicyViolation:
+        // Something this client sent was refused, and a new socket starts by sending the same
+        // viewport: say what it was, and come back no sooner than to an overloaded server.
+        this.#emit({
+          type: "protocolError",
+          message: `the server refused a message: ${reason || "policy violation"}`,
+        });
+        this.#scheduleReconnect(code);
+        return;
       default:
         this.#scheduleReconnect(code);
     }
@@ -433,7 +451,9 @@ export class LiveClient {
       return;
     }
     const policy =
-      code === CloseCode.Overloaded ? { ...DEFAULT_BACKOFF, minMs: 5_000 } : DEFAULT_BACKOFF;
+      code === CloseCode.Overloaded || code === CloseCode.PolicyViolation
+        ? { ...DEFAULT_BACKOFF, minMs: 5_000 }
+        : DEFAULT_BACKOFF;
     const delay = backoffDelay(this.#attempt, this.#options.random, policy);
     this.#attempt += 1;
     this.#setStatus({

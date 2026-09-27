@@ -1,7 +1,7 @@
 import { History, X } from "lucide-react";
 import { AnimatePresence, m } from "motion/react";
 import { useEffect } from "react";
-import { formatCount } from "@/lib/format";
+import { formatCount, plural } from "@/lib/format";
 import { useLive } from "@/state/live";
 import { useUi } from "@/state/ui";
 
@@ -35,7 +35,7 @@ export function AwayNotice() {
             <History className="size-4 text-accent" aria-hidden="true" />
             <span className="text-ink">
               <span className="font-semibold tabular-nums">{formatCount(away.count)}</span>{" "}
-              {away.count === 1 ? "event" : "events"} delivered while you were away
+              {plural(away.count, "event")} delivered while you were away
             </span>
             <button
               type="button"

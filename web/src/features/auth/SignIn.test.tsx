@@ -90,4 +90,27 @@ describe("sign-in form", () => {
     );
     expect(useSession.getState().status).toBe("signedOut");
   });
+
+  it("tells the other tabs of this browser, whose requests are now this account's", async () => {
+    const otherTab = new BroadcastChannel("perimeter.session");
+    const heard: unknown[] = [];
+    otherTab.addEventListener("message", (event) => heard.push(event.data));
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          Response.json(
+            { expires_at: "2026-09-27T12:00:00Z", user: { id: "u-1", username: "grace" } },
+            { status: 201 },
+          ),
+        ),
+      );
+      render(<SignIn />);
+      await userEvent.type(screen.getByLabelText("Username"), "grace{Enter}");
+      await vi.waitFor(() => expect(heard).toEqual([{ change: "signedIn" }]));
+      expect(useSession.getState().user).toEqual({ id: "u-1", username: "grace" });
+    } finally {
+      otherTab.close();
+    }
+  });
 });

@@ -23,6 +23,17 @@ export function formatCount(value: number): string {
   return Math.abs(value) >= 10_000 ? compact.format(value) : integer.format(value);
 }
 
+/** Plural categories of a count rounded as {@link formatCount} shows it. */
+const plurals = new Intl.PluralRules("en", { maximumFractionDigits: 0 });
+
+/**
+ * The noun for a count, agreeing with the count as it is shown: "1 row", but "0 rows", "3 rows"
+ * and "12.4K rows" (0.6 is shown as "1", so it takes the singular). Irregular plurals are given.
+ */
+export function plural(count: number, one: string, other = `${one}s`): string {
+  return plurals.select(count) === "one" ? one : other;
+}
+
 /** Rates per second: "3.3K/s", "12/s", "0.4/s". */
 export function formatRate(perSecond: number): string {
   if (!Number.isFinite(perSecond)) return "–";

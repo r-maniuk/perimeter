@@ -3,6 +3,7 @@ import { m } from "motion/react";
 import { type FormEvent, useId, useState } from "react";
 import { signIn } from "@/api/endpoints";
 import { describeError } from "@/api/http";
+import { announceSession } from "@/app/sessionSync";
 import { lastUsername, rememberUsername, useSession } from "@/state/session";
 import { Button } from "@/ui/Button";
 import { Logo } from "@/ui/Logo";
@@ -39,6 +40,8 @@ export function SignIn() {
       const session = await signIn(value);
       rememberUsername(session.user.username);
       useSession.getState().signedIn(session.user);
+      // The other tabs of this browser send the new session cookie from now on: they follow.
+      announceSession("signedIn");
     } catch (failure) {
       setError(describeError(failure));
       setPending(false);

@@ -1,5 +1,5 @@
 import { Search } from "lucide-react";
-import { formatCount } from "@/lib/format";
+import { formatCount, plural } from "@/lib/format";
 import { useLive } from "@/state/live";
 import { useUi } from "@/state/ui";
 import { cx } from "@/ui/cx";
@@ -35,7 +35,7 @@ export function TopBar({ compact }: { compact: boolean }) {
           title="Devices streaming in the current view"
         >
           <span className="font-semibold text-ink tabular-nums">{formatCount(devices)}</span>
-          <span className="text-muted">devices</span>
+          <span className="text-muted">{plural(devices, "device")}</span>
           {!compact && (
             <>
               <span className="text-muted/60">·</span>

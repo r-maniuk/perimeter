@@ -145,6 +145,15 @@ export function isApiError(error: unknown, status?: number): error is ApiError {
   return error instanceof ApiError && (status === undefined || error.status === status);
 }
 
+/**
+ * How long to wait before sending again a request the server put off with 429 (too many
+ * requests): its Retry-After, or a second without one. `null` for any other failure.
+ */
+export function retryDelayMs(error: unknown): number | null {
+  if (!isApiError(error, 429)) return null;
+  return Math.max(1, error.retryAfterS ?? 1) * 1_000;
+}
+
 /** Human sentence for an error, suitable for a toast. */
 export function describeError(error: unknown): string {
   if (error instanceof ApiError) {

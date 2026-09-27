@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Zone } from "@/api/schemas";
 import { queryClient } from "@/app/queryClient";
-import { readZones, ZONES_KEY, ZonePatcher } from "./model";
+import { applyZoneEvent, readZones, upsertZone, ZONES_KEY, ZonePatcher } from "./model";
 import { zonesQuery } from "./useZones";
 
 const api = vi.hoisted(() => ({ listZones: vi.fn() }));
@@ -27,6 +27,14 @@ function zone(overrides: Partial<Zone> = {}): Zone {
     occupancy: 3,
     ...overrides,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
 }
 
 function patcher(): ZonePatcher {
@@ -61,6 +69,38 @@ describe("refreshing the zone list", () => {
       { ...renamed, occupancy: 9 },
       zone({ id: "z3", name: "Harbour" }),
     ]);
+  });
+
+  it("keeps zones created while the list was on its way, which it could not show yet", async () => {
+    const ledger = patcher();
+    const known = zone();
+    queryClient.setQueryData(ZONES_KEY, [known]);
+    ledger.saw(known);
+    const answer = deferred<Zone[]>();
+    api.listZones.mockReturnValue(answer.promise);
+    const refresh = queryClient.fetchQuery({ ...zonesQuery, staleTime: 0 });
+    // The server has read the list. Then this tab's own creation is answered, and another
+    // session's is announced live.
+    const mine = zone({ id: "z-mine", name: "Depot" });
+    ledger.saw(mine);
+    upsertZone(queryClient, mine);
+    const theirs = zone({ id: "z-theirs", name: "Harbour" });
+    applyZoneEvent(queryClient, { type: "zone.created", zone: theirs }, ledger);
+    answer.resolve([known]);
+    await refresh;
+    expect(readZones(queryClient).map((z) => z.id)).toEqual(["z-theirs", "z-mine", "z1"]);
+  });
+
+  it("drops a zone missing from a list asked for after the tab knew of it", async () => {
+    const ledger = patcher();
+    const gone = zone({ id: "z-gone", name: "Depot" });
+    queryClient.setQueryData(ZONES_KEY, [gone, zone()]);
+    ledger.saw(gone);
+    ledger.saw(zone());
+    // Deleted while this tab missed the announcement (its socket was down, say).
+    api.listZones.mockResolvedValue([zone()]);
+    await queryClient.fetchQuery({ ...zonesQuery, staleTime: 0 });
+    expect(readZones(queryClient).map((z) => z.id)).toEqual(["z1"]);
   });
 
   it("remembers the versions it read, so a late event cannot set them back", async () => {

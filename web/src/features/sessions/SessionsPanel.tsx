@@ -10,7 +10,7 @@ import { signOutHere } from "@/features/auth/signOut";
 import { notify } from "@/features/shell/notices";
 import { PanelFrame } from "@/features/shell/PanelFrame";
 import type { PanelProps } from "@/features/shell/panels";
-import { formatAge } from "@/lib/format";
+import { formatAge, plural } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
 import { useLive } from "@/state/live";
 import { Badge } from "@/ui/Badge";
@@ -223,7 +223,7 @@ function RevokeAll({ sessions }: { sessions: LiveSession[] }) {
         </button>
       </AlertDialog.Trigger>
       <ConfirmDialog
-        title={`Sign out ${sessions.length} other sessions?`}
+        title={`Sign out ${sessions.length} other ${plural(sessions.length, "session")}?`}
         body="Every other browser is disconnected immediately. This one stays signed in."
         confirm="Sign out all"
         onConfirm={() => revokeAll.mutate()}

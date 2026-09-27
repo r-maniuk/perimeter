@@ -1,5 +1,6 @@
 import { signOut as signOutRequest } from "@/api/endpoints";
 import { describeError, isApiError } from "@/api/http";
+import { announceSession } from "@/app/sessionSync";
 import { notify } from "@/features/shell/notices";
 import { useSession } from "@/state/session";
 
@@ -33,4 +34,6 @@ async function signOutOnce(): Promise<void> {
     }
   }
   useSession.getState().signedOut();
+  // The sign-in was every tab's: the other tabs of this browser follow to the sign-in card.
+  announceSession("signedOut");
 }

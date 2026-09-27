@@ -16,6 +16,11 @@ if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
     }) as MediaQueryList;
 }
 
+if (typeof window !== "undefined" && typeof Element.prototype.scrollIntoView !== "function") {
+  // The command palette keeps the selected command in view; jsdom has nothing to scroll.
+  Element.prototype.scrollIntoView = () => {};
+}
+
 if (typeof window !== "undefined" && typeof window.ResizeObserver !== "function") {
   // Radix measures its sliders and popovers; jsdom lays nothing out, so nothing ever resizes.
   window.ResizeObserver = class {

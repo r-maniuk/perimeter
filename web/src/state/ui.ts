@@ -22,6 +22,16 @@ function systemDark(): boolean {
   return typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches;
 }
 
+/**
+ * Where the phone sheet rests after a panel or selection opened (`opened`) or closed: something
+ * new opens it halfway from peek, and once nothing is left to show (`left` is false) it goes
+ * back to peek — wherever the closing happened, the desktop layout included.
+ */
+function sheetAfter(sheet: SheetSnap, opened: boolean, left: boolean): SheetSnap {
+  if (opened) return sheet === "peek" ? "half" : sheet;
+  return left ? sheet : "peek";
+}
+
 interface UiState {
   panel: Panel | null;
   selection: Selection;
@@ -70,17 +80,17 @@ export const useUi = create<UiState>()((set, get) => ({
   flyTarget: null,
 
   openPanel: (panel) =>
-    set((s) => ({ panel, sheet: panel && s.sheet === "peek" ? "half" : s.sheet })),
+    set((s) => ({ panel, sheet: sheetAfter(s.sheet, panel !== null, s.selection !== null) })),
   togglePanel: (panel) =>
     set((s) => {
       const open = s.panel === panel ? null : panel;
-      return { panel: open, sheet: open && s.sheet === "peek" ? "half" : s.sheet };
+      return { panel: open, sheet: sheetAfter(s.sheet, open !== null, s.selection !== null) };
     }),
   select: (selection) =>
     set((s) => ({
       selection,
       followId: selection?.kind === "device" && s.followId === selection.id ? s.followId : null,
-      sheet: selection && s.sheet === "peek" ? "half" : s.sheet,
+      sheet: sheetAfter(s.sheet, selection !== null, s.panel !== null),
     })),
   setDrawing: (drawing) => set({ drawing, ...(drawing ? { followId: null } : {}) }),
   follow: (followId) => set({ followId }),

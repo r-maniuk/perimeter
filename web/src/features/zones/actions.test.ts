@@ -128,6 +128,63 @@ describe("deleting a zone", () => {
   });
 });
 
+describe("a zone write the server puts off", () => {
+  const SHAPE = { lat: 52.36, lon: 4.9, radiusM: 250 };
+  const limited = () => new ApiError(429, { code: "rate_limited" }, 2);
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("creates the drawn zone once the server allows it, showing it all along", async () => {
+    api.createZone.mockRejectedValueOnce(limited());
+    api.createZone.mockResolvedValueOnce(zone({ id: "z9", name: "Zone 2", version: 1 }));
+    const creating = createDrawnZone(SHAPE);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(api.createZone).toHaveBeenCalledTimes(1);
+    expect(readZones(queryClient).filter((z) => isDraft(z.id))).toHaveLength(1);
+    expect(useNotices.getState().notices).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await creating;
+    expect(api.createZone).toHaveBeenCalledTimes(2);
+    expect(readZones(queryClient).map((z) => z.id)).toEqual(["z1", "z9"]);
+    expect(useUi.getState().selection).toEqual({ kind: "zone", id: "z9" });
+  });
+
+  it("creates nothing for a drawn zone deleted while it waited", async () => {
+    api.createZone.mockRejectedValueOnce(limited());
+    const creating = createDrawnZone(SHAPE);
+    await vi.advanceTimersByTimeAsync(0);
+    const draft = readZones(queryClient).find((z) => isDraft(z.id));
+    if (!draft) throw new Error("no draft on the map");
+    const deleting = deleteZone(draft);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.all([creating, deleting]);
+    expect(api.createZone).toHaveBeenCalledTimes(1);
+    expect(api.deleteZone).not.toHaveBeenCalled();
+    expect(readZones(queryClient).map((z) => z.id)).toEqual(["z1"]);
+  });
+
+  it("deletes the zone once the server allows it, never showing it again meanwhile", async () => {
+    api.deleteZone.mockRejectedValueOnce(limited());
+    api.deleteZone.mockResolvedValueOnce(undefined);
+    const deleting = deleteZone(zone());
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(readZones(queryClient)).toEqual([]);
+    expect(useNotices.getState().notices).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await deleting;
+    expect(api.deleteZone).toHaveBeenCalledTimes(2);
+    expect(readZones(queryClient)).toEqual([]);
+    applyZoneEvent(queryClient, { type: "zone.updated", zone: zone({ version: 4 }) }, patcher);
+    expect(readZones(queryClient)).toEqual([]);
+  });
+});
+
 describe("deleting a zone that is still being created", () => {
   const SHAPE = { lat: 52.36, lon: 4.9, radiusM: 250 };
 

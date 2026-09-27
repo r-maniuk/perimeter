@@ -34,6 +34,7 @@ import {
   isDraft,
   RADIUS_MAX_M,
   RADIUS_MIN_M,
+  stepRadius,
   ZONE_SWATCHES,
 } from "./model";
 
@@ -41,11 +42,21 @@ import {
 const LOG_MIN = Math.log10(RADIUS_MIN_M);
 const LOG_MAX = Math.log10(RADIUS_MAX_M);
 const toSlider = (radius: number) => ((Math.log10(radius) - LOG_MIN) / (LOG_MAX - LOG_MIN)) * 1000;
+/** The radius at a slider position, in whole metres. */
+const radiusAt = (value: number) =>
+  Math.round(10 ** (LOG_MIN + (value / 1000) * (LOG_MAX - LOG_MIN)));
+/** The round radius nearest a slider position (two significant figures): what a drag picks. */
 const fromSlider = (value: number) => {
   const raw = 10 ** (LOG_MIN + (value / 1000) * (LOG_MAX - LOG_MIN));
   const magnitude = 10 ** Math.max(0, Math.floor(Math.log10(raw)) - 1);
   return clampRadius(Math.round(raw / magnitude) * magnitude);
 };
+/**
+ * Keys step from round radius to round radius. An even step along the track would be a mere
+ * percent of the radius, which rounding takes straight back at most round radii.
+ */
+const keyStep = (value: number, direction: 1 | -1, large: boolean) =>
+  toSlider(stepRadius(radiusAt(value), direction, large));
 
 function patch(zone: Zone, change: ZonePatch) {
   getRuntime()?.patcher.patch(zone.id, change);
@@ -105,6 +116,7 @@ export function ZoneInspector({ zone, onClose }: { zone: Zone; onClose: () => vo
             max={1000}
             value={toSlider(liveRadius)}
             valueText={formatDistance(liveRadius)}
+            keyStep={keyStep}
             onValueChange={(value) => {
               const radius = fromSlider(value);
               setSliderRadius(radius);

@@ -56,6 +56,21 @@ describe("signing out", () => {
     await vi.waitFor(() => expect(useSession.getState().status).toBe("signedOut"));
   });
 
+  it("tells the other tabs of this browser once signed out, and not before", async () => {
+    const otherTab = new BroadcastChannel("perimeter.session");
+    const heard: unknown[] = [];
+    otherTab.addEventListener("message", (event) => heard.push(event.data));
+    try {
+      endpoints.signOut.mockRejectedValueOnce(unavailable());
+      await signOutHere();
+      endpoints.signOut.mockResolvedValueOnce(undefined);
+      await signOutHere();
+      await vi.waitFor(() => expect(heard).toEqual([{ change: "signedOut" }]));
+    } finally {
+      otherTab.close();
+    }
+  });
+
   it("sends one request for repeated clicks", async () => {
     let answer!: () => void;
     endpoints.signOut.mockReturnValue(

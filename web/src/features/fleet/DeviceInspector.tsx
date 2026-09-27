@@ -14,6 +14,7 @@ import {
   formatCount,
   formatDistance,
   formatSpeed,
+  plural,
 } from "@/lib/format";
 import { distance } from "@/lib/geodesy";
 import { mapController } from "@/map/controller";
@@ -89,6 +90,7 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
   const stale = ageS > STALE_S;
   const status = !device ? "Unknown" : stale ? "Stale" : device.moving ? "Moving" : "Stationary";
   const trailLength = trail.data ? pathLength(trail.data.coordinates) : 0;
+  const reports = trail.data?.coordinates.length ?? 0;
 
   return (
     <PanelFrame
@@ -248,7 +250,9 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
         </span>
         <div className="min-w-0 flex-1 text-[12.5px]">
           {trail.isPending ? (
-            <span className="text-muted">Loading the last {minutes} minutes…</span>
+            <span className="text-muted">
+              Loading the last {minutes} {plural(minutes, "minute")}…
+            </span>
           ) : trail.isError ? (
             <span className="flex items-center justify-between gap-3">
               <span className="text-muted">{describeError(trail.error)}</span>
@@ -259,7 +263,7 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
           ) : trail.data.coordinates.length < 2 ? (
             <span className="text-muted">
               {trail.data.complete
-                ? `No movement in the last ${minutes} minutes.`
+                ? `No movement in the last ${minutes} ${plural(minutes, "minute")}.`
                 : `No movement since ${formatClockShort(trail.data.since)}.`}
             </span>
           ) : (
@@ -268,9 +272,10 @@ export function DeviceInspector({ id, onClose }: { id: string; onClose: () => vo
                 {formatDistance(trailLength)} travelled
               </span>
               <span className="text-muted">
+                {`${formatCount(reports)} ${plural(reports, "report")} `}
                 {trail.data.complete
-                  ? `${formatCount(trail.data.coordinates.length)} reports in the last ${minutes} min`
-                  : `${formatCount(trail.data.coordinates.length)} reports since ${formatClockShort(trail.data.times[0] ?? trail.data.since)}`}
+                  ? `in the last ${minutes} min`
+                  : `since ${formatClockShort(trail.data.times[0] ?? trail.data.since)}`}
               </span>
             </>
           )}

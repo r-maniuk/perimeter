@@ -1,6 +1,6 @@
 /** User actions on zones: create from a drawing, edit via handles, delete. */
 import { createZone, deleteZone as deleteZoneRequest, getZone } from "@/api/endpoints";
-import { describeError, isApiError } from "@/api/http";
+import { describeError, isApiError, retryDelayMs } from "@/api/http";
 import type { Zone } from "@/api/schemas";
 import { queryClient } from "@/app/queryClient";
 import { getRuntime } from "@/app/runtime";
@@ -62,20 +62,48 @@ export async function createDrawnZone(shape: { lat: number; lon: number; radiusM
   creations.delete(draftId);
 }
 
+/**
+ * Send a zone write until the server takes it. A 429 (too many changes) only puts it off: it goes
+ * out again when the server says it may — unless meanwhile it stopped being `wanted`, or the
+ * session that made it ended (signed out, or another account signed in). Resolves with the
+ * answer, or with `null` for a write given up; any other failure rejects.
+ */
+async function whenAllowed<T>(
+  send: () => Promise<T>,
+  wanted: () => boolean = () => true,
+): Promise<{ answer: T } | null> {
+  const runtime = getRuntime();
+  for (;;) {
+    try {
+      return { answer: await send() };
+    } catch (error) {
+      const wait = retryDelayMs(error);
+      if (wait === null) throw error;
+      await new Promise((resolve) => setTimeout(resolve, wait));
+      if (!wanted() || getRuntime() !== runtime) return null;
+    }
+  }
+}
+
 /** Create the drawn zone; it takes the draft's place, unless the draft was deleted meanwhile. */
 async function save(draft: Zone): Promise<Zone | null> {
-  let saved: Zone;
+  let created: { answer: Zone } | null;
   try {
-    saved = await createZone({
-      name: draft.name,
-      center: draft.center,
-      radius_m: draft.radius_m,
-      color: draft.color,
-      is_active: true,
-      notify_enter: true,
-      notify_exit: true,
-      dwell_s: null,
-    });
+    created = await whenAllowed(
+      () =>
+        createZone({
+          name: draft.name,
+          center: draft.center,
+          radius_m: draft.radius_m,
+          color: draft.color,
+          is_active: true,
+          notify_enter: true,
+          notify_exit: true,
+          dwell_s: null,
+        }),
+      // A draft deleted while its creation waits needs no zone.
+      () => !abandoned.has(draft.id),
+    );
   } catch (error) {
     removeZone(queryClient, draft.id);
     getRuntime()?.patcher.discard(draft.id);
@@ -86,6 +114,8 @@ async function save(draft: Zone): Promise<Zone | null> {
     }
     return null;
   }
+  if (!created) return null;
+  const saved = created.answer;
   const runtime = getRuntime();
   runtime?.patcher.saw(saved);
   if (abandoned.has(draft.id)) return saved;
@@ -153,8 +183,7 @@ async function deleteSaved(zone: Zone): Promise<void> {
   const patcher = getRuntime()?.patcher;
   patcher?.deleting(zone.id);
   try {
-    await deleteZoneRequest(zone.id, zone.version);
-    patcher?.bury(zone.id);
+    if (await whenAllowed(() => deleteZoneRequest(zone.id, zone.version))) patcher?.bury(zone.id);
   } catch (error) {
     if (isApiError(error, 404)) {
       patcher?.bury(zone.id);

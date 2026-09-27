@@ -4,7 +4,7 @@ import { describeError } from "@/api/http";
 import type { Zone } from "@/api/schemas";
 import { PanelFrame } from "@/features/shell/PanelFrame";
 import type { PanelProps } from "@/features/shell/panels";
-import { formatCount, formatDistance, formatDuration } from "@/lib/format";
+import { formatCount, formatDistance, formatDuration, plural } from "@/lib/format";
 import { mapController } from "@/map/controller";
 import { useLive } from "@/state/live";
 import { useUi } from "@/state/ui";
@@ -25,7 +25,7 @@ export function ZonesPanel({ onClose, titleId }: PanelProps) {
       titleId={titleId}
       subtitle={
         zones
-          ? `${zones.length} ${zones.length === 1 ? "zone" : "zones"} · ${formatCount(inside)} devices inside`
+          ? `${zones.length} ${plural(zones.length, "zone")} · ${formatCount(inside)} ${plural(inside, "device")} inside`
           : "Loading…"
       }
       onClose={onClose}

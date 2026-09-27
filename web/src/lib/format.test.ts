@@ -14,6 +14,7 @@ import {
   parseCoordinatePair,
   parseDegrees,
   parseDistance,
+  plural,
 } from "./format";
 
 describe("format", () => {
@@ -24,6 +25,18 @@ describe("format", () => {
     expect(formatRate(12.4)).toBe("12/s");
     expect(formatRate(0.44)).toBe("0.4/s");
     expect(formatRate(Number.NaN)).toBe("–");
+  });
+
+  it("names what is counted in the singular only for a count shown as one", () => {
+    expect(`${formatCount(1)} ${plural(1, "row")}`).toBe("1 row");
+    expect(plural(0, "row")).toBe("rows");
+    expect(plural(3, "row")).toBe("rows");
+    expect(plural(1, "process", "processes")).toBe("process");
+    expect(plural(2, "process", "processes")).toBe("processes");
+    // The noun follows the number on screen: 0.6 is shown as "1", 1.5 as "2", 12,400 as "12.4K".
+    expect(`${formatCount(0.6)} ${plural(0.6, "row")}`).toBe("1 row");
+    expect(`${formatCount(1.5)} ${plural(1.5, "row")}`).toBe("2 rows");
+    expect(`${formatCount(12_400)} ${plural(12_400, "report")}`).toBe("12.4K reports");
   });
 
   it("durations and latencies", () => {

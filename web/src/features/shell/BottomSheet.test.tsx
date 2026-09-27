@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Zone } from "@/api/schemas";
 import { queryClient } from "@/app/queryClient";
 import { ZONES_KEY } from "@/features/zones/model";
+import { mapController } from "@/map/controller";
 import { useUi } from "@/state/ui";
 import { BottomSheet } from "./BottomSheet";
 
@@ -46,8 +47,24 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   queryClient.clear();
-  useUi.getState().select(null);
+  useUi.setState({ panel: null, selection: null, sheet: "peek" });
 });
+
+function sheet() {
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <Tooltip.Provider>
+        <BottomSheet />
+      </Tooltip.Provider>
+    </QueryClientProvider>,
+  );
+}
+
+/** How high the sheet stands: the map frames what it shows above that. */
+function standing(insets: { mock: { calls: unknown[][] } }) {
+  const [last] = insets.mock.calls.at(-1) ?? [];
+  return (last as { bottom?: number } | undefined)?.bottom;
+}
 
 function dwellChoice(name: string) {
   const group = screen.getByRole("radiogroup", { name: "Dwell alert" });
@@ -75,5 +92,50 @@ describe("phone sheet", () => {
     expect(dwellChoice("Custom")).toBe("false");
     expect(screen.queryByLabelText("Alert after")).toBeNull();
     expect(screen.getByRole("textbox", { name: "Zone name" })).toHaveProperty("value", "Gate");
+  });
+
+  it("rests at peek once what it showed was closed on a desktop layout", () => {
+    // Opened while the window was wide: the sheet opens with it, for when the window narrows.
+    act(() => useUi.getState().openPanel("zones"));
+    expect(useUi.getState().sheet).toBe("half");
+    // Closed there, then the window narrows to a phone.
+    act(() => useUi.getState().openPanel(null));
+    expect(useUi.getState().sheet).toBe("peek");
+    const insets = vi.spyOn(mapController, "setInsets");
+    sheet();
+    expect(standing(insets)).toBe(92);
+    expect(screen.getByRole("button", { name: "Expand" })).toHaveProperty("disabled", true);
+    const tabs = within(screen.getByRole("navigation", { name: "Workspace" }));
+    expect(tabs.getAllByRole("button").map((tab) => tab.getAttribute("aria-pressed"))).toEqual(
+      Array(5).fill("false"),
+    );
+  });
+
+  it("goes back to peek with the last thing it shows, wherever that closes", () => {
+    const ui = useUi.getState;
+    act(() => ui().openPanel("zones"));
+    act(() => ui().select({ kind: "zone", id: "z-dock" }));
+    act(() => ui().select(null));
+    // The panel is still there to show.
+    expect(ui().sheet).toBe("half");
+    act(() => ui().togglePanel("zones"));
+    expect(ui().sheet).toBe("peek");
+    act(() => ui().select({ kind: "device", id: "veh-1" }));
+    expect(ui().sheet).toBe("half");
+    // Cleared by the app itself (the zone was deleted in another session, say).
+    act(() => ui().select(null));
+    expect(ui().sheet).toBe("peek");
+  });
+
+  it("rests at peek while the zone it was opened for is gone from the list", () => {
+    useUi.setState({ panel: null, selection: { kind: "zone", id: "z-gone" }, sheet: "half" });
+    const insets = vi.spyOn(mapController, "setInsets");
+    sheet();
+    expect(standing(insets)).toBe(92);
+    expect(screen.getByRole("button", { name: "Expand" })).toHaveProperty("disabled", true);
+    // Something to show opens it again.
+    act(() => useUi.getState().openPanel("zones"));
+    expect(standing(insets)).toBeGreaterThan(92);
+    expect(screen.getByRole("button", { name: "Collapse" })).toHaveProperty("disabled", false);
   });
 });

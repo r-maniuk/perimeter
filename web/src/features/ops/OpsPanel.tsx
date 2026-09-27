@@ -5,7 +5,7 @@ import { useServerNow } from "@/features/fleet/useFleet";
 import { PanelFrame } from "@/features/shell/PanelFrame";
 import type { PanelProps } from "@/features/shell/panels";
 import { contrast, hexToRgba } from "@/lib/color";
-import { formatCount, formatMs, formatRate } from "@/lib/format";
+import { formatCount, formatMs, formatRate, plural } from "@/lib/format";
 import { useNow } from "@/lib/useNow";
 import { useLive } from "@/state/live";
 import { useUi } from "@/state/ui";
@@ -33,6 +33,7 @@ export function OpsPanel({ onClose, titleId }: PanelProps) {
   const ops = useLive((s) => s.ops);
   const history = useLive((s) => s.history);
   const now = useNow(1_000);
+  const processes = ops?.frame.services.length ?? 0;
 
   return (
     <PanelFrame
@@ -40,7 +41,7 @@ export function OpsPanel({ onClose, titleId }: PanelProps) {
       titleId={titleId}
       subtitle={
         ops
-          ? `Live from ${ops.frame.services.length} processes · ${Math.max(0, Math.round((now - ops.at) / 1000))} s ago`
+          ? `Live from ${processes} ${plural(processes, "process", "processes")} · ${Math.max(0, Math.round((now - ops.at) / 1000))} s ago`
           : "Waiting for the first heartbeat…"
       }
       onClose={onClose}
@@ -64,6 +65,10 @@ function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, 
   const serverNow = useServerNow(1_000);
   const last = (key: string) => history[key]?.at(-1) ?? 0;
   const rate = (key: string) => formatRate(recentMean(history[key]));
+  const count = (key: string, one: string) => {
+    const value = Math.round(last(key));
+    return `${formatCount(value)} ${plural(value, one)}`;
+  };
   const state = admission(frame);
   const owners = ownership(frame);
   const palette = OWNER_COLORS[dark ? "dark" : "light"];
@@ -108,10 +113,10 @@ function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, 
             {state === "shedding" ? "Shedding load" : state === "open" ? "Open" : "Unknown"}
           </span>
         </div>
-        <Row label="Stream backlog" value={`${formatCount(Math.round(last("lag")))} msgs`} />
+        <Row label="Stream backlog" value={count("lag", "msg")} />
         <Row label="Rejected reports" value={rate("rejected")} />
         <Row label="Late reports" value={rate("late")} />
-        <Row label="Outbox backlog" value={`${formatCount(Math.round(last("backlog")))} rows`} />
+        <Row label="Outbox backlog" value={count("backlog", "row")} />
         <Row label="Live drops" value={rate("drops")} />
       </div>
 
@@ -165,7 +170,7 @@ function OpsBody({ frame, history }: { frame: OpsFrame; history: Record<string, 
               />
               <span className="flex-1 truncate font-mono text-ink">{engine.instance}</span>
               <span className="text-muted tabular-nums">
-                {engine.count} {engine.count === 1 ? "partition" : "partitions"}
+                {engine.count} {plural(engine.count, "partition")}
               </span>
             </li>
           ))}
@@ -232,10 +237,10 @@ function describeProcess(service: string, raw: Record<string, unknown>): string 
   if (service === "engine") {
     const parts = Array.isArray(raw.partitions) ? raw.partitions.length : 0;
     const batches = formatRate(Number(raw.batches_rate ?? 0)).replace("/s", "");
-    return `${parts} ${parts === 1 ? "partition" : "partitions"} · ${batches} batches/s`;
+    return `${parts} ${plural(parts, "partition")} · ${batches} batches/s`;
   }
   const sessions = Number(raw.sessions ?? 0);
-  return `${formatCount(sessions)} ${sessions === 1 ? "session" : "sessions"} · db pool ${formatCount(Number(raw.db_pool_checked_out ?? 0))}`;
+  return `${formatCount(sessions)} ${plural(sessions, "session")} · db pool ${formatCount(Number(raw.db_pool_checked_out ?? 0))}`;
 }
 
 function StatTile({

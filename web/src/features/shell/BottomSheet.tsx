@@ -32,13 +32,21 @@ function snapHeight(snap: SheetSnap, viewport: number): number {
 export function BottomSheet() {
   const panel = useUi((s) => s.panel);
   const selection = useUi((s) => s.selection);
-  const snap = useUi((s) => s.sheet);
+  const sheet = useUi((s) => s.sheet);
   const drawing = useUi((s) => s.drawing);
   const unseen = useAlerts((s) => s.unseen);
   const zone = useZone(selection?.kind === "zone" ? selection.id : null);
   const titleId = useId();
   const height = useMotionValue(PEEK);
   const drag = useRef<{ y: number; h: number; moved: boolean; t: number } | null>(null);
+
+  const View = panel ? PANEL_VIEWS[panel] : null;
+  const showSelection = selection?.kind === "device" || (selection?.kind === "zone" && zone);
+  // The sheet rests open only while it has something to show. A selected zone can leave the list
+  // with the selection still pointing at it (deleted in another session, found out by a refresh
+  // or a failed save), and an open sheet would then show nothing at all.
+  const empty = !showSelection && !View;
+  const snap: SheetSnap = empty ? "peek" : sheet;
 
   useLayoutEffect(() => {
     // Camera moves frame their target above the sheet (and below the status bar).
@@ -55,10 +63,10 @@ export function BottomSheet() {
   useEffect(() => () => mapController.setInsets({ top: 0, bottom: 0 }), []);
 
   useEffect(() => {
-    const onResize = () => height.set(snapHeight(useUi.getState().sheet, window.innerHeight));
+    const onResize = () => height.set(snapHeight(snap, window.innerHeight));
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-  }, [height]);
+  }, [height, snap]);
 
   function onPointerDown(e: ReactPointerEvent) {
     drag.current = { y: e.clientY, h: height.get(), moved: false, t: performance.now() };
@@ -88,7 +96,9 @@ export function BottomSheet() {
     const viewport = window.innerHeight;
     const snaps: SheetSnap[] = ["peek", "half", "full"];
     let next: SheetSnap;
-    if (Math.abs(velocity) > 0.6) {
+    if (empty) {
+      next = "peek";
+    } else if (Math.abs(velocity) > 0.6) {
       const index = snaps.indexOf(snap);
       next = snaps[Math.min(2, Math.max(0, index + (velocity < 0 ? 1 : -1)))] ?? snap;
     } else {
@@ -104,8 +114,6 @@ export function BottomSheet() {
     useUi.getState().setSheet(next);
   }
 
-  const View = panel ? PANEL_VIEWS[panel] : null;
-  const showSelection = selection?.kind === "device" || (selection?.kind === "zone" && zone);
   const closeContent = () => {
     const ui = useUi.getState();
     if (selection) ui.select(null);
@@ -153,6 +161,7 @@ export function BottomSheet() {
             <button
               type="button"
               aria-label={snap === "peek" ? "Expand" : "Collapse"}
+              disabled={empty}
               onClick={() => useUi.getState().setSheet(snap === "peek" ? "half" : "peek")}
               className="h-5 w-16 rounded-full"
             >

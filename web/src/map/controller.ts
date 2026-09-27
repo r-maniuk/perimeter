@@ -222,6 +222,10 @@ export class MapController {
       style: this.#styles[this.#theme],
       center: [HOME.lon, HOME.lat],
       zoom: HOME.zoom,
+      // MapLibre zooms out to -2 by default, as far as a map shorter than one 512-pixel world
+      // allows. Below zoom 0 it only shows the world several times over, smaller, and the live
+      // channel takes no viewport there.
+      minZoom: 0,
       maxPitch: 60,
       attributionControl: { compact: true },
       canvasContextAttributes: { antialias: true },
@@ -628,6 +632,10 @@ export class MapController {
     if (drawing) {
       map.dragPan.disable();
       this.#setHovered(null);
+      // However drawing started — the D key, a Draw button, the palette — the keyboard moves to
+      // the map: arrow keys pan it and Enter places the zone at its centre, as the hint says. Left
+      // on the button that started it, Enter would press that button again.
+      this.focus();
     } else {
       if (this.#interactive) map.dragPan.enable();
       this.#draft = null;
@@ -892,6 +900,9 @@ export class MapController {
     this.#handles = { center, radius, zoneId: zone.id, azimuth: 90 };
     this.#bindHandle(centerElement, zone.id, "center");
     this.#bindHandle(radiusElement, zone.id, "radius");
+    // What the handles show of the zone, the radius the slider announces included, is set in one
+    // place: from the moment they appear, not only once the zone first changes.
+    this.#placeHandles();
   }
 
   /**

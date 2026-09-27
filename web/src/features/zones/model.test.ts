@@ -9,6 +9,7 @@ import {
   nextSwatch,
   nextZoneName,
   readZones,
+  stepRadius,
   ZONE_SWATCHES,
   ZONES_KEY,
   ZonePatcher,
@@ -188,6 +189,73 @@ describe("ZonePatcher", () => {
     expect(readZones(t.client)[0]).toMatchObject({ name: "De Dam", radius_m: 500, version: 3 });
   });
 
+  it("sends only what the server's version lacks, and nothing for a change of nothing", async () => {
+    const t = setup();
+    t.patcher.patch("z1", { radius_m: 400 });
+    expect(t.calls).toEqual([]);
+    expect(t.patcher.busy("z1")).toBe(false);
+    t.patcher.patch("z1", { radius_m: 400, name: "Dam" });
+    expect(t.calls).toEqual([{ id: "z1", patch: { name: "Dam" }, version: 1 }]);
+    // Changed and changed back while that write is on its way: nothing more to send.
+    t.patcher.patch("z1", { radius_m: 500 });
+    t.patcher.patch("z1", { radius_m: 400 });
+    t.replies[0]?.resolve(zone({ name: "Dam", version: 2 }));
+    await t.patcher.settled("z1");
+    expect(t.calls).toHaveLength(1);
+    expect(readZones(t.client)[0]).toMatchObject({ name: "Dam", radius_m: 400, version: 2 });
+  });
+
+  it("keeps a change the server put off and sends it again when allowed, with later edits", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = setup();
+      t.patcher.patch("z1", { radius_m: 500 });
+      t.replies[0]?.reject(new ApiError(429, { code: "rate_limited" }, 2));
+      await vi.advanceTimersByTimeAsync(0);
+      // Too many changes for now is not a refusal: nothing is undone or reported.
+      expect(readZones(t.client)[0]?.radius_m).toBe(500);
+      expect(t.hooks.onError).not.toHaveBeenCalled();
+      t.patcher.patch("z1", { name: "Dam" });
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(t.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(t.calls[1]).toEqual({ id: "z1", patch: { radius_m: 500, name: "Dam" }, version: 1 });
+      t.replies[1]?.resolve(zone({ radius_m: 500, name: "Dam", version: 2 }));
+      await t.patcher.settled("z1");
+      expect(readZones(t.client)[0]).toMatchObject({ radius_m: 500, name: "Dam", version: 2 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sends nothing it put off once the session is over", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = setup();
+      t.patcher.patch("z1", { radius_m: 500 });
+      t.replies[0]?.reject(new ApiError(429, { code: "rate_limited" }, 1));
+      await vi.advanceTimersByTimeAsync(0);
+      t.patcher.stop();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(t.calls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("tells zones first seen after a stamp from those it knew before", () => {
+    const t = setup();
+    t.patcher.saw(zone({ id: "before" }));
+    const stamp = t.patcher.stamp();
+    t.patcher.saw(zone({ id: "after" }));
+    // A newer version of a zone known before is not a first sighting.
+    t.patcher.saw(zone({ id: "before", version: 2 }));
+    expect(t.patcher.seenSince("before", stamp)).toBe(false);
+    expect(t.patcher.seenSince("after", stamp)).toBe(true);
+    expect(t.patcher.seenSince("never", stamp)).toBe(false);
+    expect(t.patcher.seenSince("after", t.patcher.stamp())).toBe(false);
+  });
+
   it("holds edits of a drawn zone until it exists, then saves them against the real id", async () => {
     const t = setup([zone({ id: "draft-1", version: 0 })]);
     t.patcher.patch("draft-1", { name: "Depot" });
@@ -299,6 +367,36 @@ describe("before the first fetch", () => {
     applyZoneEvent(client, { type: "zone.created", zone: zone({ id: "early" }) }, t.patcher);
     bumpOccupancy(client, "z1", 1);
     expect(client.getQueryData(ZONES_KEY)).toBeUndefined();
+  });
+});
+
+describe("stepping a radius", () => {
+  it("moves to the next round radius, even from a round one", () => {
+    expect(stepRadius(100, 1)).toBe(110);
+    expect(stepRadius(100, -1)).toBe(99);
+    expect(stepRadius(250, 1)).toBe(260);
+    expect(stepRadius(990, 1)).toBe(1_000);
+    expect(stepRadius(1_000, 1)).toBe(1_100);
+    expect(stepRadius(1_000, -1)).toBe(990);
+    expect(stepRadius(2_000, -1)).toBe(1_900);
+    // A radius set on the map is rarely round: the first step rounds it, in the key's direction.
+    expect(stepRadius(437, 1)).toBe(440);
+    expect(stepRadius(437, -1)).toBe(430);
+  });
+
+  it("takes a large step to the next radius with one significant figure", () => {
+    expect(stepRadius(250, 1, true)).toBe(300);
+    expect(stepRadius(250, -1, true)).toBe(200);
+    expect(stepRadius(1_000, 1, true)).toBe(2_000);
+    expect(stepRadius(100, -1, true)).toBe(90);
+  });
+
+  it("stays within the limits", () => {
+    expect(stepRadius(10, -1)).toBe(10);
+    expect(stepRadius(10, -1, true)).toBe(10);
+    expect(stepRadius(99_000, 1)).toBe(100_000);
+    expect(stepRadius(100_000, 1)).toBe(100_000);
+    expect(stepRadius(100_000, 1, true)).toBe(100_000);
   });
 });
 

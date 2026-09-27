@@ -7,7 +7,10 @@
  * edits merge into one pending patch that is sent with the version the first one returns. A 412
  * therefore always means another session changed the zone — the tab shows the latest version and
  * offers to re-apply the local change on top of it. Any failed write is undone on the spot, back
- * to the last version the server confirmed.
+ * to the last version the server confirmed — except one the server only put off (429, too many
+ * changes): that one stays and goes out again, with anything edited meanwhile, when the server
+ * says it may. A write never carries what the server's version already has, and one that would
+ * change nothing is not sent at all: the server counts every write against the account's limit.
  *
  * Zone data reaches the tab by several roads — live events, write answers, re-reads, the list —
  * and not in order: the server's outbox sweeper may publish an older change after a newer one,
@@ -16,7 +19,7 @@
  */
 import type { QueryClient } from "@tanstack/react-query";
 import type { ZonePatch } from "@/api/endpoints";
-import { isApiError } from "@/api/http";
+import { isApiError, retryDelayMs } from "@/api/http";
 import type { Zone } from "@/api/schemas";
 import { withinRadius } from "@/lib/geodesy";
 
@@ -71,6 +74,35 @@ export function clampRadius(radiusM: number): number {
 }
 
 /**
+ * The round radii from 10 m to 100 km with `figures` significant figures, in order (with two:
+ * 10, 11, … 99, 100, 110, … 990, 1000, 1100 …).
+ */
+function roundRadii(figures: number): number[] {
+  const radii: number[] = [];
+  const first = 10 ** (figures - 1);
+  for (let unit = RADIUS_MIN_M / first; unit * first < RADIUS_MAX_M; unit *= 10) {
+    for (let digits = first; digits < first * 10; digits++) radii.push(digits * unit);
+  }
+  radii.push(RADIUS_MAX_M);
+  return radii;
+}
+
+const FINE_RADII = roundRadii(2);
+const COARSE_RADII = roundRadii(1);
+
+/**
+ * The next round radius past `radiusM` in `direction`, within the limits: a step of two
+ * significant figures (100 → 110 m, 990 m → 1 km, 1 km → 1.1 km), or of one for a large step
+ * (250 → 300 m, 1 → 2 km). Every step lands on another radius, however round the one it left.
+ */
+export function stepRadius(radiusM: number, direction: 1 | -1, large = false): number {
+  const radii = large ? COARSE_RADII : FINE_RADII;
+  return direction > 0
+    ? (radii.find((r) => r > radiusM) ?? RADIUS_MAX_M)
+    : (radii.findLast((r) => r < radiusM) ?? RADIUS_MIN_M);
+}
+
+/**
  * The active zones containing a point, the smallest first: the order the map tints devices in
  * (where zones overlap, the smaller one is the more specific).
  */
@@ -82,6 +114,16 @@ export function zonesContaining(zones: readonly Zone[], lat: number, lon: number
 
 export function applyPatch(zone: Zone, patch: ZonePatch): Zone {
   return { ...zone, ...patch } as Zone;
+}
+
+/** The part of `patch` that would change `zone`, or `undefined` when none of it would. */
+function changesTo(zone: Zone, patch: ZonePatch): ZonePatch | undefined {
+  const changes = Object.entries(patch).filter(([key, value]) => {
+    if (key !== "center") return zone[key as keyof ZonePatch] !== value;
+    const center = value as Zone["center"];
+    return center.lat !== zone.center.lat || center.lon !== zone.center.lon;
+  });
+  return changes.length > 0 ? (Object.fromEntries(changes) as ZonePatch) : undefined;
 }
 
 export function readZones(client: QueryClient): Zone[] {
@@ -157,9 +199,14 @@ export class ZonePatcher implements ZoneLedger {
   #confirmed = new Map<string, Zone>();
   /** The newest version seen of every zone; a deleted zone's is infinitely new. */
   #versions = new Map<string, number>();
+  /** When each zone was first seen, on the ledger's own clock (see {@link stamp}). */
+  #firstSeen = new Map<string, number>();
+  #clock = 0;
   /** Zones this tab is deleting: nothing announced about them applies until that settles. */
   #deleting = new Set<string>();
   #idle = new Map<string, (() => void)[]>();
+  /** Changes the server put off (429), waiting to go out again. */
+  #retries = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(client: QueryClient, api: PatchApi, hooks: PatchHooks) {
     this.#client = client;
@@ -206,6 +253,7 @@ export class ZonePatcher implements ZoneLedger {
    */
   saw(zone: Zone): void {
     if (!this.isNews(zone)) return;
+    if (!this.#versions.has(zone.id)) this.#firstSeen.set(zone.id, this.#clock);
     this.#versions.set(zone.id, zone.version);
     const confirmed = this.#confirmed.get(zone.id);
     if (confirmed && zone.version > confirmed.version) this.#confirmed.set(zone.id, zone);
@@ -213,6 +261,20 @@ export class ZonePatcher implements ZoneLedger {
 
   isNews(zone: Zone): boolean {
     return zone.version > this.#known(zone.id);
+  }
+
+  /**
+   * A mark on the ledger's history, taken when a read of the zone list is sent: zones first seen
+   * after it (see {@link seenSince}) may be missing from that list without being gone.
+   */
+  stamp(): number {
+    this.#clock += 1;
+    return this.#clock;
+  }
+
+  /** Whether the zone was first seen after `stamp` was taken. */
+  seenSince(zoneId: string, stamp: number): boolean {
+    return (this.#firstSeen.get(zoneId) ?? Number.NEGATIVE_INFINITY) >= stamp;
   }
 
   /** Whether `zone` is at least as new as every version of it seen so far (never, once deleted). */
@@ -268,20 +330,27 @@ export class ZonePatcher implements ZoneLedger {
     });
   }
 
+  /** The session ended: nothing put off goes out any more. */
+  stop(): void {
+    for (const timer of this.#retries.values()) clearTimeout(timer);
+    this.#retries.clear();
+  }
+
   async #flush(zoneId: string): Promise<void> {
-    const patch = this.#pending.get(zoneId);
-    if (!patch) {
+    const pending = this.#pending.get(zoneId);
+    if (!pending) {
       this.#confirmed.delete(zoneId);
       this.#settle(zoneId);
       return;
     }
     this.#pending.delete(zoneId);
-    this.#inflight.set(zoneId, patch);
     const current = readZones(this.#client).find((z) => z.id === zoneId);
-    if (!current) {
-      this.#inflight.delete(zoneId);
-      return this.#flush(zoneId);
-    }
+    // Only what differs from the server's version goes out: an edit made and undone while
+    // another write was on its way changes nothing, and is not sent.
+    const confirmed = this.#confirmed.get(zoneId);
+    const patch = confirmed ? changesTo(confirmed, pending) : pending;
+    if (!current || !patch) return this.#flush(zoneId);
+    this.#inflight.set(zoneId, patch);
     try {
       const saved = await this.#api.update(zoneId, patch, current.version);
       this.#inflight.delete(zoneId);
@@ -292,9 +361,30 @@ export class ZonePatcher implements ZoneLedger {
         this.#show(saved);
       }
     } catch (error) {
+      const wait = retryDelayMs(error);
+      if (wait !== null) {
+        this.#putOff(zoneId, patch, wait);
+        return;
+      }
       await this.#recover(zoneId, { ...patch, ...this.#pending.get(zoneId) }, error);
     }
     return this.#flush(zoneId);
+  }
+
+  /**
+   * The server put the write off (too many changes, for now): it is not a refusal, so nothing is
+   * undone. The change stays on the zone and goes out again once the wait is over, together with
+   * whatever was edited meanwhile — the zone stays busy, so those edits join it.
+   */
+  #putOff(zoneId: string, patch: ZonePatch, waitMs: number): void {
+    this.#pending.set(zoneId, { ...patch, ...this.#pending.get(zoneId) });
+    this.#inflight.set(zoneId, {});
+    const timer = setTimeout(() => {
+      this.#retries.delete(zoneId);
+      this.#inflight.delete(zoneId);
+      void this.#flush(zoneId);
+    }, waitMs);
+    this.#retries.set(zoneId, timer);
   }
 
   /**

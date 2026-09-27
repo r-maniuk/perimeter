@@ -1,4 +1,4 @@
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventEnvelope, HelloFrame, User, Zone } from "@/api/schemas";
 import { useNotices } from "@/features/shell/notices";
@@ -191,6 +191,21 @@ describe("identity", () => {
     expect(useSession.getState().notice).toMatch(/session has ended/);
   });
 
+  it("says the session was signed out without claiming where, or that it expired", () => {
+    const signedOut = setup();
+    signedOut.emit({ type: "status", status: { state: "signedOut", expired: false } });
+    // Signing out in another tab of this browser revokes this tab's sign-in too.
+    expect(useSession.getState()).toMatchObject({
+      status: "signedOut",
+      notice: "You were signed out. Sign in again.",
+    });
+
+    useSession.getState().signedIn(USER);
+    const expired = setup();
+    expired.emit({ type: "status", status: { state: "signedOut", expired: true } });
+    expect(useSession.getState().notice).toBe("Your session has expired. Sign in again.");
+  });
+
   it("stays put when the browser is back on this account, or cannot tell yet", async () => {
     const t = setup();
     endpoints.currentUser.mockResolvedValueOnce(USER);
@@ -251,6 +266,34 @@ describe("alerts", () => {
     // Live ones move the count as before.
     t.emit({ type: "event", seq: 9, event: alert("a-now", "enter"), replayed: false });
     expect(readZones(t.client)[0]?.occupancy).toBe(5);
+  });
+
+  it("starts a read already on its way over at a replay, so no replayed arrival is missed", () => {
+    const t = setup();
+    const reads = new Map<string, AbortSignal[]>();
+    const watch = (queryKey: readonly string[]) => {
+      const signals: AbortSignal[] = [];
+      reads.set(queryKey.join(":"), signals);
+      const observer = new QueryObserver(t.client, {
+        queryKey,
+        // Never answered: every read stays on its way.
+        queryFn: ({ signal }) => {
+          signals.push(signal);
+          return new Promise<never>(() => {});
+        },
+      });
+      observer.subscribe(() => {});
+    };
+    // The list, read for the first time as the tab reloads, and a zone's occupants read again.
+    watch(ZONES_KEY);
+    t.client.setQueryData(["occupants", "z1"], { occupancy: 3, items: [] });
+    watch(["occupants", "z1"]);
+    t.emit({ type: "hello", hello: hello({ resume: { mode: "replay", after: 6 } }) });
+    for (const signals of reads.values()) {
+      expect(signals).toHaveLength(2);
+      expect(signals[0]?.aborted).toBe(true);
+      expect(signals[1]?.aborted).toBe(false);
+    }
   });
 
   it("re-reads nothing after a fresh start", () => {

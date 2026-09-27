@@ -233,6 +233,27 @@ describe("connecting", () => {
     expect(sent[1]?.bbox).toEqual([-180, -80, 180, 80]);
   });
 
+  it("keeps the zoom it sends within the protocol's range", () => {
+    const t = setup();
+    t.client.start();
+    t.open();
+    // A map shorter than one 512-pixel world could zoom out below 0; the protocol starts there.
+    t.client.setViewport({ bbox: [-600, -80, 300, 80], zoom: -1.4 });
+    vi.advanceTimersByTime(250);
+    t.client.setViewport({ bbox: [4.9, 52.37, 4.91, 52.375], zoom: 31 });
+    vi.advanceTimersByTime(250);
+    expect(t.last().sentOfType("viewport")).toEqual([
+      { type: "viewport", bbox: [-180, -80, 180, 80], zoom: 0 },
+      { type: "viewport", bbox: [4.9, 52.37, 4.91, 52.375], zoom: 30 },
+    ]);
+    // The viewport a new socket starts with is kept in range as well.
+    t.client.setViewport({ bbox: [-600, -80, 300, 80], zoom: -2 });
+    t.last().drop(1006);
+    vi.advanceTimersByTime(500);
+    t.last().accept();
+    expect(t.last().sent).toEqual([{ type: "viewport", bbox: [-180, -80, 180, 80], zoom: 0 }]);
+  });
+
   it("sends viewport changes immediately once open", () => {
     const t = setup();
     t.client.start();
@@ -261,7 +282,7 @@ describe("connecting", () => {
     ]);
   });
 
-  it("keeps a camera that moves every frame under four viewport messages a second", () => {
+  it("keeps a camera that moves every frame to at most four viewport messages a second", () => {
     const t = setup();
     t.client.start();
     t.open();
@@ -520,7 +541,28 @@ describe("reconnecting", () => {
     expect(t.client.status.state).toBe("waiting");
   });
 
-  it.each([1001, 1006, 1011, 1012, 1013, 4008])(
+  it("says what the server refused, and tries again no sooner than five seconds later", () => {
+    const t = setup(new MemoryStore(), () => 0);
+    t.client.start();
+    t.open();
+    // A server that refuses whatever every new socket sends first, over and over.
+    for (let round = 0; round < 5; round++) {
+      t.last().drop(CloseCode.PolicyViolation, "Expected `float` >= 0.0 - at `$.zoom`");
+      const refusedAt = Date.now();
+      const sockets = t.sockets.length;
+      while (t.sockets.length === sockets && Date.now() - refusedAt < 60_000) {
+        vi.advanceTimersByTime(100);
+      }
+      expect(t.sockets).toHaveLength(sockets + 1);
+      expect(Date.now() - refusedAt).toBeGreaterThanOrEqual(5_000);
+      t.open();
+    }
+    expect(t.ofType("protocolError")[0]?.message).toBe(
+      "the server refused a message: Expected `float` >= 0.0 - at `$.zoom`",
+    );
+  });
+
+  it.each([1001, 1006, 1008, 1011, 1012, 1013, 4008])(
     "reconnects after close code %i, resuming after the last event",
     (code) => {
       const t = setup();

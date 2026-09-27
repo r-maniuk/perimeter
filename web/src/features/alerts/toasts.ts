@@ -5,6 +5,7 @@
  */
 import type { Alert } from "@/api/endpoints";
 import type { AlertKind } from "@/api/schemas";
+import { plural } from "@/lib/format";
 
 export interface Toast {
   id: string;
@@ -86,6 +87,7 @@ export function headline(toast: Toast): string {
       only.kind === "enter" ? "entered" : only.kind === "exit" ? "left" : "is dwelling in";
     return `${only.deviceId} ${verb} ${only.zoneName}`;
   }
-  const where = toast.zones.length === 1 ? toast.zones[0] : `${toast.zones.length} zones`;
-  return `${total} alerts in ${where}`;
+  const zones = toast.zones.length;
+  const where = zones === 1 ? toast.zones[0] : `${zones} ${plural(zones, "zone")}`;
+  return `${total} ${plural(total, "alert")} in ${where}`;
 }
