@@ -33,7 +33,7 @@ RUN mkdir out \
  && cp index.html reference.js node_modules/swagger-ui-dist/swagger-ui-bundle.js \
        node_modules/swagger-ui-dist/swagger-ui.css out/
 
-FROM caddy:2.11.4-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+FROM caddy:2.11.6-alpine@sha256:d44355d3c2149dc580ce2cac735955d1c08d3d00882c30489c241aa51a5c10d9
 # The image grants the binary cap_net_bind_service so it could bind :80 as a non-root user. This
 # edge listens on :8080 and runs with no capabilities at all, which the kernel only allows for a
 # binary that does not ask for any.
